@@ -1,0 +1,394 @@
+// Bismillahi ar-Rahmani ar-Rahim Audhu billahi min ash-shayatin wa an yahdurun Bismillah ar-Rahman ar-Rahim Allah la ilaha illa huwa al-hayy al-qayyum. Tamsa Allahu ala ayunihim
+//@version=6
+strategy("Bismillah-Trobot Stocks v1", overlay=true, pyramiding=5, initial_capital=10000, commission_type=strategy.commission.percent, commission_value=0.1)
+
+// ======================================================
+// - Bismillah-Trobot Stocks v1
+// - Gusgraph LLC
+// - Author: Gus Kazem
+// - https://Gusgraph.com
+// - STOCKS ONLY (Alpaca)
+// - SWING MODE: run on 4H / Trend 1D
+// - Pullback window: 20 bars
+// - Exit: ATR trailing stop + optional regime fail
+// - AUTO tier hidden: ATR% threshold 1.2
+// - PAUSE SPLIT: Regime fail pauses NEW baskets only (B1), NOT recovery adds
+// - Alerts via alert() (NO {{}} placeholders)
+// - Uses JSON field: "license":"tvk_..."
+// - NEW: intent tags for safety on executor:
+//     intent:"open" for base entry (First)
+//     intent:"add"  for recovery add (MULTI)
+// - SHORT alert_id format:
+//     Buy-AAPL-4h-<time_ms>-First
+//     Multi-AAPL-4h-<time_ms>-L1
+//     Sell-AAPL-4h-<time_ms>-ATRTrail
+// ======================================================
+
+// ======================================================
+// A) Core inputs (SWING)
+// ======================================================
+execTfNote = input.string("Run Bismillah on 4H chart", "Execution Timeframe Note")
+trendTf    = input.timeframe("D", "Trend Timeframe (HTF)")  // 1D
+
+emaFastLen  = input.int(50,  "EMA Fast", minval=1)
+emaSlowLen  = input.int(200, "EMA Slow", minval=1)
+swingLen    = input.int(20,  "Pullback Window (bars)", minval=5)
+pullbackMin = input.float(0.40, "Min Pullback Depth (0.40 = 40%)", minval=0.05, maxval=0.95, step=0.05)
+
+rsiLen = input.int(14, "RSI Length (Exec TF)", minval=2)
+atrLen = input.int(14, "ATR Length (Exec TF)", minval=1)
+
+entryMode        = input.string("Fast Reclaim", "Entry Repeat Behavior", options=["Fast Reclaim", "RSI Crossover"])
+priceReclaimBars = input.int(2, "Reclaim Confirm Bars", minval=1, maxval=10)
+
+// ======================================================
+// B) Swing tuning
+// ======================================================
+rsiTurnUp = input.float(46, "RSI Turn-Up", minval=1, maxval=99)
+
+// Adds (swing: small count)
+maxAdds = input.int(2, "Recovery Lot Multiblier", minval=0, maxval=4)
+
+// First lot dollars
+firstLotDollars = input.float(100.0, "First Lot-$", minval=1.0, step=1.0)
+
+// MULTI multipliers
+q1 = input.float(1.2, "MULTI 1 x", step=0.1)
+q2 = input.float(1.6, "MULTI 2 x", step=0.1)
+q3 = input.float(2.0, "MULTI 3 x", step=0.1)
+q4 = input.float(2.5, "MULTI 4 x", step=0.1)
+
+// Basket cap
+maxBasketPctEquity = input.float(10.0, "Max Basket % Equity", minval=0.05, step=0.05)
+
+// Exit: ATR trail
+atrTrailMult     = input.float(3.0, "ATR Trail Mult", minval=0.5, step=0.1)
+exitOnRegimeFail = input.bool(true, "Exit on Regime Fail (HTF)")
+
+// ======================================================
+// C) Regime / pause (SPLIT)
+// ======================================================
+pauseNewEntriesManual = input.bool(false, "Pause New Entries (Manual)")
+pauseOnRegimeFail     = input.bool(true,  "Pause NEW Basket on Regime Fail")
+
+useAutoPause          = input.bool(true, "Use Auto Pause by Regime")
+autoPauseOnRegimeFail = input.bool(true, "Auto Pause when Regime Fails")
+
+requireEmaSlowSlopeUp = input.bool(true, "Require HTF EMA200 Slope Up")
+emaSlowSlopeLookback  = input.int(10, "HTF EMA200 Slope Lookback", minval=1)
+
+useSessionFilter  = input.bool(false, "Use Market Session Filter")
+tradeSession      = input.session("0930-1600", "Stocks Session (Exchange Time)")
+tradeWeekdaysOnly = input.bool(true, "Weekdays Only")
+
+// ======================================================
+// D) Visual controls
+// ======================================================
+showEMAsExec          = input.bool(true,  "Show Exec EMA50/200")
+showBuyAddLabels      = input.bool(true,  "Show Buy/MULTI Labels")
+showExitLabels        = input.bool(true,  "Show Exit Labels")
+showPullbackHighlight = input.bool(false, "Show Pullback Highlight")
+
+showTopRightDashboard = input.bool(true, "Top Right Dashboard")
+dashboardTextSize     = input.string("small", "Dashboard Text Size", options=["tiny", "small", "normal"])
+
+// ======================================================
+// E) Webhook controls (ALERT() MODE)
+// TradingView alert must be: "Any alert() function call only"
+// ======================================================
+useWebhookAlerts = input.bool(true, "Enable Webhook Alerts")
+
+// IMPORTANT: Put your per-user API key here (tvk_...)
+// This must be sent as JSON field "license".
+licenseKey = input.string("tvk_REPLACE_ME", "License (tvk_...)")
+
+tifInput       = input.string("day", "Time In Force", options=["day", "gtc", "opg", "cls", "ioc", "fok"])
+pingOnEveryBar = input.bool(false, "PING on every bar close (testing)")
+
+isStock = syminfo.type == "stock"
+sym     = syminfo.ticker
+tf      = timeframe.period
+
+f_send(_json) =>
+    // Allow alerts on stocks normally.
+    // Allow alerts on ANY symbol only when pingOnEveryBar is ON (testing).
+    canSend = useWebhookAlerts and barstate.isconfirmed and (isStock or pingOnEveryBar)
+    if canSend
+        alert(_json, alert.freq_once_per_bar_close)
+
+// SHORT alert_id format (no bot prefix)
+f_id(_action, _tag) =>
+    _action + "-" + sym + "-" + tf + "-" + str.tostring(time_close) + (_tag == "" ? "" : "-" + _tag)
+
+// ======================================================
+// Core calculations
+// ======================================================
+emaFastExec = ta.ema(close, emaFastLen)
+emaSlowExec = ta.ema(close, emaSlowLen)
+rsiVal      = ta.rsi(close, rsiLen)
+atrVal      = ta.atr(atrLen)
+atrPct      = close > 0 ? (atrVal / close) * 100.0 : 0.0
+
+swingHigh      = ta.highest(high, swingLen)
+swingLow       = ta.lowest(low, swingLen)
+swingRange     = swingHigh - swingLow
+pullbackDepth  = swingRange > 0 ? (swingHigh - close) / swingRange : 0.0
+inPullbackZone = pullbackDepth >= pullbackMin
+
+lowestLowReclaim = ta.lowest(low, priceReclaimBars)
+
+rsiCrossMode    = ta.crossover(rsiVal, rsiTurnUp) and close > high[1]
+fastReclaimMode = close > open and close > close[1] and close > emaFastExec and lowestLowReclaim <= emaFastExec
+momentumConfirm = entryMode == "RSI Crossover" ? rsiCrossMode : (rsiVal > rsiTurnUp and fastReclaimMode)
+
+// HTF trend (1D)
+htfClose       = request.security(syminfo.tickerid, trendTf, close, barmerge.gaps_off, barmerge.lookahead_off)
+htfEmaFast     = request.security(syminfo.tickerid, trendTf, ta.ema(close, emaFastLen), barmerge.gaps_off, barmerge.lookahead_off)
+htfEmaSlow     = request.security(syminfo.tickerid, trendTf, ta.ema(close, emaSlowLen), barmerge.gaps_off, barmerge.lookahead_off)
+htfEmaSlowPrev = request.security(syminfo.tickerid, trendTf, ta.ema(close, emaSlowLen)[emaSlowSlopeLookback], barmerge.gaps_off, barmerge.lookahead_off)
+
+htfEmaSlowSlopeUp = htfEmaSlow > htfEmaSlowPrev
+trendBaseHTF      = htfEmaFast > htfEmaSlow and htfClose > htfEmaSlow and htfClose > htfEmaFast
+trendOk           = trendBaseHTF and (requireEmaSlowSlopeUp ? htfEmaSlowSlopeUp : true)
+
+// Session filter
+inSession = not na(time(timeframe.period, tradeSession))
+isWeekday = dayofweek >= dayofweek.monday and dayofweek <= dayofweek.friday
+sessionOk = useSessionFilter ? (inSession and (tradeWeekdaysOnly ? isWeekday : true)) : true
+
+// Regime fail + pauses (SPLIT)
+regimeFail = not trendOk
+autoPaused = useAutoPause and autoPauseOnRegimeFail and regimeFail
+
+pauseNewBasket = pauseNewEntriesManual or (pauseOnRegimeFail and autoPaused) or (not sessionOk)
+pauseAdds      = pauseNewEntriesManual or (not sessionOk)
+
+// ======================================================
+// AUTO TIER (hidden): ATR% threshold fixed 1.2
+// ======================================================
+tierThresh = 1.2
+isLowTier  = atrPct < tierThresh
+
+// HighTier defaults (aggressive)
+hi_spAtr1 = 3.0
+hi_spAtr2 = 3.0
+hi_spAtr3 = 4.0
+hi_spAtr4 = 7.0
+hi_dp1 = 2.80
+hi_dp2 = 3.30
+hi_dp3 = 7.90
+hi_dp4 = 9.60
+
+// LowTier defaults (tight)
+lo_spAtr1 = 1.5
+lo_spAtr2 = 1.8
+lo_spAtr3 = 2.2
+lo_spAtr4 = 2.8
+lo_dp1 = 0.80
+lo_dp2 = 1.30
+lo_dp3 = 1.90
+lo_dp4 = 2.60
+
+f_spacing_atr(_step) =>
+    if isLowTier
+        _step == 1 ? lo_spAtr1 : _step == 2 ? lo_spAtr2 : _step == 3 ? lo_spAtr3 : lo_spAtr4
+    else
+        _step == 1 ? hi_spAtr1 : _step == 2 ? hi_spAtr2 : _step == 3 ? hi_spAtr3 : hi_spAtr4
+
+f_min_drop_pct(_step) =>
+    if isLowTier
+        _step == 1 ? lo_dp1 : _step == 2 ? lo_dp2 : _step == 3 ? lo_dp3 : lo_dp4
+    else
+        _step == 1 ? hi_dp1 : _step == 2 ? hi_dp2 : _step == 3 ? hi_dp3 : hi_dp4
+
+// ======================================================
+// Helpers
+// ======================================================
+f_qty_mult(_step) =>
+    _step == 0 ? 1.0 :
+     _step == 1 ? q1 :
+     _step == 2 ? q2 :
+     _step == 3 ? q3 :
+     _step == 4 ? q4 : q4
+
+f_step_dollars_from_first(_step, _firstDollars) =>
+    _firstDollars * f_qty_mult(_step)
+
+f_max_basket_dollars() =>
+    strategy.equity * (maxBasketPctEquity / 100.0)
+
+f_to_qty(_dollars) =>
+    close > 0 ? (_dollars / close) : 0.0
+
+f_txt_size(_s) =>
+    _s == "tiny" ? size.tiny : _s == "normal" ? size.normal : size.small
+
+// ======================================================
+// Visuals
+// ======================================================
+plot(showEMAsExec ? emaFastExec : na, "EMA 50", color=color.new(color.teal, 0), linewidth=2)
+plot(showEMAsExec ? emaSlowExec : na, "EMA 200", color=color.new(color.orange, 0), linewidth=2)
+bgcolor(showPullbackHighlight and inPullbackZone ? color.new(color.green, 88) : na)
+
+// ======================================================
+// Position state
+// ======================================================
+inPos = strategy.position_size > 0
+avg   = strategy.position_avg_price
+
+var int   addCount     = 0
+var float lastAddPrice = na
+var float dollarsUsed  = 0.0
+
+var float posHigh   = na
+var float trailStop = na
+
+if not inPos
+    addCount := 0
+    lastAddPrice := na
+    dollarsUsed := 0.0
+    posHigh := na
+    trailStop := na
+
+if inPos
+    posHigh := math.max(nz(posHigh, high), high)
+    trailStop := posHigh - atrVal * atrTrailMult
+
+// ======================================================
+// ENTRY (edge-trigger) — gated by pauseNewBasket
+// ======================================================
+baseEntrySignal  = isStock and (not pauseNewBasket) and trendOk and inPullbackZone and momentumConfirm
+baseEntryTrigger = baseEntrySignal and not baseEntrySignal[1]
+
+if (not inPos) and baseEntryTrigger
+    firstDollars = f_step_dollars_from_first(0, firstLotDollars)
+    firstQty     = f_to_qty(firstDollars)
+    capNow       = f_max_basket_dollars()
+
+    if firstDollars <= capNow and firstQty > 0
+        strategy.entry("FirstLot", strategy.long, qty=firstQty)
+
+        lastAddPrice := close
+        dollarsUsed  := firstDollars
+        addCount     := 0
+
+        if showBuyAddLabels
+            label.new(bar_index, low, "First Lot-$ " + str.tostring(firstDollars, "#.##"), style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white, size=size.tiny)
+
+        buyId = f_id("Buy", "First")
+        // intent:"open" => executor can block duplicate base entries if Alpaca already holds position
+        f_send('{"license":"' + licenseKey + '","intent":"open","alert_id":"' + buyId + '","symbol":"' + sym + '","asset_class":"equity","side":"buy","notional":' + str.tostring(firstDollars, "#.##") + ',"type":"market","time_in_force":"' + tifInput + '","bar_time_ms":' + str.tostring(time_close) + '}')
+
+// ======================================================
+// MULTI adds (tiered + edge-trigger) — NOT gated by regimeFail
+// Only blocked by manual pause + session
+// ======================================================
+if inPos and (addCount < maxAdds) and (not pauseAdds) and inPullbackZone
+    step = addCount + 1
+
+    addBounceConfirm = close > open and close > close[1] and rsiVal > math.max(20, rsiTurnUp - 8)
+
+    needAtr = f_spacing_atr(step)
+    needDp  = f_min_drop_pct(step)
+
+    gateAtrOk = not na(lastAddPrice) and close <= (lastAddPrice - atrVal * needAtr)
+    gateDpOk  = avg > 0 ? close <= (avg * (1.0 - needDp / 100.0)) : false
+
+    capNow      = f_max_basket_dollars()
+    stepDollars = f_step_dollars_from_first(step, firstLotDollars)
+    capOk       = (dollarsUsed + stepDollars) <= capNow + 1e-10
+
+    addSignalRaw = addBounceConfirm and gateAtrOk and gateDpOk and capOk
+    addTrigger   = addSignalRaw and not addSignalRaw[1]
+
+    if addTrigger
+        stepQty = f_to_qty(stepDollars)
+        if stepQty > 0
+            strategy.entry("MULTI-" + str.tostring(step), strategy.long, qty=stepQty)
+
+            addCount += 1
+            lastAddPrice := close
+            dollarsUsed += stepDollars
+
+            if showBuyAddLabels
+                label.new(bar_index, low, "MULTI " + str.tostring(step) + " $" + str.tostring(stepDollars, "#.##"), style=label.style_label_up, color=color.new(color.lime, 0), textcolor=color.black, size=size.tiny)
+
+            multiId = f_id("Multi", "L" + str.tostring(step))
+            // intent:"add" => executor allows recovery adds even if position exists
+            f_send('{"license":"' + licenseKey + '","intent":"add","alert_id":"' + multiId + '","symbol":"' + sym + '","asset_class":"equity","side":"buy","notional":' + str.tostring(stepDollars, "#.##") + ',"type":"market","time_in_force":"' + tifInput + '","bar_time_ms":' + str.tostring(time_close) + '}')
+
+// ======================================================
+// EXIT: ATR TRAIL (and optional regime fail)
+// ======================================================
+if inPos
+    hitAtrTrail = not na(trailStop) and close <= trailStop
+    hitRegime   = exitOnRegimeFail and regimeFail
+
+    if hitAtrTrail or hitRegime
+        sellTag = hitRegime ? "Regime" : "ATRTrail"
+        sellId  = f_id("Sell", sellTag)
+
+        f_send('{"license":"' + licenseKey + '","alert_id":"' + sellId + '","symbol":"' + sym + '","asset_class":"equity","side":"sell","type":"market","time_in_force":"' + tifInput + '","bar_time_ms":' + str.tostring(time_close) + '}')
+
+        strategy.close_all(comment=hitRegime ? "EXIT_REGIME" : "EXIT_ATR")
+
+        if showExitLabels
+            label.new(bar_index, high, hitRegime ? "EXIT REGIME" : "EXIT ATR", style=label.style_label_down, color=color.new(color.blue, 0), textcolor=color.white, size=size.tiny)
+
+// ======================================================
+// Dashboard
+// ======================================================
+var table dashTbl = table.new(position.top_right, 2, 11, border_width=1)
+
+if showTopRightDashboard
+    table.clear(dashTbl, 0, 0, 1, 10)
+
+    txtSize  = f_txt_size(dashboardTextSize)
+    capNow   = f_max_basket_dollars()
+    usePct   = (inPos and capNow > 0) ? (dollarsUsed / capNow) * 100.0 : 0.0
+    botTxt   = not useWebhookAlerts ? "OFF" : (pauseNewEntriesManual ? "PAUSED" : "ON")
+    tierTxt  = isLowTier ? "LOW" : "HIGH"
+    newTxt   = pauseNewBasket ? "PAUSE" : "GO"
+    rgTxt    = regimeFail ? "FAIL" : "OK"
+
+    table.cell(dashTbl, 0, 0, "BOT", text_size=txtSize)
+    table.cell(dashTbl, 1, 0, botTxt, text_size=txtSize)
+
+    table.cell(dashTbl, 0, 1, "NEW", text_size=txtSize)
+    table.cell(dashTbl, 1, 1, newTxt, text_size=txtSize)
+
+    table.cell(dashTbl, 0, 2, "RG", text_size=txtSize)
+    table.cell(dashTbl, 1, 2, rgTxt, text_size=txtSize)
+
+    table.cell(dashTbl, 0, 3, "TIER", text_size=txtSize)
+    table.cell(dashTbl, 1, 3, tierTxt, text_size=txtSize)
+
+    table.cell(dashTbl, 0, 4, "ATR%", text_size=txtSize)
+    table.cell(dashTbl, 1, 4, str.tostring(atrPct, "#.##"), text_size=txtSize)
+
+    table.cell(dashTbl, 0, 5, "IN", text_size=txtSize)
+    table.cell(dashTbl, 1, 5, inPos ? "1" : "0", text_size=txtSize)
+
+    table.cell(dashTbl, 0, 6, "EQ", text_size=txtSize)
+    table.cell(dashTbl, 1, 6, str.tostring(strategy.equity, "#.##"), text_size=txtSize)
+
+    table.cell(dashTbl, 0, 7, "First$", text_size=txtSize)
+    table.cell(dashTbl, 1, 7, str.tostring(firstLotDollars, "#.##"), text_size=txtSize)
+
+    table.cell(dashTbl, 0, 8, "USE%", text_size=txtSize)
+    table.cell(dashTbl, 1, 8, str.tostring(usePct, "#.##"), text_size=txtSize)
+
+    table.cell(dashTbl, 0, 9, "MULTI", text_size=txtSize)
+    table.cell(dashTbl, 1, 9, str.tostring(addCount) + "/" + str.tostring(maxAdds), text_size=txtSize)
+
+    table.cell(dashTbl, 0, 10, "TRAIL", text_size=txtSize)
+    table.cell(dashTbl, 1, 10, inPos and not na(trailStop) ? str.tostring(trailStop, "#.#####") : "0", text_size=txtSize)
+else
+    table.clear(dashTbl, 0, 0, 1, 10)
+
+// ======================================================
+// Optional PING (testing only)
+// ======================================================
+if pingOnEveryBar
+    pingId = f_id("Ping", "")
+    f_send('{"license":"' + licenseKey + '","action":"ping","alert_id":"' + pingId + '","symbol":"' + sym + '","asset_class":"crypto","bar_time_ms":' + str.tostring(time_close) + '}')
