@@ -75,7 +75,7 @@ The intended behavior is:
 
 ## Pullback Zone
 
-Execution timeframe pullback logic uses a recent lookback window, commonly around 20 bars.
+Execution timeframe pullback logic uses a recent lookback window, commonly around 5 bars.
 
 Core idea:
 
