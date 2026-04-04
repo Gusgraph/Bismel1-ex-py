@@ -48,12 +48,13 @@ def test_add_signal_is_not_blocked_by_regime_fail_when_add_pause_is_clear() -> N
         htf_bars=[],
         symbol="AAPL",
     )
-    config = BismillahTrobotStocksV1Config()
+    config = BismillahTrobotStocksV1Config(exit_on_regime_fail=False)
     state = BismillahTrobotStocksV1State(
         add_count=0,
         last_add_price=100.0,
         dollars_used=0.0,
         position_avg_price=100.0,
+        position_size=1.0,
     )
     series = PineComputedSeries(
         rsi_val=[30.0, 40.0],
@@ -77,4 +78,4 @@ def test_add_signal_is_not_blocked_by_regime_fail_when_add_pause_is_clear() -> N
     assert snapshot.base_entry_signal is False
     assert snapshot.add_signal_raw is True
     assert snapshot.add_trigger is True
-    assert snapshot.hit_regime is True
+    assert snapshot.hit_regime is False

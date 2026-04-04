@@ -232,28 +232,56 @@ This file documents the exact source of truth in `reference/pine/Bismel1-Pine-Fi
   - HTF trend merge
   - split pause flags
   - hidden low-tier detection
-- `strategy.py` mirrors current-bar boolean names for:
+- `strategy.py` now evaluates bar-by-bar signal/state parity for:
+  - `regimeFail`
+  - `autoPaused`
+  - `pauseNewBasket`
+  - `pauseAdds`
   - `baseEntrySignal`
   - `baseEntryTrigger`
+  - `addBounceConfirm`
+  - `gateAtrOk`
+  - `gateDpOk`
+  - `capOk`
   - `addSignalRaw`
   - `addTrigger`
   - `hitAtrTrail`
   - `hitRegime`
+- The sequential evaluator resets Pine `var` mirrors when flat, updates `posHigh` and `trailStop` only while a mirrored position is open, and advances the minimum position mirror required to preserve trigger edges:
+  - base entry opens the mirrored position using close-price notional-to-qty conversion
+  - adds update `addCount`, `lastAddPrice`, `dollarsUsed`, `position_size`, and weighted `position_avg_price`
+  - ATR-trail or regime-fail exit resets the mirrored position state back to flat
+- This is signal/state parity only. The mirrored position exists solely so later bars can evaluate Pine-equivalent gates and edge triggers.
+
+## This phase proves
+
+- New-basket pause and add pause are split exactly as Pine documents: regime fail can pause `pauseNewBasket` while leaving `pauseAdds` clear.
+- Base entry uses Pine naming and edge-trigger behavior: `baseEntryTrigger = baseEntrySignal and not baseEntrySignal[1]`.
+- Add logic uses Pine naming and edge-trigger behavior: `addTrigger = addSignalRaw and not addSignalRaw[1]`, evaluated against the prior bar's raw signal from the sequential state path rather than recomputing the prior bar with current state.
+- ATR-trail exit is evaluated as a parity trigger only: `close <= trailStop` while the mirrored position is open.
+- Regime-fail exit is evaluated as a parity trigger only: `exitOnRegimeFail and regimeFail` while the mirrored position is open.
+- Focused tests now cover:
+  - `pauseNewBasket` vs `pauseAdds`
+  - base entry edge triggering
+  - multi-add raw signal and trigger edges
+  - ATR trail exit trigger
+  - regime-fail exit trigger
 
 ## Documented ambiguities and non-goals
 
 - Execution parity is not complete. Python scaffolding does not place orders, send alerts, or implement broker/runtime orchestration.
-- `strategy.equity`, `strategy.position_size`, and TradingView `strategy.position_avg_price` are runtime values. Python currently uses source-truth scaffolding only and does not claim live parity for those values.
+- `strategy.equity` is still not modeled. Basket-cap checks still use configured initial capital rather than TradingView's live `strategy.equity`.
+- `strategy.position_size` and TradingView `strategy.position_avg_price` are now mirrored only to the minimum extent needed for signal/state parity. This is not broker execution parity.
 - Session filtering is only approximated in Python using bar timestamps plus `HHMM-HHMM` parsing. TradingView exchange-time semantics, holidays, and DST handling remain unresolved.
 - `request.security(..., gaps_off, lookahead_off)` merge intent is preserved, but real exported TradingView series are still required for proof.
 - The Pine PING path uses `"asset_class":"crypto"` while the rest of the script is stock-only. This is preserved as a source-truth quirk, not normalized.
 - Dashboard rendering is documented but not implemented as Python UI output.
+- Same-bar interactions between add fills and exit triggers are not proven against TradingView exports yet. The current implementation preserves the trigger booleans as a parity layer, but exact broker-emulator side effects remain unproven.
 
 ## Remaining parity gaps
 
-- No broker/runtime position lifecycle parity
-- No `strategy.equity` parity
-- No `strategy.position_avg_price` parity
-- No TradingView-export comparison for the synchronized fields yet
+- No broker/runtime position lifecycle parity beyond the minimum mirror required for signal/state gating
+- No live `strategy.equity` parity for basket-cap evolution
+- No TradingView-export comparison for the new signal/state fields yet
+- No proof yet for same-bar order/execution side effects in TradingView's broker emulator
 - No execution-side alert payload emission yet
-

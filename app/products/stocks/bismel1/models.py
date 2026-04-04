@@ -51,6 +51,7 @@ class BismillahTrobotStocksV1State:
     trail_stop: float | None = None
     dash_table_initialized: bool = False
     position_avg_price: float | None = None
+    position_size: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,30 @@ class PineSignalSnapshot:
     add_trigger: bool
     hit_atr_trail: bool
     hit_regime: bool
+
+
+@dataclass(frozen=True)
+class PineSignalStateBar:
+    """Bar-by-bar Pine parity view for pause, signal, and minimal state transitions."""
+
+    bar_index: int
+    regime_fail: bool
+    auto_paused: bool
+    pause_new_basket: bool
+    pause_adds: bool
+    in_position_before: bool
+    signal: PineSignalSnapshot
+    state_before: BismillahTrobotStocksV1State
+    state_after: BismillahTrobotStocksV1State
+
+
+@dataclass(frozen=True)
+class PineSignalStateEvaluation:
+    """Sequential parity output for the signal/state phase."""
+
+    series: PineComputedSeries
+    bars: list[PineSignalStateBar] = field(default_factory=list)
+    final_state: BismillahTrobotStocksV1State = field(default_factory=BismillahTrobotStocksV1State)
 
 
 StrategyInputSet = BismillahTrobotStocksV1Input

@@ -40,7 +40,15 @@ def test_parity_map_documents_missing_real_series_status() -> None:
     parity_map = Path("app/products/stocks/bismel1/parity_map.md").read_text(encoding="utf-8")
 
     assert "## Remaining parity gaps" in parity_map
-    assert "No TradingView-export comparison for the synchronized fields yet" in parity_map
+    assert "No TradingView-export comparison for the new signal/state fields yet" in parity_map
+
+
+def test_parity_map_documents_signal_state_phase_scope() -> None:
+    parity_map = Path("app/products/stocks/bismel1/parity_map.md").read_text(encoding="utf-8")
+
+    assert "## This phase proves" in parity_map
+    assert "pauseNewBasket" in parity_map
+    assert "addTrigger = addSignalRaw and not addSignalRaw[1]" in parity_map
 
 
 def test_pine_readme_documents_tradingview_export_contract() -> None:

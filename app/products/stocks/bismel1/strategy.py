@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from dataclasses import replace
 
 from app.products.stocks.bismel1.config import (
     Bismel1StrategyConfig,
@@ -29,6 +30,8 @@ from app.products.stocks.bismel1.indicators import (
 from app.products.stocks.bismel1.models import (
     BismillahTrobotStocksV1Input,
     BismillahTrobotStocksV1State,
+    PineSignalStateBar,
+    PineSignalStateEvaluation,
     PineComputedSeries,
     PineSignalSnapshot,
     StrategyInputSet,
@@ -232,95 +235,86 @@ def snapshot_signals(
 ) -> PineSignalSnapshot:
     """Return current-bar booleans that mirror the Pine entry/add/exit gates."""
 
-    if not strategy_input.execution_bars:
-        return PineSignalSnapshot(
-            base_entry_signal=False,
-            base_entry_trigger=False,
-            add_bounce_confirm=False,
-            gate_atr_ok=False,
-            gate_dp_ok=False,
-            cap_ok=False,
-            add_signal_raw=False,
-            add_trigger=False,
-            hit_atr_trail=False,
-            hit_regime=False,
+    evaluation = evaluate_signal_state_phase(
+        strategy_input=strategy_input,
+        config=config,
+        initial_state=state,
+        series=series,
+    )
+    if not evaluation.bars:
+        return _empty_signal_snapshot()
+    return evaluation.bars[-1].signal
+
+
+def evaluate_signal_state_phase(
+    strategy_input: BismillahTrobotStocksV1Input,
+    config: BismillahTrobotStocksV1Config,
+    initial_state: BismillahTrobotStocksV1State | None = None,
+    series: PineComputedSeries | None = None,
+) -> PineSignalStateEvaluation:
+    """Mirror Pine's bar-by-bar gating and minimal position-state transitions."""
+
+    resolved_series = series or compute_pine_series(strategy_input, config)
+    state = _clone_state(initial_state or BismillahTrobotStocksV1State())
+    bars: list[PineSignalStateBar] = []
+    previous_base_entry_signal = False
+    previous_add_signal_raw = False
+
+    for index, current_bar in enumerate(strategy_input.execution_bars):
+        if not _in_position(state):
+            _reset_flat_position_state(state)
+
+        in_position_before = _in_position(state)
+        if in_position_before:
+            state.pos_high = max(state.pos_high if state.pos_high is not None else current_bar.high, current_bar.high)
+            current_atr = _float_at(resolved_series.atr_val, index)
+            state.trail_stop = (
+                None
+                if current_atr is None
+                else state.pos_high - current_atr * config.atr_trail_mult
+            )
+
+        state_before = _clone_state(state)
+        signal = _snapshot_signals_at(
+            strategy_input=strategy_input,
+            config=config,
+            state=state_before,
+            series=resolved_series,
+            index=index,
+            in_position_before=in_position_before,
+            previous_base_entry_signal=previous_base_entry_signal,
+            previous_add_signal_raw=previous_add_signal_raw,
         )
 
-    index = len(strategy_input.execution_bars) - 1
-    current_bar = strategy_input.execution_bars[index]
-    current_close = current_bar.close
-    previous_close = strategy_input.execution_bars[index - 1].close if index >= 1 else None
+        if (not in_position_before) and signal.base_entry_trigger:
+            _apply_base_entry_fill(state, current_bar.close, config)
 
-    is_stock = strategy_input.asset_type == "stock"
-    base_entry_signal = _base_entry_signal_at(
-        strategy_input=strategy_input,
-        series=series,
-        index=index,
-    )
-    previous_base_entry_signal = _base_entry_signal_at(
-        strategy_input=strategy_input,
-        series=series,
-        index=index - 1,
-    )
-    base_entry_trigger = base_entry_signal and (not previous_base_entry_signal)
+        if in_position_before and signal.add_trigger:
+            _apply_add_fill(state, current_bar.close, config)
 
-    step = state.add_count + 1
-    add_bounce_confirm = (
-        previous_close is not None
-        and current_close > current_bar.open
-        and current_close > previous_close
-        and _float_at(series.rsi_val, index) is not None
-        and _float_at(series.rsi_val, index) > max(20.0, config.rsi_turn_up - 8.0)
-    )
-    need_atr = _spacing_atr(series.is_low_tier[index], step)
-    need_dp = _min_drop_pct(series.is_low_tier[index], step)
-    current_atr = _float_at(series.atr_val, index)
-    gate_atr_ok = (
-        state.last_add_price is not None
-        and current_atr is not None
-        and current_close <= (state.last_add_price - current_atr * need_atr)
-    )
-    gate_dp_ok = (
-        state.position_avg_price is not None
-        and state.position_avg_price > 0
-        and current_close <= (state.position_avg_price * (1.0 - need_dp / 100.0))
-    )
-    step_dollars = _step_dollars_from_first(step, config.first_lot_dollars, config)
-    cap_now = _max_basket_dollars(config.strategy_initial_capital, config.max_basket_pct_equity)
-    cap_ok = (state.dollars_used + step_dollars) <= cap_now + 1e-10
-    add_signal_raw = _add_signal_raw_at(
-        strategy_input=strategy_input,
-        config=config,
-        state=state,
-        series=series,
-        index=index,
-        add_bounce_confirm=add_bounce_confirm,
-        gate_atr_ok=gate_atr_ok,
-        gate_dp_ok=gate_dp_ok,
-        cap_ok=cap_ok,
-    )
-    previous_add_signal_raw = _add_signal_raw_at(
-        strategy_input=strategy_input,
-        config=config,
-        state=state,
-        series=series,
-        index=index - 1,
-    )
-    add_trigger = add_signal_raw and (not previous_add_signal_raw)
-    hit_atr_trail = state.trail_stop is not None and current_close <= state.trail_stop
-    hit_regime = config.exit_on_regime_fail and series.regime_fail[index]
+        if in_position_before and (signal.hit_atr_trail or signal.hit_regime):
+            _reset_flat_position_state(state)
 
-    return PineSignalSnapshot(
-        base_entry_signal=base_entry_signal,
-        base_entry_trigger=base_entry_trigger,
-        add_bounce_confirm=add_bounce_confirm,
-        gate_atr_ok=gate_atr_ok,
-        gate_dp_ok=gate_dp_ok,
-        cap_ok=cap_ok,
-        add_signal_raw=add_signal_raw,
-        add_trigger=add_trigger,
-        hit_atr_trail=hit_atr_trail,
-        hit_regime=hit_regime,
+        bars.append(
+            PineSignalStateBar(
+                bar_index=index,
+                regime_fail=_bool_at(resolved_series.regime_fail, index),
+                auto_paused=_bool_at(resolved_series.auto_paused, index),
+                pause_new_basket=_bool_at(resolved_series.pause_new_basket, index),
+                pause_adds=_bool_at(resolved_series.pause_adds, index),
+                in_position_before=in_position_before,
+                signal=signal,
+                state_before=state_before,
+                state_after=_clone_state(state),
+            )
+        )
+        previous_base_entry_signal = signal.base_entry_signal
+        previous_add_signal_raw = signal.add_signal_raw
+
+    return PineSignalStateEvaluation(
+        series=resolved_series,
+        bars=bars,
+        final_state=_clone_state(state),
     )
 
 
@@ -330,20 +324,35 @@ def evaluate_strategy(
 ) -> dict[str, object]:
     resolved_config = config or Bismel1StrategyConfig()
     series = compute_pine_series(strategy_input, resolved_config)
-    signals = snapshot_signals(
+    evaluation = evaluate_signal_state_phase(
         strategy_input=strategy_input,
         config=resolved_config,
-        state=BismillahTrobotStocksV1State(),
         series=series,
     )
+    signals = evaluation.bars[-1].signal if evaluation.bars else _empty_signal_snapshot()
     return {
         "product_key": resolved_config.product_key,
         "pine_strategy_title": resolved_config.pine_strategy_title,
         "status": "parity_scaffolding_only",
-        "message": "Pine source-truth inputs, derived series, signal names, and alert naming are synchronized, but execution parity is not implemented.",
+        "message": "Pine source-truth inputs, bar-by-bar signal/state gating, and signal names are synchronized for the current parity phase, but execution parity is not implemented.",
         "series_type": type(series).__name__,
         "signal_type": type(signals).__name__,
     }
+
+
+def _empty_signal_snapshot() -> PineSignalSnapshot:
+    return PineSignalSnapshot(
+        base_entry_signal=False,
+        base_entry_trigger=False,
+        add_bounce_confirm=False,
+        gate_atr_ok=False,
+        gate_dp_ok=False,
+        cap_ok=False,
+        add_signal_raw=False,
+        add_trigger=False,
+        hit_atr_trail=False,
+        hit_regime=False,
+    )
 
 
 def _float_at(values: list[float | None], index: int) -> float | None:
@@ -416,6 +425,70 @@ def _max_basket_dollars(equity_reference: float, configured_cap_pct: float) -> f
     return equity_reference * (configured_cap_pct / 100.0)
 
 
+def _in_position(state: BismillahTrobotStocksV1State) -> bool:
+    return state.position_size > 0.0
+
+
+def _clone_state(state: BismillahTrobotStocksV1State) -> BismillahTrobotStocksV1State:
+    return replace(state)
+
+
+def _reset_flat_position_state(state: BismillahTrobotStocksV1State) -> None:
+    state.add_count = 0
+    state.last_add_price = None
+    state.dollars_used = 0.0
+    state.pos_high = None
+    state.trail_stop = None
+    state.position_avg_price = None
+    state.position_size = 0.0
+
+
+def _apply_base_entry_fill(
+    state: BismillahTrobotStocksV1State,
+    close_price: float,
+    config: BismillahTrobotStocksV1Config,
+) -> None:
+    first_dollars = _step_dollars_from_first(0, config.first_lot_dollars, config)
+    first_qty = (first_dollars / close_price) if close_price > 0 else 0.0
+    cap_now = _max_basket_dollars(config.strategy_initial_capital, config.max_basket_pct_equity)
+    if first_dollars > cap_now or first_qty <= 0:
+        return
+
+    state.position_size = first_qty
+    state.position_avg_price = close_price
+    state.last_add_price = close_price
+    state.dollars_used = first_dollars
+    state.add_count = 0
+
+
+def _apply_add_fill(
+    state: BismillahTrobotStocksV1State,
+    close_price: float,
+    config: BismillahTrobotStocksV1Config,
+) -> None:
+    step = state.add_count + 1
+    step_dollars = _step_dollars_from_first(step, config.first_lot_dollars, config)
+    step_qty = (step_dollars / close_price) if close_price > 0 else 0.0
+    if step_qty <= 0:
+        return
+
+    previous_position_size = state.position_size
+    previous_cost = (
+        0.0
+        if state.position_avg_price is None
+        else state.position_avg_price * previous_position_size
+    )
+    new_position_size = previous_position_size + step_qty
+    if new_position_size <= 0:
+        return
+
+    state.position_size = new_position_size
+    state.position_avg_price = (previous_cost + close_price * step_qty) / new_position_size
+    state.add_count += 1
+    state.last_add_price = close_price
+    state.dollars_used += step_dollars
+
+
 def _base_entry_signal_at(
     strategy_input: BismillahTrobotStocksV1Input,
     series: PineComputedSeries,
@@ -432,6 +505,92 @@ def _base_entry_signal_at(
     )
 
 
+def _snapshot_signals_at(
+    strategy_input: BismillahTrobotStocksV1Input,
+    config: BismillahTrobotStocksV1Config,
+    state: BismillahTrobotStocksV1State,
+    series: PineComputedSeries,
+    index: int,
+    in_position_before: bool,
+    previous_base_entry_signal: bool,
+    previous_add_signal_raw: bool,
+) -> PineSignalSnapshot:
+    if index < 0 or index >= len(strategy_input.execution_bars):
+        return _empty_signal_snapshot()
+
+    current_bar = strategy_input.execution_bars[index]
+    previous_close = strategy_input.execution_bars[index - 1].close if index >= 1 else None
+    base_entry_signal = _base_entry_signal_at(
+        strategy_input=strategy_input,
+        series=series,
+        index=index,
+    )
+    base_entry_trigger = base_entry_signal and (not previous_base_entry_signal)
+
+    add_bounce_confirm = False
+    gate_atr_ok = False
+    gate_dp_ok = False
+    cap_ok = False
+    add_signal_raw = False
+    add_trigger = False
+    hit_atr_trail = False
+    hit_regime = False
+
+    if in_position_before:
+        step = state.add_count + 1
+        add_bounce_confirm = (
+            previous_close is not None
+            and current_bar.close > current_bar.open
+            and current_bar.close > previous_close
+            and _float_at(series.rsi_val, index) is not None
+            and _float_at(series.rsi_val, index) > max(20.0, config.rsi_turn_up - 8.0)
+        )
+        need_atr = _spacing_atr(_bool_at(series.is_low_tier, index), step)
+        need_dp = _min_drop_pct(_bool_at(series.is_low_tier, index), step)
+        current_atr = _float_at(series.atr_val, index)
+        gate_atr_ok = (
+            state.last_add_price is not None
+            and current_atr is not None
+            and current_bar.close <= (state.last_add_price - current_atr * need_atr)
+        )
+        gate_dp_ok = (
+            state.position_avg_price is not None
+            and state.position_avg_price > 0
+            and current_bar.close <= (state.position_avg_price * (1.0 - need_dp / 100.0))
+        )
+        step_dollars = _step_dollars_from_first(step, config.first_lot_dollars, config)
+        cap_now = _max_basket_dollars(config.strategy_initial_capital, config.max_basket_pct_equity)
+        cap_ok = (state.dollars_used + step_dollars) <= cap_now + 1e-10
+        add_signal_raw = _add_signal_raw_at(
+            strategy_input=strategy_input,
+            config=config,
+            state=state,
+            series=series,
+            index=index,
+            add_bounce_confirm=add_bounce_confirm,
+            gate_atr_ok=gate_atr_ok,
+            gate_dp_ok=gate_dp_ok,
+            cap_ok=cap_ok,
+            in_position_before=in_position_before,
+        )
+        add_trigger = add_signal_raw and (not previous_add_signal_raw)
+        hit_atr_trail = state.trail_stop is not None and current_bar.close <= state.trail_stop
+        hit_regime = config.exit_on_regime_fail and _bool_at(series.regime_fail, index)
+
+    return PineSignalSnapshot(
+        base_entry_signal=base_entry_signal,
+        base_entry_trigger=base_entry_trigger,
+        add_bounce_confirm=add_bounce_confirm,
+        gate_atr_ok=gate_atr_ok,
+        gate_dp_ok=gate_dp_ok,
+        cap_ok=cap_ok,
+        add_signal_raw=add_signal_raw,
+        add_trigger=add_trigger,
+        hit_atr_trail=hit_atr_trail,
+        hit_regime=hit_regime,
+    )
+
+
 def _add_signal_raw_at(
     strategy_input: BismillahTrobotStocksV1Input,
     config: BismillahTrobotStocksV1Config,
@@ -442,6 +601,7 @@ def _add_signal_raw_at(
     gate_atr_ok: bool | None = None,
     gate_dp_ok: bool | None = None,
     cap_ok: bool | None = None,
+    in_position_before: bool | None = None,
 ) -> bool:
     if index < 0 or index >= len(strategy_input.execution_bars):
         return False
@@ -449,6 +609,7 @@ def _add_signal_raw_at(
     current_bar = strategy_input.execution_bars[index]
     previous_close = strategy_input.execution_bars[index - 1].close if index >= 1 else None
     step = state.add_count + 1
+    resolved_in_position_before = _in_position(state) if in_position_before is None else in_position_before
     resolved_add_bounce_confirm = (
         add_bounce_confirm
         if add_bounce_confirm is not None
@@ -495,9 +656,10 @@ def _add_signal_raw_at(
         )
     )
     return (
-        strategy_input.asset_type == "stock"
+        resolved_in_position_before
+        and strategy_input.asset_type == "stock"
+        and state.add_count < config.max_adds
         and series.in_pullback_zone[index]
-        and (state.add_count < config.max_adds)
         and (not series.pause_adds[index])
         and resolved_add_bounce_confirm
         and resolved_gate_atr_ok
