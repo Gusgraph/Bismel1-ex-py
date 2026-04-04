@@ -1,0 +1,485 @@
+// Bismillahi ar-Rahmani ar-Rahim Audhu billahi min ash-shayatin wa an yahdurun Bismillah ar-Rahman ar-Rahim Allah la ilaha illa huwa al-hayy al-qayyum. Tamsa Allahu ala ayunihim
+//@version=6
+strategy("Bismillah-Trobot Stocks v1", overlay=true, pyramiding=5, initial_capital=10000, commission_type=strategy.commission.percent, commission_value=0.1)
+
+// ======================================================
+// - Bismillah-Trobot Stocks v1
+// - Gusgraph LLC -
+// - Author: Gus Kazem
+// - STOCKS-ONLY CLEAN VERSION
+// - 1m execution / 1h trend
+// - Long only
+// - No time exit
+// - No Ghuphran exit
+// - No loss trail exit
+// - TP by price %
+// - Optional profit-trail only after TP extension
+// - Webhook via alert() (so TradingView uses "Any alert() function call")
+// ======================================================
+
+// ======================================================
+// A) Core inputs
+// ======================================================
+execTfNote = input.string("Run Bismillah on 1m chart", "Execution Timeframe Note")
+trendTf    = input.timeframe("60", "Trend Timeframe (HTF)")
+
+emaFastLen = input.int(50,  "EMA Fast", minval=1)
+emaSlowLen = input.int(200, "EMA Slow", minval=1)
+swingLen   = input.int(20,  "Swing Length (Execution TF)", minval=2)
+pullbackMin = input.float(0.40, "Min Pullback Depth (0.40 = 40%)", minval=0.05, maxval=0.95, step=0.05)
+
+rsiLen = input.int(14, "RSI Length (Execution TF)", minval=2)
+atrLen = input.int(14, "ATR Length (Execution TF)", minval=1)
+
+// 1m repeat behavior
+entryMode = input.string("Fast Reclaim", "Entry Repeat Behavior", options=["Fast Reclaim", "RSI Crossover"])
+priceReclaimBars = input.int(2, "1m Reclaim Confirm Bars", minval=1, maxval=10)
+
+// ======================================================
+// B) Stocks tuning (clean)
+// ======================================================
+rsiTurnUp     = input.float(46, "Stocks RSI Turn-Up", minval=1, maxval=99)
+addSpacingATR = input.float(2.4, "Stocks Add Spacing ATR", minval=0.1, step=0.1)
+tpPct         = input.float(1.0, "Stocks Take Profit %", minval=0.05, step=0.05)
+
+// Profit trail (only after TP extension)
+trailProfitOn = input.bool(true, "Stocks Trail Profit After TP")
+trailStartPct = input.float(0.20, "Stocks Trail Profit Start Extra %", minval=0.0, step=0.05)
+trailDistPct  = input.float(0.35, "Stocks Trail Profit Distance %", minval=0.05, step=0.05)
+
+// ======================================================
+// C) Regime / pause
+// ======================================================
+pauseNewEntriesManual = input.bool(false, "Pause New Entries (Manual)")
+useAutoPause          = input.bool(true, "Use Auto Pause by Regime")
+autoPauseOnRegimeFail = input.bool(true, "Kafa-Allah Trend Regime Fails")
+requireEmaSlowSlopeUp = input.bool(true, "Require HTF EMA200 AlRafi-a")
+emaSlowSlopeLookback  = input.int(10, "HTF EMA200 Slope YaAllah Bars", minval=1)
+showPauseLabels       = input.bool(false, "Alhamdulilah / REGIME Labels")
+
+// Optional market session filter (stocks only)
+useSessionFilter = input.bool(false, "Use Market Session Filter")
+tradeSession     = input.session("0930-1600", "Stocks Session (Exchange Time)")
+tradeWeekdaysOnly = input.bool(true, "Weekdays Only")
+
+// ======================================================
+// D) Position ladder sizing (stocks only)
+// ======================================================
+maxAdds = input.int(4, "Allah Al-Muatee", minval=0, maxval=10)
+
+// B1 anchor sizing (% equity)
+b1PctEquity = input.float(1.0, "Stocks B1 % Equity", minval=0.001, step=0.01)
+
+// Add multipliers from B1 (frozen at basket open)
+q0 = input.float(1.0, "Allah Recovers B1", step=0.1)
+q1 = input.float(1.1, "Allah Recovers A1", step=0.1)
+q2 = input.float(1.5, "Allah Recovers A2", step=0.1)
+q3 = input.float(1.7, "Allah Recovers A3", step=0.1)
+q4 = input.float(1.9, "Allah Recovers A4", step=0.1)
+
+// Basket cap as % equity
+maxBasketPctEquity = input.float(8.0, "Stocks Max Basket % Equity", minval=0.05, step=0.05)
+
+// ======================================================
+// E) Visual controls
+// ======================================================
+showEMAsExec          = input.bool(true,  "Alhamdulilah Execution TF EMA50/200")
+showHTFStatus         = input.bool(false, "Alhamdulilah HTF Trend Status Label")
+showBuyAddLabels      = input.bool(true,  "Alhamdulilah Buy/Add Labels")
+showExitLabels        = input.bool(true,  "Alhamdulilah Exit Labels")
+showPullbackHighlight = input.bool(false, "Alhamdulilah Pullback Highlight")
+showDebugLabel        = input.bool(false, "Alhamdulilah Debug Label")
+showModeLabels        = input.bool(false, "Bismillah Mode Labels")
+
+showTopRightDashboard = input.bool(true, "Bismillah Top Right Dashboard")
+dashboardTextSize     = input.string("small", "Bismillah Dashboard Text Size", options=["tiny", "small", "normal"])
+
+// ======================================================
+// W) Webhook controls (ALERT() MODE)
+// TradingView alert must be: "Any alert() function call"
+// Webhook URL: your Cloud Run /webhook
+// ======================================================
+useWebhookAlerts = input.bool(true, "Enable Webhook Alerts")
+appSecret        = input.string("F7k3Qp9aL", "Executor Secret")
+pingOnEveryBar   = input.bool(false, "PING on every bar close (testing)")
+tifInput         = input.string("day", "Time In Force", options=["day", "gtc", "opg", "cls", "ioc", "fok"])
+
+// Stocks-only silence gate (cannot remove script from chart, but prevents alerts off-stocks)
+isStock = syminfo.type == "stock"
+
+f_send(_json) =>
+    if useWebhookAlerts and isStock and barstate.isconfirmed
+        alert(_json, alert.freq_once_per_bar_close)
+
+// ======================================================
+// F) Core calculations
+// ======================================================
+emaFastExec = ta.ema(close, emaFastLen)
+emaSlowExec = ta.ema(close, emaSlowLen)
+rsiVal      = ta.rsi(close, rsiLen)
+atrVal      = ta.atr(atrLen)
+
+swingHigh   = ta.highest(high, swingLen)
+swingLow    = ta.lowest(low, swingLen)
+swingRange  = swingHigh - swingLow
+pullbackDepth = swingRange > 0 ? (swingHigh - close) / swingRange : 0.0
+inPullbackZone = pullbackDepth >= pullbackMin
+
+// 1m repeat-friendly momentum
+rsiCrossMode   = ta.crossover(rsiVal, rsiTurnUp) and close > high[1]
+fastReclaimMode = close > open and close > close[1] and close > emaFastExec and ta.lowest(low, priceReclaimBars) <= emaFastExec
+momentumConfirm = entryMode == "RSI Crossover" ? rsiCrossMode : (rsiVal > rsiTurnUp and fastReclaimMode)
+
+// HTF trend (stocks long-only active trend)
+htfClose    = request.security(syminfo.tickerid, trendTf, close, barmerge.gaps_off, barmerge.lookahead_off)
+htfEmaFast  = request.security(syminfo.tickerid, trendTf, ta.ema(close, emaFastLen), barmerge.gaps_off, barmerge.lookahead_off)
+htfEmaSlow  = request.security(syminfo.tickerid, trendTf, ta.ema(close, emaSlowLen), barmerge.gaps_off, barmerge.lookahead_off)
+htfEmaSlowPrev = request.security(syminfo.tickerid, trendTf, ta.ema(close, emaSlowLen)[emaSlowSlopeLookback], barmerge.gaps_off, barmerge.lookahead_off)
+
+htfEmaSlowSlopeUp = htfEmaSlow > htfEmaSlowPrev
+trendBaseHTF = htfEmaFast > htfEmaSlow and htfClose > htfEmaSlow and htfClose > htfEmaFast
+trendOk = trendBaseHTF and (requireEmaSlowSlopeUp ? htfEmaSlowSlopeUp : true)
+
+// Market session filter (exchange time)
+inSession = not na(time(timeframe.period, tradeSession))
+isWeekday = dayofweek >= dayofweek.monday and dayofweek <= dayofweek.friday
+sessionOk = useSessionFilter ? (inSession and (tradeWeekdaysOnly ? isWeekday : true)) : true
+
+// Pause logic
+regimeFail = not trendOk
+autoPaused = useAutoPause and autoPauseOnRegimeFail and regimeFail
+entriesPaused = pauseNewEntriesManual or autoPaused or (not sessionOk)
+
+// ======================================================
+// G) Strategy state
+// ======================================================
+var bool  inBasket          = false
+var int   addCount          = 0
+var int   entryBarIndex     = na
+var float lastEntryPrice    = na
+
+// Basket accounting
+var float basketQtyUnits    = 0.0
+var float basketCost        = 0.0
+var float basketAvg         = na
+var float basketDollarsUsed = 0.0
+
+// Frozen B1 anchor for current basket
+var float basketB1Dollars   = na
+
+// Exit state (profit-only logic)
+var float tpPrice             = na
+var bool  profitTrailArmed    = false
+var bool  profitTrailActive   = false
+var float profitTrailHigh     = na
+var float profitTrailStop     = na
+var float profitTrailArmPrice = na
+var string lastExitReason     = ""
+
+// ======================================================
+// H) Helpers
+// ======================================================
+f_qty_mult(_step) =>
+    _step == 0 ? q0 :
+     _step == 1 ? q1 :
+     _step == 2 ? q2 :
+     _step == 3 ? q3 :
+     _step == 4 ? q4 : q4
+
+f_order_id(_step) =>
+    _step == 0 ? "Bismillahi-1" :
+     _step == 1 ? "Bismillah-A1" :
+     _step == 2 ? "Bismillah-A2" :
+     _step == 3 ? "Bismillah-A3" :
+     _step == 4 ? "Bismillah-A4" : "Bismillah-A" + str.tostring(_step)
+
+f_step_dollars_from_b1(_step, _b1Dollars) =>
+    _b1Dollars * f_qty_mult(_step)
+
+f_equity_b1_dollars() =>
+    strategy.equity * (b1PctEquity / 100.0)
+
+f_max_basket_dollars() =>
+    strategy.equity * (maxBasketPctEquity / 100.0)
+
+f_to_qty(_dollars) =>
+    close > 0 ? (_dollars / close) : 0.0
+
+f_place_label(_txt, _y, _isUp, _bg, _tc) =>
+    label.new(bar_index, _y, _txt, style=_isUp ? label.style_label_up : label.style_label_down, color=_bg, textcolor=_tc, size=size.tiny)
+
+f_txt_size(_s) =>
+    _s == "tiny" ? size.tiny : _s == "normal" ? size.normal : size.small
+
+f_pct_up_price(_base, _pct) =>
+    _base * (1.0 + _pct / 100.0)
+
+// ======================================================
+// I) Visuals
+// ======================================================
+plot(showEMAsExec ? emaFastExec : na, "Billah Exec EMA 50", color=color.new(color.teal, 0), linewidth=2)
+plot(showEMAsExec ? emaSlowExec : na, "Billah Exec EMA 200", color=color.new(color.orange, 0), linewidth=2)
+bgcolor(showPullbackHighlight and inPullbackZone ? color.new(color.green, 88) : na)
+
+var label debugLbl = na
+var label htfLbl   = na
+var label modeLbl  = na
+var label pauseLbl = na
+var table dashTbl  = table.new(position.top_right, 2, 16, border_width=1)
+
+// ======================================================
+// J) Entry / add conditions (stocks-only)
+// ======================================================
+baseEntrySignal = isStock and (not entriesPaused) and trendOk and inPullbackZone and momentumConfirm
+
+canAddMore = inBasket and addCount < maxAdds
+spacingOk  = inBasket and not na(lastEntryPrice) and close <= (lastEntryPrice - atrVal * addSpacingATR)
+
+// Adds are recovery-oriented, spaced wider for 1m
+addBounceConfirm = close > open and close > close[1] and rsiVal > math.max(20, rsiTurnUp - 8)
+addSignalRaw = isStock and canAddMore and (not entriesPaused) and trendOk and inPullbackZone and spacingOk and addBounceConfirm
+
+// Basket cap checks
+maxBasketDollarsNow = f_max_basket_dollars()
+nextAddStep = addCount + 1
+nextAddDollarsPlanned = inBasket and not na(basketB1Dollars) ? f_step_dollars_from_b1(nextAddStep, basketB1Dollars) : na
+addWithinCap = inBasket and not na(nextAddDollarsPlanned) and ((basketDollarsUsed + nextAddDollarsPlanned) <= maxBasketDollarsNow + 1e-10)
+addSignal = addSignalRaw and addWithinCap
+
+// ======================================================
+// K) Initial entry (B1)
+// ======================================================
+if not inBasket and baseEntrySignal
+    b1DollarsCalc = f_equity_b1_dollars()
+    b1StepDollars = f_step_dollars_from_b1(0, b1DollarsCalc)
+    b1Qty = f_to_qty(b1StepDollars)
+
+    if b1Qty > 0 and b1StepDollars <= maxBasketDollarsNow
+        strategy.entry(f_order_id(0), strategy.long, qty=b1Qty)
+
+        inBasket          := true
+        addCount          := 0
+        entryBarIndex     := bar_index
+        lastEntryPrice    := close
+
+        basketB1Dollars   := b1DollarsCalc
+        basketDollarsUsed := b1StepDollars
+        basketQtyUnits    := b1Qty
+        basketCost        := close * b1Qty
+        basketAvg         := basketQtyUnits > 0 ? basketCost / basketQtyUnits : na
+
+        tpPrice             := f_pct_up_price(basketAvg, tpPct)
+        profitTrailArmed    := trailProfitOn
+        profitTrailActive   := false
+        profitTrailHigh     := na
+        profitTrailStop     := na
+        profitTrailArmPrice := trailProfitOn ? f_pct_up_price(tpPrice, trailStartPct) : na
+        lastExitReason      := ""
+
+        if showBuyAddLabels
+            f_place_label("OPEN B1 $" + str.tostring(b1StepDollars, "#.##"), low, true, color.new(color.green, 0), color.white)
+
+        // WEBHOOK: BUY B1 (notional dollars)
+        f_send('{"secret":"' + appSecret + '","alert_id":"tv-buy-{{ticker}}-{{interval}}-{{time}}-{{timenow}}","symbol":"{{ticker}}","asset_class":"equity","side":"buy","notional":' + str.tostring(b1StepDollars, "#.##") + ',"type":"market","time_in_force":"' + tifInput + '","bar_time":"{{time}}"}')
+
+// ======================================================
+// L) Add entries (recovery-focused)
+// ======================================================
+if addSignal and inBasket and not na(basketB1Dollars)
+    step        = addCount + 1
+    stepDollars = f_step_dollars_from_b1(step, basketB1Dollars)
+    stepQty     = f_to_qty(stepDollars)
+
+    if stepQty > 0
+        strategy.entry(f_order_id(step), strategy.long, qty=stepQty)
+
+        addCount          += 1
+        lastEntryPrice    := close
+        basketDollarsUsed += stepDollars
+
+        basketQtyUnits    += stepQty
+        basketCost        += close * stepQty
+        basketAvg         := basketQtyUnits > 0 ? basketCost / basketQtyUnits : na
+
+        // Recompute TP from new basket average (recovery target zone)
+        tpPrice             := f_pct_up_price(basketAvg, tpPct)
+        profitTrailArmed    := trailProfitOn
+        profitTrailActive   := false
+        profitTrailHigh     := na
+        profitTrailStop     := na
+        profitTrailArmPrice := trailProfitOn ? f_pct_up_price(tpPrice, trailStartPct) : na
+
+        if showBuyAddLabels
+            f_place_label("ADD A" + str.tostring(step) + " $" + str.tostring(stepDollars, "#.##"), low, true, color.new(color.lime, 0), color.black)
+
+        // WEBHOOK: BUY ADD (notional dollars)
+        f_send('{"secret":"' + appSecret + '","alert_id":"tv-buyadd-{{ticker}}-{{interval}}-{{time}}-{{timenow}}","symbol":"{{ticker}}","asset_class":"equity","side":"buy","notional":' + str.tostring(stepDollars, "#.##") + ',"type":"market","time_in_force":"' + tifInput + '","bar_time":"{{time}}"}')
+
+// ======================================================
+// M) Exit logic (profit-only)
+// ======================================================
+string EXIT_TP    = "Bismillah-TP"
+string EXIT_TP_TR = "Bismillah-TRAIL-PROFIT"
+
+if inBasket
+    tpPrice := f_pct_up_price(basketAvg, tpPct)
+    profitTrailArmPrice := trailProfitOn ? f_pct_up_price(tpPrice, trailStartPct) : na
+
+    if trailProfitOn and not profitTrailActive and not na(profitTrailArmPrice) and high >= profitTrailArmPrice
+        profitTrailActive := true
+        profitTrailHigh := high
+        profitTrailStop := profitTrailHigh * (1.0 - trailDistPct / 100.0)
+        profitTrailStop := math.max(profitTrailStop, tpPrice)
+
+    if profitTrailActive
+        profitTrailHigh := math.max(nz(profitTrailHigh, high), high)
+        profitTrailStop := profitTrailHigh * (1.0 - trailDistPct / 100.0)
+        profitTrailStop := math.max(profitTrailStop, tpPrice)
+
+    hitPlainTP     = (not trailProfitOn) and close >= tpPrice
+    hitProfitTrail = trailProfitOn and profitTrailActive and close <= profitTrailStop
+
+    if hitPlainTP or hitProfitTrail
+        exitReason = hitProfitTrail ? EXIT_TP_TR : EXIT_TP
+
+        // WEBHOOK: SELL CLOSE (no qty => executor close_position / noop if none)
+        f_send('{"secret":"' + appSecret + '","alert_id":"tv-sell-{{ticker}}-{{interval}}-{{time}}-{{timenow}}","symbol":"{{ticker}}","asset_class":"equity","side":"sell","type":"market","time_in_force":"' + tifInput + '","bar_time":"{{time}}"}')
+
+        strategy.close_all(comment=exitReason)
+        lastExitReason := exitReason
+
+        if showExitLabels
+            lblColor = hitProfitTrail ? color.new(color.orange, 0) : color.new(color.blue, 0)
+            lblText  = hitProfitTrail ? "EXIT TP-TRAIL" : "EXIT TP"
+            f_place_label(lblText, high, false, lblColor, color.white)
+
+        // Reset basket state
+        inBasket            := false
+        addCount            := 0
+        entryBarIndex       := na
+        lastEntryPrice      := na
+        basketQtyUnits      := 0.0
+        basketCost          := 0.0
+        basketAvg           := na
+        basketDollarsUsed   := 0.0
+        basketB1Dollars     := na
+        tpPrice             := na
+        profitTrailArmed    := false
+        profitTrailActive   := false
+        profitTrailHigh     := na
+        profitTrailStop     := na
+        profitTrailArmPrice := na
+
+// Safety sync if position closes externally / manually
+if strategy.position_size == 0 and inBasket
+    inBasket            := false
+    addCount            := 0
+    entryBarIndex       := na
+    lastEntryPrice      := na
+    basketQtyUnits      := 0.0
+    basketCost          := 0.0
+    basketAvg           := na
+    basketDollarsUsed   := 0.0
+    basketB1Dollars     := na
+    tpPrice             := na
+    profitTrailArmed    := false
+    profitTrailActive   := false
+    profitTrailHigh     := na
+    profitTrailStop     := na
+    profitTrailArmPrice := na
+
+// ======================================================
+// N) Optional labels (mostly OFF)
+// ======================================================
+if showModeLabels and barstate.islast
+    label.delete(modeLbl)
+    modeLbl := label.new(bar_index, high + atrVal * 0.9, "1M", style=label.style_label_down, color=color.new(color.blue, 0), textcolor=color.white)
+else if barstate.islast
+    label.delete(modeLbl)
+
+if showPauseLabels and barstate.islast
+    label.delete(pauseLbl)
+    pauseText = entriesPaused ? "PAUSE" : "ACT"
+    pauseLbl := label.new(bar_index, high + atrVal * 0.45, pauseText, style=label.style_label_down, color=entriesPaused ? color.red : color.green, textcolor=color.white)
+else if barstate.islast
+    label.delete(pauseLbl)
+
+if showHTFStatus and barstate.islast
+    label.delete(htfLbl)
+    htfLbl := label.new(bar_index, low - atrVal * 0.45, trendOk ? "HTF 1" : "HTF 0", style=label.style_label_up, color=trendOk ? color.green : color.red, textcolor=color.white)
+else if barstate.islast
+    label.delete(htfLbl)
+
+if showDebugLabel and barstate.islast
+    label.delete(debugLbl)
+    debugLbl := label.new(bar_index, high, "DBG", style=label.style_label_down, textcolor=color.white, color=color.new(color.black, 15))
+else if barstate.islast
+    label.delete(debugLbl)
+
+// ======================================================
+// O) Top-right dashboard (numbers only)
+// ======================================================
+if barstate.islast and showTopRightDashboard
+    table.clear(dashTbl, 0, 0, 1, 15)
+
+    txtSize = f_txt_size(dashboardTextSize)
+    capNowDash    = f_max_basket_dollars()
+    capUsePctDash = (inBasket and capNowDash > 0) ? (basketDollarsUsed / capNowDash) * 100.0 : 0.0
+    b1NowDash     = f_equity_b1_dollars()
+    holdNowDash   = inBasket and not na(entryBarIndex) ? (bar_index - entryBarIndex) : 0
+
+    table.cell(dashTbl, 0, 0,  "PF",   text_size=txtSize)
+    table.cell(dashTbl, 1, 0,  "S",    text_size=txtSize)
+
+    table.cell(dashTbl, 0, 1,  "SE",   text_size=txtSize)
+    table.cell(dashTbl, 1, 1,  sessionOk ? "1" : "0", text_size=txtSize)
+
+    table.cell(dashTbl, 0, 2,  "RG",   text_size=txtSize)
+    table.cell(dashTbl, 1, 2,  trendOk ? "1" : "0", text_size=txtSize)
+
+    table.cell(dashTbl, 0, 3,  "PA",   text_size=txtSize)
+    table.cell(dashTbl, 1, 3,  entriesPaused ? "1" : "0", text_size=txtSize)
+
+    table.cell(dashTbl, 0, 4,  "EQ",   text_size=txtSize)
+    table.cell(dashTbl, 1, 4,  str.tostring(strategy.equity, "#.##"), text_size=txtSize)
+
+    table.cell(dashTbl, 0, 5,  "B1%",  text_size=txtSize)
+    table.cell(dashTbl, 1, 5,  str.tostring(b1PctEquity, "#.##"), text_size=txtSize)
+
+    table.cell(dashTbl, 0, 6,  "B1$",  text_size=txtSize)
+    table.cell(dashTbl, 1, 6,  str.tostring(b1NowDash, "#.##"), text_size=txtSize)
+
+    table.cell(dashTbl, 0, 7,  "CAP%", text_size=txtSize)
+    table.cell(dashTbl, 1, 7,  str.tostring(maxBasketPctEquity, "#.##"), text_size=txtSize)
+
+    table.cell(dashTbl, 0, 8,  "CAP$", text_size=txtSize)
+    table.cell(dashTbl, 1, 8,  str.tostring(capNowDash, "#.##"), text_size=txtSize)
+
+    table.cell(dashTbl, 0, 9,  "USE%", text_size=txtSize)
+    table.cell(dashTbl, 1, 9,  str.tostring(capUsePctDash, "#.##"), text_size=txtSize)
+
+    table.cell(dashTbl, 0, 10, "ADD",  text_size=txtSize)
+    table.cell(dashTbl, 1, 10, str.tostring(addCount) + "/" + str.tostring(maxAdds), text_size=txtSize)
+
+    table.cell(dashTbl, 0, 11, "AVG",  text_size=txtSize)
+    table.cell(dashTbl, 1, 11, inBasket and not na(basketAvg) ? str.tostring(basketAvg, "#.#####") : "0", text_size=txtSize)
+
+    table.cell(dashTbl, 0, 12, "TP%",  text_size=txtSize)
+    table.cell(dashTbl, 1, 12, str.tostring(tpPct, "#.##"), text_size=txtSize)
+
+    table.cell(dashTbl, 0, 13, "TP",   text_size=txtSize)
+    table.cell(dashTbl, 1, 13, inBasket and not na(tpPrice) ? str.tostring(tpPrice, "#.#####") : "0", text_size=txtSize)
+
+    table.cell(dashTbl, 0, 14, "PTS",  text_size=txtSize)
+    table.cell(dashTbl, 1, 14, inBasket and profitTrailActive and not na(profitTrailStop) ? str.tostring(profitTrailStop, "#.#####") : "0", text_size=txtSize)
+
+    table.cell(dashTbl, 0, 15, "HB",   text_size=txtSize)
+    table.cell(dashTbl, 1, 15, str.tostring(holdNowDash), text_size=txtSize)
+else if barstate.islast and not showTopRightDashboard
+    table.clear(dashTbl, 0, 0, 1, 15)
+
+// ======================================================
+// Z) Optional PING (testing only)
+// ======================================================
+if pingOnEveryBar
+    f_send('{"secret":"' + appSecret + '","action":"ping","alert_id":"tv-ping-{{ticker}}-{{interval}}-{{time}}-{{timenow}}","symbol":"{{ticker}}","asset_class":"equity","bar_time":"{{time}}"}')
