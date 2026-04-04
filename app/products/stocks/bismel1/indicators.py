@@ -11,6 +11,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
+from app.products.stocks.bismel1.models import PriceBar
+
 
 def ema(values: list[float], length: int) -> list[float | None]:
     """Return a Pine-style EMA series using alpha=2/(length+1)."""
@@ -136,3 +140,68 @@ def pct_up_price(base: float, pct: float) -> float:
     """Match Pine helper `f_pct_up_price`."""
 
     return base * (1.0 + pct / 100.0)
+
+
+def shift_series(values: list[float | None], bars_back: int) -> list[float | None]:
+    """Shift a series backward by `bars_back`, matching Pine `[n]` indexing."""
+
+    if bars_back < 0:
+        raise ValueError("bars_back must be >= 0.")
+    if bars_back == 0:
+        return list(values)
+    if not values:
+        return []
+    return ([None] * bars_back) + list(values[:-bars_back])
+
+
+def merge_htf_series(
+    execution_bars: list[PriceBar],
+    htf_bars: list[PriceBar],
+    htf_values: list[float | None],
+) -> list[float | None]:
+    """Approximate Pine `request.security(..., gaps_off, lookahead_off)` on execution bars.
+
+    The current HTF bar only becomes visible once that HTF bar is closed. Earlier
+    child bars keep the last confirmed non-`None` HTF value.
+    """
+
+    if len(htf_bars) != len(htf_values):
+        raise ValueError("htf_bars and htf_values must have the same length.")
+    if not execution_bars:
+        return []
+    if not htf_bars:
+        return [None] * len(execution_bars)
+
+    confirmed_value: float | None = None
+    merged: list[float | None] = []
+    htf_index = 0
+
+    for exec_index, execution_bar in enumerate(execution_bars):
+        execution_bar_ends_at = _resolve_bar_close_at(execution_bars, exec_index)
+        if execution_bar_ends_at is None:
+            merged.append(confirmed_value)
+            continue
+
+        while htf_index < len(htf_bars):
+            htf_bar_ends_at = _resolve_bar_close_at(htf_bars, htf_index)
+            if htf_bar_ends_at is None or htf_bar_ends_at > execution_bar_ends_at:
+                break
+            htf_value = htf_values[htf_index]
+            if htf_value is not None:
+                confirmed_value = htf_value
+            htf_index += 1
+
+        merged.append(confirmed_value)
+
+    return merged
+
+
+def _resolve_bar_close_at(bars: list[PriceBar], index: int) -> datetime | None:
+    """Return a best-effort close timestamp for a bar without inventing future bars."""
+
+    bar = bars[index]
+    if bar.ends_at is not None:
+        return bar.ends_at
+    if index + 1 < len(bars):
+        return bars[index + 1].starts_at
+    return None

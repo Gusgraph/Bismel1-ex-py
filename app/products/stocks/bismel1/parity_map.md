@@ -187,6 +187,18 @@ This file documents the Pine source of truth in `reference/pine/Stocks-pine.pine
 - Session membership uses `time(timeframe.period, tradeSession)`.
 - Alerts only fire on `barstate.isconfirmed`.
 
+## HTF alignment assumptions implemented in Python
+
+- HTF series are first computed in HTF context, then merged onto execution bars.
+- Merge intent is Pine `request.security(..., barmerge.gaps_off, barmerge.lookahead_off)` for the HTF trend scaffolding only.
+- A confirmed HTF value does not appear on execution bars before the HTF bar is closed.
+- Before the first confirmed HTF value exists, the merged execution-side value remains `None`.
+- After an HTF value is confirmed, execution bars carry that last confirmed non-`None` value forward until a later HTF bar closes.
+- `gaps_off` is modeled as carry-forward of the last confirmed non-`None` HTF value, not as synthetic interpolation.
+- `htfEmaSlowPrev` is modeled by shifting `ta.ema(close, emaSlowLen)` inside HTF context first, then merging the shifted HTF series onto execution bars.
+- Python uses `PriceBar.ends_at` when present, otherwise the next bar's `starts_at`, to decide when an HTF bar becomes confirmed for merge purposes.
+- Session parity is still unresolved; if `useSessionFilter=true`, Python currently keeps `sessionOk=false` on all bars rather than faking TradingView exchange-time membership.
+
 ## Entry conditions
 
 `baseEntrySignal` requires all of:
@@ -301,8 +313,8 @@ Visual outputs:
 ## Ambiguities and Pine-specific behavior to match carefully
 
 - `ta.ema`, `ta.rsi`, and `ta.atr` warmup behavior must match Pine exactly before parity can be claimed.
-- `request.security` with `barmerge.gaps_off` and `barmerge.lookahead_off` must be matched exactly.
-- `htfEmaSlowPrev` shifts EMA inside HTF context, not after merge.
+- `request.security` with `barmerge.gaps_off` and `barmerge.lookahead_off` is now scaffolded for HTF trend series, but still needs proof against TradingView output on real data.
+- `htfEmaSlowPrev` shifts EMA inside HTF context, not after merge; Python now models that explicitly.
 - Session and weekday logic depends on TradingView exchange-time semantics.
 - `barstate.isconfirmed` is mandatory for webhook timing.
 - `syminfo.type == "stock"` must be preserved; Python should not silently assume stock symbols.
@@ -318,12 +330,16 @@ Visual outputs:
 - Persistent state names
 - Named series and signal scaffolding
 - Thin indicator/helper signatures required by Pine logic
+- Execution-timeframe EMA/RSI/ATR/highest/lowest scaffolding
+- HTF close / EMA trend series computed on HTF bars and merged onto execution bars with no-lookahead carry-forward scaffolding
+- `htfEmaSlowPrev` shifted in HTF context before merge
+- `htfEmaSlowSlopeUp`, `trendBaseHTF`, and `trendOk` scaffolding from merged HTF series
 - Non-parity strategy scaffold
 
 ## Still not fully implemented
 
 - Exact indicator parity
-- Exact HTF merge behavior
+- Exact HTF merge proof versus TradingView on real candles
 - Exact session/calendar behavior
 - TradingView equity/order semantics
 - Actual entry/add/exit execution parity

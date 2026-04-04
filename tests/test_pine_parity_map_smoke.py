@@ -37,6 +37,7 @@ def test_pine_aligned_structures_import() -> None:
     assert config.pine_strategy_title == "Bismillah-Trobot Stocks v1"
     assert config.trend_tf == "60"
     assert state.in_basket is False
+    assert series.htf_close == []
     assert series.entries_paused == []
     assert snapshot.base_entry_signal is False
 
