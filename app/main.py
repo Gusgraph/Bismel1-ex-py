@@ -35,6 +35,7 @@ def root() -> dict[str, str]:
         "service": "executor-bootstrap",
         "status": "ok",
         "phase": "phase-1-bootstrap",
+        "runtime_target": "cloud-run",
     }
 
 

@@ -17,6 +17,7 @@ This is an inspection-only cleanup review. No files were removed in this phase.
 
 | Absolute path | Why it looks duplicate or obsolete | Recommendation |
 | --- | --- | --- |
+| `/var/www/html/bismel1.com/python/bismel1_engine/__init__.py` | Legacy package root for Python executor code inside the web repo, which overlaps with the dedicated executor repository direction. | Keep for now, remove later when the web repo no longer imports this package. |
 | `/var/www/html/bismel1.com/python/bismel1_engine/models.py` | Existing Python strategy model file for Bismel1 inside the web repo. The new executor repo now owns the dedicated Python executor structure for this concern. | Keep for now, remove later after parity migration is complete and callers are moved. |
 | `/var/www/html/bismel1.com/python/bismel1_engine/indicators.py` | Existing indicator implementation file in the web repo overlaps with the new executor repo responsibility. | Keep for now, remove later after exact Pine parity work is re-established in this repo. |
 | `/var/www/html/bismel1.com/python/bismel1_engine/strategy.py` | Existing strategy evaluation logic for Bismel1 in the web repo appears to be an earlier Python executor attempt. | Keep for now, remove later after the dedicated executor repo becomes authoritative. |

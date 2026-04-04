@@ -22,8 +22,15 @@ class AppConfig:
     environment: str
     host: str
     port: int
-    cloud_run_target: str
+    cloud_run_target: bool
     pine_source_filename: str
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 @lru_cache(maxsize=1)
@@ -33,6 +40,6 @@ def get_settings() -> AppConfig:
         environment=os.getenv("APP_ENV", "development"),
         host=os.getenv("APP_HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8080")),
-        cloud_run_target=os.getenv("CLOUD_RUN_TARGET", "true"),
+        cloud_run_target=_env_flag("CLOUD_RUN_TARGET", True),
         pine_source_filename=os.getenv("PINE_SOURCE_FILENAME", "Trobot - Stocks-Swing-4.pine"),
     )

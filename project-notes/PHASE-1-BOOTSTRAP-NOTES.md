@@ -13,14 +13,14 @@ version: 1
 
 # Phase 1 Bootstrap Notes
 
-## Created
+## Implemented In This Phase
 
-- Minimal package skeleton under `app/`, `reference/`, `tests/`, and `project-notes/`.
-- FastAPI-ready bootstrap app with `GET /` and `GET /_diag`.
-- Thin Bismel1 strategy placeholder modules under `app/products/stocks/bismel1/`.
-- Shared config and logging placeholders.
-- Minimal `requirements.txt`, `.env.example`, `.gitignore`, `Dockerfile`, and `README.md`.
-- VM duplicate-review note for nearby Python executor-related files.
+- Normalized the existing package skeleton under `app/`, `reference/`, `tests/`, and `project-notes/` to match the requested phase-1 executor foundation.
+- Kept the FastAPI-ready bootstrap app limited to `GET /` and `GET /_diag`.
+- Kept `app/products/stocks/bismel1/` as thin placeholder modules only, without claiming Pine parity.
+- Kept shared config and logging minimal for later service bootstrapping.
+- Kept the container bootstrap aligned to Cloud Run intent instead of VM-owned runtime assumptions.
+- Reviewed nearby VM paths that look related to older Python executor or strategy work and recorded cleanup candidates.
 
 ## Intentionally Not Implemented
 
@@ -33,4 +33,4 @@ version: 1
 
 ## Next Phase
 
-- Add the original Pine file into `reference/pine/` and start exact Pine-to-Python indicator parity work for `stocks/bismel1`.
+- Add the original Pine file into `reference/pine/Trobot - Stocks-Swing-4.pine` and begin exact Pine-to-Python parity work in `app/products/stocks/bismel1/` starting with indicator behavior and input mapping.
