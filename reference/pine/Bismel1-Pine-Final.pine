@@ -8,7 +8,7 @@ strategy("Bismillah-Trobot Stocks v1", overlay=true, pyramiding=5, initial_capit
 // - Author: Gus Kazem
 // - https://Gusgraph.com
 // - STOCKS ONLY (Alpaca)
-// - SWING MODE: run on 4H / Trend 1D
+// - SWING MODE: run on 1H / Trend 1D
 // - Pullback window: 20 bars
 // - Exit: ATR trailing stop + optional regime fail
 // - AUTO tier hidden: ATR% threshold 1.2

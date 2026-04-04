@@ -27,7 +27,7 @@ This file documents the exact source of truth in `reference/pine/Bismel1-Pine-Fi
 - Source comments explicitly describe:
   - stocks only
   - swing mode
-  - run on `4H` execution chart with `1D` trend timeframe
+  - run on `1H` execution chart with `1D` trend timeframe
   - pullback window `20` bars
   - exit by ATR trailing stop plus optional regime-fail exit
   - hidden auto tier threshold `ATR% < 1.2`
