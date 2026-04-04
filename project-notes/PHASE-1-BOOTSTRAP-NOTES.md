@@ -33,4 +33,4 @@ version: 1
 
 ## Next Phase
 
-- Add the original Pine file into `reference/pine/Trobot - Stocks-Swing-4.pine` and begin exact Pine-to-Python parity work in `app/products/stocks/bismel1/` starting with indicator behavior and input mapping.
+- Add the original Pine file into `reference/pine/Stocks-pine.pine` and begin exact Pine-to-Python parity work in `app/products/stocks/bismel1/` starting with indicator behavior and input mapping.

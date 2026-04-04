@@ -31,7 +31,7 @@ Live trading, webhook execution, Alpaca order routing, Firestore persistence, an
 
 The original Pine strategy is the exact source of truth for behavior. The expected reference file for the first strategy conversion is:
 
-- `reference/pine/Trobot - Stocks-Swing-4.pine`
+- `reference/pine/Stocks-pine.pine`
 
 If that file is not yet present in this repo, place the Pine source there in a later step without rewriting the logic during import.
 

@@ -41,5 +41,5 @@ def get_settings() -> AppConfig:
         host=os.getenv("APP_HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8080")),
         cloud_run_target=_env_flag("CLOUD_RUN_TARGET", True),
-        pine_source_filename=os.getenv("PINE_SOURCE_FILENAME", "Trobot - Stocks-Swing-4.pine"),
+        pine_source_filename=os.getenv("PINE_SOURCE_FILENAME", "Stocks-pine.pine"),
     )

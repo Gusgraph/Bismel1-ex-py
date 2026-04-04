@@ -17,6 +17,6 @@ This directory is reserved for Pine source files that are treated as exact sourc
 
 Expected first source file:
 
-- `reference/pine/Trobot - Stocks-Swing-4.pine`
+- `reference/pine/Stocks-pine.pine`
 
 If the file is not yet present in this repo, copy the original Pine source here in a later step without altering the logic during placement.

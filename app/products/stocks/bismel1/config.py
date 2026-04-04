@@ -19,5 +19,5 @@ class Bismel1StrategyConfig:
     product_key: str = "stocks.bismel1"
     execution_timeframe: str = "4H"
     trend_timeframe: str = "1D"
-    pine_reference_filename: str = "Trobot - Stocks-Swing-4.pine"
+    pine_reference_filename: str = "Stocks-pine.pine"
 
