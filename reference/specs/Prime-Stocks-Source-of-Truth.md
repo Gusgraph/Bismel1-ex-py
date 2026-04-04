@@ -37,6 +37,12 @@ This replaces older wording that centered the base working structure around 4H /
 
 Long-only stocks swing/pullback automation.
 
+Stocks-only lock:
+- This strategy is for stock symbols only.
+- It must not be reused for crypto, options, or other product families.
+- Other asset classes require separate strategy/product definitions.
+
+
 Designed to trade strong stocks in bullish higher-timeframe conditions, enter on pullback resolution, manage controlled recovery adds, and exit through ATR-aware trailing logic with optional regime invalidation.
 
 ## Core Market Logic
