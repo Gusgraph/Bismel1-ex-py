@@ -28,6 +28,32 @@ def test_parity_map_exists() -> None:
     assert parity_map.exists()
 
 
+def test_parity_map_documents_fixture_proof_scope() -> None:
+    parity_map = Path("app/products/stocks/bismel1/parity_map.md").read_text(encoding="utf-8")
+
+    assert "## HTF fixture proof status" in parity_map
+    assert "### Proven by deterministic fixture tests" in parity_map
+    assert "### Still assumed, not yet proven against live TradingView output" in parity_map
+
+
+def test_parity_map_documents_missing_real_series_status() -> None:
+    parity_map = Path("app/products/stocks/bismel1/parity_map.md").read_text(encoding="utf-8")
+
+    assert "## Real exported sample status" in parity_map
+    assert "this repo does not contain a TradingView-exported HTF sample file" in parity_map
+
+
+def test_pine_readme_documents_tradingview_export_contract() -> None:
+    pine_readme = Path("reference/pine/README.md").read_text(encoding="utf-8")
+
+    assert "## TradingView HTF export contract" in pine_readme
+    assert "reference/pine/Stocks-pine-tv-export-sample.csv" in pine_readme
+    assert "htf_close_tv" in pine_readme
+    assert "htf_ema_fast_tv" in pine_readme
+    assert "htf_ema_slow_tv" in pine_readme
+    assert "htf_ema_slow_prev_tv" in pine_readme
+
+
 def test_pine_aligned_structures_import() -> None:
     config = BismillahTrobotStocksV1Config()
     state = BismillahTrobotStocksV1State()

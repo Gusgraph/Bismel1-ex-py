@@ -199,6 +199,63 @@ This file documents the Pine source of truth in `reference/pine/Stocks-pine.pine
 - Python uses `PriceBar.ends_at` when present, otherwise the next bar's `starts_at`, to decide when an HTF bar becomes confirmed for merge purposes.
 - Session parity is still unresolved; if `useSessionFilter=true`, Python currently keeps `sessionOk=false` on all bars rather than faking TradingView exchange-time membership.
 
+## HTF fixture proof status
+
+### Proven by deterministic fixture tests
+
+- Fixed 1h execution and 3h HTF candle fixtures now assert exact merged HTF outputs bar by bar instead of only checking conceptual behavior.
+- No-lookahead leakage is directly covered:
+  - the first confirmed HTF value only appears on the execution bar whose close matches the HTF close
+  - a still-open trailing HTF bar does not leak onto an open trailing execution bar
+- Carry-forward behavior is directly covered:
+  - after an HTF value is confirmed, later execution bars keep that confirmed value until a later HTF bar closes
+  - a confirmed HTF `None` source does not erase the last confirmed non-`None` value under the current scaffolding
+- Warmup / unavailable periods are directly covered:
+  - merged execution bars remain `None` until the first confirmed HTF value exists
+  - `htfEmaSlowPrev` remains `None` until the shifted HTF source itself becomes available and confirmed
+- Shifted previous-EMA behavior is directly covered:
+  - `htfEmaSlowPrev` is proven against fixtures as `request.security(..., ta.ema(close, emaSlowLen)[emaSlowSlopeLookback], ...)`
+  - the proof is specifically that Python shifts inside HTF context first and only then merges to execution bars
+
+### Still assumed, not yet proven against live TradingView output
+
+- The fixture proof only validates the current Python merge scaffolding against deterministic candles. It does not yet validate against exported TradingView series for live market symbols.
+- Session membership and exchange-time behavior are still not parity-proven. Python intentionally does not claim TradingView-equivalent `time()` semantics.
+- TradingView calendar edge cases remain unproven:
+  - market holidays
+  - DST transitions
+  - shortened sessions
+  - missing vendor bars or symbol halts
+- `request.security(..., gaps_off, lookahead_off)` behavior is not yet validated against live TradingView output for irregular HTF/LTF calendars or sparse HTF source `na` patterns beyond the deterministic fixtures in `tests/fixtures_bismel1_htf.py`.
+
+### Remaining unresolved edge cases
+
+- Last-bar confirmation depends on `PriceBar.ends_at` when there is no following bar. That is fixture-proven locally, but not yet cross-checked against TradingView exports for real feeds.
+- The current proof uses evenly spaced candles. Non-uniform execution or HTF bar spacing is not yet covered.
+- Only the HTF trend-series scaffolding is fixture-proven in this phase. Entry, add, exit, session, and webhook parity remain outside this proof scope.
+
+## Real exported sample status
+
+- As of April 4, 2026, this repo does not contain a TradingView-exported HTF sample file, so real-series parity is not yet executed in tests.
+- No code-path correction was made in this phase because there is no live exported series to compare against and no defensible mismatch to act on.
+- The required sample contract is documented in `reference/pine/README.md`.
+
+### What will count as real-series proof once the sample is committed
+
+- One small exported execution-bar sample from `reference/pine/Stocks-pine.pine`.
+- Exact Python-vs-TradingView comparison for:
+  - `htfClose`
+  - `htfEmaFast`
+  - `htfEmaSlow`
+  - `htfEmaSlowPrev`
+- Any mismatch must be surfaced bar-by-bar and treated as a parity failure, not normalized away.
+
+### What remains unproven right now
+
+- Real TradingView `request.security(..., barmerge.gaps_off, barmerge.lookahead_off)` merge behavior for this script.
+- Whether the current Python `PriceBar.ends_at` confirmation rule matches TradingView on an exported live series.
+- Any parity statement stronger than fixture-level proof for the HTF trend scaffolding.
+
 ## Entry conditions
 
 `baseEntrySignal` requires all of:
