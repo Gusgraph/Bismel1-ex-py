@@ -31,41 +31,49 @@ def test_parity_map_exists() -> None:
 def test_parity_map_documents_fixture_proof_scope() -> None:
     parity_map = Path("app/products/stocks/bismel1/parity_map.md").read_text(encoding="utf-8")
 
-    assert "## HTF fixture proof status" in parity_map
-    assert "### Proven by deterministic fixture tests" in parity_map
-    assert "### Still assumed, not yet proven against live TradingView output" in parity_map
+    assert "reference/pine/Bismel1-Pine-Final.pine" in parity_map
+    assert "## Pine sections synchronized" in parity_map
+    assert "## Documented ambiguities and non-goals" in parity_map
 
 
 def test_parity_map_documents_missing_real_series_status() -> None:
     parity_map = Path("app/products/stocks/bismel1/parity_map.md").read_text(encoding="utf-8")
 
-    assert "## Real exported sample status" in parity_map
-    assert "this repo does not contain a TradingView-exported HTF sample file" in parity_map
+    assert "## Remaining parity gaps" in parity_map
+    assert "No TradingView-export comparison for the synchronized fields yet" in parity_map
 
 
 def test_pine_readme_documents_tradingview_export_contract() -> None:
     pine_readme = Path("reference/pine/README.md").read_text(encoding="utf-8")
 
-    assert "## TradingView HTF export contract" in pine_readme
-    assert "reference/pine/Stocks-pine-tv-export-sample.csv" in pine_readme
+    assert "## TradingView export contract" in pine_readme
+    assert "reference/pine/Bismel1-Pine-Final-tv-export-sample.csv" in pine_readme
     assert "htf_close_tv" in pine_readme
     assert "htf_ema_fast_tv" in pine_readme
     assert "htf_ema_slow_tv" in pine_readme
     assert "htf_ema_slow_prev_tv" in pine_readme
+    assert "pause_new_basket_tv" in pine_readme
+    assert "pause_adds_tv" in pine_readme
 
 
 def test_pine_aligned_structures_import() -> None:
     config = BismillahTrobotStocksV1Config()
     state = BismillahTrobotStocksV1State()
     series = PineComputedSeries()
-    snapshot = PineSignalSnapshot(False, False, False, False, False, False, False, False)
+    snapshot = PineSignalSnapshot(False, False, False, False, False, False, False, False, False, False)
 
     assert config.pine_strategy_title == "Bismillah-Trobot Stocks v1"
-    assert config.trend_tf == "60"
-    assert state.in_basket is False
+    assert config.pine_reference_filename == "Bismel1-Pine-Final.pine"
+    assert config.exec_tf_note == "Run Bismillah on 4H chart"
+    assert config.trend_tf == "D"
+    assert config.first_lot_dollars == 100.0
+    assert config.license_key == "tvk_REPLACE_ME"
+    assert state.add_count == 0
     assert series.htf_close == []
-    assert series.entries_paused == []
+    assert series.pause_new_basket == []
+    assert series.pause_adds == []
     assert snapshot.base_entry_signal is False
+    assert snapshot.hit_regime is False
 
 
 def test_strategy_reports_scaffolding_only() -> None:

@@ -13,31 +13,27 @@ version: 1
 
 # Pine References
 
-This directory is reserved for Pine source files that are treated as exact source-of-truth references for Python conversion.
+`reference/pine/Bismel1-Pine-Final.pine` is the current exact source-of-truth Pine file for the Bismel1 stock strategy.
 
-Expected first source file:
+The older `reference/pine/Stocks-pine.pine` file remains in the repo as historical material only. Source-truth synchronization work must follow `Bismel1-Pine-Final.pine` unless the repository owner explicitly changes that contract.
 
-- `reference/pine/Stocks-pine.pine`
+## TradingView export contract
 
-If the file is not yet present in this repo, copy the original Pine source here in a later step without altering the logic during placement.
+Real-series parity is still blocked until a small TradingView export is committed for the active source file.
 
-## TradingView HTF export contract
+Expected sample file path:
 
-Real-series HTF parity is blocked until one small TradingView export is committed to this directory.
-
-Expected file path:
-
-- `reference/pine/Stocks-pine-tv-export-sample.csv`
+- `reference/pine/Bismel1-Pine-Final-tv-export-sample.csv`
 
 Expected file format:
 
 - UTF-8 CSV
 - one row per execution-timeframe bar
-- timestamps exported in ISO-8601 with timezone offset, or in UTC-normalized `YYYY-MM-DDTHH:MM:SS+00:00`
-- rows sorted ascending by execution bar start time
+- timestamps in ISO-8601 with timezone offset, or UTC-normalized ISO-8601
+- rows sorted ascending by execution-bar start time
 - no blank separator rows
 
-Required columns:
+Required execution-bar columns:
 
 - `exec_starts_at`
 - `exec_ends_at`
@@ -45,24 +41,47 @@ Required columns:
 - `exec_high`
 - `exec_low`
 - `exec_close`
+
+Required HTF / derived columns:
+
 - `htf_starts_at`
 - `htf_ends_at`
 - `htf_close_tv`
 - `htf_ema_fast_tv`
 - `htf_ema_slow_tv`
 - `htf_ema_slow_prev_tv`
+- `trend_ok_tv`
+- `regime_fail_tv`
+- `pause_new_basket_tv`
+- `pause_adds_tv`
 
-Expected Pine export semantics:
+Recommended alert / state columns:
 
-- The sample must come from `reference/pine/Stocks-pine.pine`.
-- The export must use the same Pine inputs as the comparison config, or list any deviations next to the sample file.
-- The exported HTF columns must be the direct Pine outputs of:
+- `atr_pct_tv`
+- `is_low_tier_tv`
+- `trail_stop_tv`
+- `base_entry_signal_tv`
+- `base_entry_trigger_tv`
+- `add_signal_raw_tv`
+- `add_trigger_tv`
+- `hit_atr_trail_tv`
+- `hit_regime_tv`
+
+Expected export semantics:
+
+- The sample must come from `reference/pine/Bismel1-Pine-Final.pine`.
+- The export must use the Pine defaults unless deviations are documented alongside the CSV.
+- The HTF columns must be direct Pine outputs of:
   - `htfClose`
   - `htfEmaFast`
   - `htfEmaSlow`
   - `htfEmaSlowPrev`
-- The sample should be small and readable, ideally 20-80 execution bars covering at least:
-  - pre-first-confirmed HTF bars
-  - one HTF confirmation boundary
-  - one carry-forward span across multiple execution bars
-  - one non-initial `htfEmaSlowPrev` value
+- The pause columns must reflect the exact split-pause behavior:
+  - `pauseNewBasket`
+  - `pauseAdds`
+- The sample should be small and readable, ideally 20-80 execution bars, and include:
+  - warmup bars
+  - at least one HTF confirmation boundary
+  - at least one new-basket pause case
+  - at least one add-eligible case if available
+

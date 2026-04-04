@@ -42,26 +42,15 @@ class BismillahTrobotStocksV1Input:
 
 @dataclass
 class BismillahTrobotStocksV1State:
-    """Persistent `var` state declared by the Pine strategy."""
+    """Persistent Pine `var` state plus minimal runtime mirrors used by scaffolding."""
 
-    in_basket: bool = False
     add_count: int = 0
-    entry_bar_index: int | None = None
-    last_entry_price: float | None = None
-
-    basket_qty_units: float = 0.0
-    basket_cost: float = 0.0
-    basket_avg: float | None = None
-    basket_dollars_used: float = 0.0
-    basket_b1_dollars: float | None = None
-
-    tp_price: float | None = None
-    profit_trail_armed: bool = False
-    profit_trail_active: bool = False
-    profit_trail_high: float | None = None
-    profit_trail_stop: float | None = None
-    profit_trail_arm_price: float | None = None
-    last_exit_reason: str = ""
+    last_add_price: float | None = None
+    dollars_used: float = 0.0
+    pos_high: float | None = None
+    trail_stop: float | None = None
+    dash_table_initialized: bool = False
+    position_avg_price: float | None = None
 
 
 @dataclass(frozen=True)
@@ -72,10 +61,15 @@ class PineComputedSeries:
     ema_slow_exec: list[float | None] = field(default_factory=list)
     rsi_val: list[float | None] = field(default_factory=list)
     atr_val: list[float | None] = field(default_factory=list)
+    atr_pct: list[float | None] = field(default_factory=list)
     swing_high: list[float | None] = field(default_factory=list)
     swing_low: list[float | None] = field(default_factory=list)
     pullback_depth: list[float | None] = field(default_factory=list)
     in_pullback_zone: list[bool] = field(default_factory=list)
+    lowest_low_reclaim: list[float | None] = field(default_factory=list)
+    rsi_cross_mode: list[bool] = field(default_factory=list)
+    fast_reclaim_mode: list[bool] = field(default_factory=list)
+    momentum_confirm: list[bool] = field(default_factory=list)
     htf_close: list[float | None] = field(default_factory=list)
     htf_ema_fast: list[float | None] = field(default_factory=list)
     htf_ema_slow: list[float | None] = field(default_factory=list)
@@ -83,22 +77,30 @@ class PineComputedSeries:
     htf_ema_slow_slope_up: list[bool] = field(default_factory=list)
     trend_base_htf: list[bool] = field(default_factory=list)
     trend_ok: list[bool] = field(default_factory=list)
+    in_session: list[bool] = field(default_factory=list)
+    is_weekday: list[bool] = field(default_factory=list)
     session_ok: list[bool] = field(default_factory=list)
-    entries_paused: list[bool] = field(default_factory=list)
+    regime_fail: list[bool] = field(default_factory=list)
+    auto_paused: list[bool] = field(default_factory=list)
+    pause_new_basket: list[bool] = field(default_factory=list)
+    pause_adds: list[bool] = field(default_factory=list)
+    is_low_tier: list[bool] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
 class PineSignalSnapshot:
-    """Entry, add, and exit booleans named after Pine sections J-M."""
+    """Current-bar entry, add, and exit booleans named after the Pine file."""
 
     base_entry_signal: bool
-    can_add_more: bool
-    spacing_ok: bool
+    base_entry_trigger: bool
+    add_bounce_confirm: bool
+    gate_atr_ok: bool
+    gate_dp_ok: bool
+    cap_ok: bool
     add_signal_raw: bool
-    add_within_cap: bool
-    add_signal: bool
-    hit_plain_tp: bool
-    hit_profit_trail: bool
+    add_trigger: bool
+    hit_atr_trail: bool
+    hit_regime: bool
 
 
 StrategyInputSet = BismillahTrobotStocksV1Input
