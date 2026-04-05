@@ -84,4 +84,10 @@ def _settings() -> AppConfig:
         prime_stocks_trend_bar_limit=221,
         prime_stocks_first_lot_notional=101.0,
         prime_stocks_multi_notional=73.0,
+        prime_stocks_scheduler_job_name="prime-stocks-scheduled",
+        prime_stocks_scheduler_region="us-central1",
+        prime_stocks_scheduler_schedule="5 * * * 1-5",
+        prime_stocks_scheduler_timezone="Etc/UTC",
+        prime_stocks_scheduler_header_name="X-Prime-Stocks-Scheduler",
+        prime_stocks_scheduler_header_value="secret-value",
     )

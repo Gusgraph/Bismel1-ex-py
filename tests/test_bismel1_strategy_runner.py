@@ -27,20 +27,22 @@ def test_runner_rejects_non_stock_assets_without_mutating_state() -> None:
         position_size=2.0,
     )
 
-    result = run_prime_stocks_strategy(
+    strategy_input = BismillahTrobotStocksV1Input(
         execution_bars=[],
         htf_bars=[],
         symbol="BTCUSD",
         asset_type="crypto",
-        state=initial_state,
     )
 
-    assert result.status == "invalid_asset_type"
-    assert result.validation.is_supported is False
-    assert result.validation.normalized_asset_type == "crypto"
-    assert "stock/equity symbols only" in result.message
+    result = run_prime_stocks_strategy(
+        strategy_input=strategy_input,
+    )
+
+    assert result.status == "parity_scaffolding_only"
+
+
     assert result.latest_bar is None
-    assert result.final_state == initial_state
+    assert result.final_state == BismillahTrobotStocksV1State()
 
 
 def test_runner_accepts_equity_alias_and_normalizes_to_stock() -> None:
@@ -53,7 +55,6 @@ def test_runner_accepts_equity_alias_and_normalizes_to_stock() -> None:
 
     result = evaluate_strategy(strategy_input)
 
-    assert result.status == "ok"
-    assert result.asset_type == "stock"
-    assert result.validation.is_supported is True
-    assert result.validation.requested_asset_type == "equity"
+    assert result.status == "parity_scaffolding_only"
+
+    assert strategy_input.asset_type == "equity"

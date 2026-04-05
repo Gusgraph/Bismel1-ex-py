@@ -21,6 +21,7 @@ def test_runtime_config_loads_prime_stocks_dry_run_defaults(monkeypatch) -> None
     monkeypatch.setenv("ALPACA_API_SECRET", "secret-123")
     monkeypatch.setenv("PRIME_STOCKS_RUNTIME_ENABLED", "true")
     monkeypatch.setenv("PRIME_STOCKS_DRY_RUN", "true")
+    monkeypatch.setenv("PRIME_STOCKS_PAPER_EXECUTION_ENABLED", "false")
     monkeypatch.setenv("PRIME_STOCKS_EXECUTION_BAR_LIMIT", "351")
     monkeypatch.setenv("PRIME_STOCKS_TREND_BAR_LIMIT", "221")
 
@@ -41,3 +42,4 @@ def test_runtime_config_loads_prime_stocks_dry_run_defaults(monkeypatch) -> None
     assert settings.prime_stocks_scheduler_schedule == "5 * * * 1-5"
     assert settings.prime_stocks_scheduler_header_name == "X-Prime-Stocks-Scheduler"
     assert settings.prime_stocks_scheduler_header_value is None
+    assert settings.prime_stocks_scheduler_timezone == "Etc/UTC"

@@ -89,4 +89,4 @@ def test_strategy_reports_scaffolding_only() -> None:
 
     result = evaluate_strategy(strategy_input)
 
-    assert result["status"] == "parity_scaffolding_only"
+    assert result.status == "parity_scaffolding_only"

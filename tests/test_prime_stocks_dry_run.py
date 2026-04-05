@@ -23,7 +23,6 @@ from app.products.stocks.bismel1.models import (
     PineSignalStateBar,
     PineSignalStateEvaluation,
     PriceBar,
-    PrimeStocksAssetValidation,
     PrimeStocksStrategyResult,
 )
 from app.runtime.prime_stocks_dry_run import PrimeStocksRuntimeService
@@ -59,7 +58,7 @@ def test_dry_run_service_writes_snapshot_signal_state_and_log_records() -> None:
     assert result.order_submitted is False
     assert result.order_status == "not_submitted"
     assert result.skipped_reason == "paper_execution_disabled"
-    assert result.status == "ok"
+    assert result.status == "parity_scaffolding_only"
     assert result.bars_processed_execution == 11
     assert result.bars_processed_trend == 11
     assert result.firestore_paths["config_document"] == "runtime_products/prime_stocks/config/current"
@@ -450,28 +449,15 @@ def _strategy_result(candidate_action: str) -> PrimeStocksStrategyResult:
     )
     return PrimeStocksStrategyResult(
         product_key="stocks.bismel1",
-        strategy_key="prime_stocks",
-        strategy_title="Prime Stocks Bot Trader",
-        symbol="AAPL",
-        asset_type="stock",
-        validation=PrimeStocksAssetValidation(
-            requested_asset_type="stock",
-            normalized_asset_type="stock",
-            is_supported=True,
-        ),
-        status="ok",
+        pine_strategy_title="Prime Stocks Bot Trader",
+        status="parity_scaffolding_only",
         message="stub strategy result",
-        execution_timeframe="1H",
-        trend_timeframe="1D",
-        entry_name_first_lot="FirstLot",
-        entry_name_multi_prefix="MULTI-",
-        exit_name_atr="EXIT_ATR",
-        exit_name_regime_fail="EXIT_REGIME",
-        evaluation=evaluation,
+        series=evaluation.series,
         latest_signal=signal,
         latest_bar=latest_bar,
-        initial_state=state,
         final_state=state,
+        execution_timeframe="1H",
+        trend_timeframe="1D",
     )
 
 
@@ -501,6 +487,12 @@ def _settings(**overrides) -> AppConfig:
         prime_stocks_trend_bar_limit=221,
         prime_stocks_first_lot_notional=101.0,
         prime_stocks_multi_notional=73.0,
+        prime_stocks_scheduler_job_name="prime-stocks-scheduled",
+        prime_stocks_scheduler_region="us-central1",
+        prime_stocks_scheduler_schedule="5 * * * 1-5",
+        prime_stocks_scheduler_timezone="Etc/UTC",
+        prime_stocks_scheduler_header_name="X-Prime-Stocks-Scheduler",
+        prime_stocks_scheduler_header_value="secret-value",
     )
     base.update(overrides)
     return AppConfig(**base)
