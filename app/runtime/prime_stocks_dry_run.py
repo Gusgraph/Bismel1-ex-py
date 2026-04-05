@@ -140,14 +140,36 @@ class PrimeStocksRuntimeService:
             )
             logger.info(message)
             return disabled_result
-
-        bar_set = self._market_data.fetch_prime_stocks_bars(
-            symbol=resolved_runtime_config.symbol,
-            asset_type=resolved_runtime_config.asset_type,
-            product_key=resolved_runtime_config.product_key,
-            execution_limit=resolved_runtime_config.execution_bar_limit,
-            trend_limit=resolved_runtime_config.trend_bar_limit,
-        )
+        try:
+            bar_set = self._market_data.fetch_prime_stocks_bars(
+                symbol=resolved_runtime_config.symbol,
+                asset_type=resolved_runtime_config.asset_type,
+                product_key=resolved_runtime_config.product_key,
+                execution_limit=resolved_runtime_config.execution_bar_limit,
+                trend_limit=resolved_runtime_config.trend_bar_limit,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Prime Stocks runtime blocked before strategy evaluation because market-data fetch failed "
+                "trigger_type=%s trigger_source=%s run_id=%s",
+                trigger_type,
+                trigger_source,
+                run_id,
+            )
+            return _build_blocked_runtime_result(
+                run_id=run_id,
+                runtime_config=resolved_runtime_config,
+                allow_execution=allow_execution,
+                trigger_type=trigger_type,
+                trigger_source=trigger_source,
+                firestore_paths=self._runtime_store.get_paths().__dict__,
+                message=(
+                    "Prime Stocks runtime blocked because Alpaca market data could not be fetched after runtime config load. "
+                    f"{exc}"
+                ),
+                execution_decision="market_data_unavailable",
+                skipped_reason="market_data_unavailable",
+            )
         latest_signal_time = _resolve_latest_signal_time(bar_set.execution_bars)
         try:
             runtime_state = self._runtime_store.load_runtime_state_record()
@@ -540,6 +562,39 @@ def _build_runtime_store_failure_result(
     candidate_action: str = "BLOCKED",
     bars_processed_execution: int = 0,
     bars_processed_trend: int = 0,
+    ) -> PrimeStocksRuntimeResult:
+    return _build_blocked_runtime_result(
+        run_id=run_id,
+        runtime_config=runtime_config,
+        allow_execution=allow_execution,
+        trigger_type=trigger_type,
+        trigger_source=trigger_source,
+        firestore_paths=firestore_paths,
+        message=message,
+        latest_signal_time=latest_signal_time,
+        candidate_action=candidate_action,
+        bars_processed_execution=bars_processed_execution,
+        bars_processed_trend=bars_processed_trend,
+        execution_decision="runtime_store_unavailable",
+        skipped_reason="runtime_store_unavailable",
+    )
+
+
+def _build_blocked_runtime_result(
+    *,
+    run_id: str,
+    runtime_config: PrimeStocksRuntimeConfigRecord,
+    allow_execution: bool | None,
+    trigger_type: str,
+    trigger_source: str,
+    firestore_paths: dict[str, str],
+    message: str,
+    execution_decision: str,
+    skipped_reason: str,
+    latest_signal_time: datetime | None = None,
+    candidate_action: str = "BLOCKED",
+    bars_processed_execution: int = 0,
+    bars_processed_trend: int = 0,
 ) -> PrimeStocksRuntimeResult:
     return PrimeStocksRuntimeResult(
         run_id=run_id,
@@ -554,12 +609,12 @@ def _build_runtime_store_failure_result(
         trigger_type=trigger_type,
         trigger_source=trigger_source,
         candidate_action=candidate_action,
-        execution_decision="runtime_store_unavailable",
+        execution_decision=execution_decision,
         order_status="not_submitted",
         order_submitted=False,
         order_id=None,
         client_order_id=None,
-        skipped_reason="runtime_store_unavailable",
+        skipped_reason=skipped_reason,
         latest_signal_time=None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat(),
         status="blocked",
         message=message,

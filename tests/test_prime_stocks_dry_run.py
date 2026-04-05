@@ -315,6 +315,29 @@ def test_runtime_service_returns_degraded_result_when_runtime_result_write_fails
     assert "Firestore result persistence failed" in result.message
 
 
+def test_runtime_service_returns_blocked_result_when_market_data_fetch_fails_after_runtime_config_load() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FailingMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=FakePaperTrading(),
+        strategy_runner=lambda **_: _strategy_result("FirstLot"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True, trigger_type="scheduled", trigger_source="cloud_scheduler")
+
+    assert result.status == "blocked"
+    assert result.execution_decision == "market_data_unavailable"
+    assert result.skipped_reason == "market_data_unavailable"
+    assert result.order_submitted is False
+    assert result.trigger_type == "scheduled"
+    assert result.trigger_source == "cloud_scheduler"
+    assert "Alpaca market data could not be fetched after runtime config load" in result.message
+
+
 class FakeMarketData:
     def fetch_prime_stocks_bars(
         self,
@@ -331,6 +354,12 @@ class FakeMarketData:
             execution_bars=_bars(),
             trend_bars=_bars(),
         )
+
+
+class FailingMarketData:
+    def fetch_prime_stocks_bars(self, **kwargs) -> PrimeStocksBarSet:
+        del kwargs
+        raise RuntimeError("Alpaca credentials are required for Prime Stocks market-data fetches.")
 
 
 class FakePaperTrading:

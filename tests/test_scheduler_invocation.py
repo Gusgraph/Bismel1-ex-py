@@ -17,6 +17,7 @@ from fastapi import HTTPException
 from starlette.requests import Request
 
 from app import main
+from app.runtime.prime_stocks_dry_run import PrimeStocksRuntimeResult
 
 
 def _request_with_headers(headers: dict[str, str]) -> Request:
@@ -111,6 +112,54 @@ def test_scheduled_endpoint_returns_conflict_for_runtime_misconfiguration() -> N
             assert exc.detail == "Prime Stocks runtime only supports asset_type='stock'. Received 'crypto'."
         else:
             raise AssertionError("Expected scheduled endpoint to convert runtime misconfiguration into HTTP 409.")
+    finally:
+        main.settings = original_settings
+        main.build_prime_stocks_runtime_service = original_builder
+
+
+def test_scheduled_endpoint_returns_blocked_runtime_result_when_market_data_fetch_is_unavailable() -> None:
+    class BlockedService:
+        def run_once(self, **kwargs):
+            del kwargs
+            return PrimeStocksRuntimeResult(
+                run_id="run-test-market-data",
+                mode="paper",
+                runtime_target="cloud_run",
+                product_key="stocks.bismel1",
+                strategy_key="prime_stocks",
+                strategy_title="Prime Stocks Bot Trader",
+                symbol="AAPL",
+                asset_type="stock",
+                enabled=True,
+                trigger_type="scheduled",
+                trigger_source="cloud_scheduler",
+                candidate_action="BLOCKED",
+                execution_decision="market_data_unavailable",
+                order_status="not_submitted",
+                order_submitted=False,
+                order_id=None,
+                client_order_id=None,
+                skipped_reason="market_data_unavailable",
+                latest_signal_time=None,
+                status="blocked",
+                message="Prime Stocks runtime blocked because Alpaca market data could not be fetched after runtime config load.",
+                bars_processed_execution=0,
+                bars_processed_trend=0,
+                firestore_paths={"config_document": "runtime_products/prime_stocks/config/current"},
+            )
+
+    original_settings = main.settings
+    original_builder = main.build_prime_stocks_runtime_service
+    main.settings = replace(
+        original_settings,
+        prime_stocks_scheduler_header_value=None,
+    )
+    main.build_prime_stocks_runtime_service = lambda settings: BlockedService()
+    try:
+        payload = main.trigger_prime_stocks_scheduled(request=_request_with_headers({}))
+        assert payload["status"] == "blocked"
+        assert payload["execution_decision"] == "market_data_unavailable"
+        assert payload["skipped_reason"] == "market_data_unavailable"
     finally:
         main.settings = original_settings
         main.build_prime_stocks_runtime_service = original_builder
