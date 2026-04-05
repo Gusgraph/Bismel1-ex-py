@@ -15,7 +15,7 @@ version: 1
 
 `Bismel1-ex-py` is the Python executor-side repository for Bismel1. This repo holds the canonical Prime Stocks Python strategy module, later Cloud Run service wiring, and the surrounding deployment packaging.
 
-## Phase 4 Scope
+## Phase 5 Scope
 
 This bounded production phase delivers:
 
@@ -27,10 +27,11 @@ This bounded production phase delivers:
 - Firestore runtime config, state, signal, snapshot, execution, action, and runtime-log writes
 - Cloud Run friendly dry-run, manual execute, and scheduler-ready trigger surfaces
 - no-new-bar protection for repeated scheduled invocation
+- Cloud Scheduler deployment wiring artifacts and invocation contract notes
 - focused tests for current intended behavior
 - Cloud Run oriented repo/runtime notes
 
-This phase adds Alpaca paper execution only. Live trading is still not implemented, no webhook flow is added, and the browser is not part of runtime ownership.
+This phase prepares scheduled Cloud Run invocation around the existing paper runtime. Live trading is still not implemented, no webhook flow is added, and the browser is not part of runtime ownership.
 
 ## Canonical Strategy Rule
 
@@ -91,6 +92,15 @@ The runtime service surfaces are exposed through FastAPI:
 - `POST /runtime/prime-stocks/execute`
 - `POST /runtime/prime-stocks/scheduled`
 
+Scheduler contract:
+
+- target method: `POST`
+- target path: `/runtime/prime-stocks/scheduled`
+- Cloud Scheduler should invoke a private Cloud Run service with OIDC
+- optional scheduler header: `X-Prime-Stocks-Scheduler: prime-stocks-hourly`
+- if `PRIME_STOCKS_SCHEDULER_HEADER_VALUE` is unset, the custom header is not required
+- if `PRIME_STOCKS_SCHEDULER_HEADER_VALUE` is set, the scheduled endpoint rejects mismatched header values
+
 The runtime flow:
 
 - loads one Prime Stocks runtime config
@@ -114,6 +124,12 @@ Current Firestore path shape:
 
 ## Next Phase
 
-The next implementation step after this paper-execution phase is scheduler wiring plus Laravel runtime read integration on top of the same Cloud Run and Firestore runtime loop.
+Deployment helpers added in this phase:
+
+- `scripts/deploy_cloud_run.sh`
+- `scripts/configure_cloud_scheduler.sh`
+- `docs/cloud-scheduler-prime-stocks.md`
+
+The next implementation step after this scheduler-wiring phase is Laravel runtime read integration on top of the same Cloud Run and Firestore runtime loop.
 
 Cloud Scheduler is intended to invoke the Cloud Run scheduled runtime surface. The runtime only advances on newly closed bars, and the user browser is not involved in runtime continuity.

@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request, status
 
 from app.runtime.prime_stocks_dry_run import build_prime_stocks_runtime_service
 from app.shared.config import get_settings
@@ -35,7 +35,7 @@ def root() -> dict[str, str]:
         "app": settings.app_name,
         "service": "prime-stocks-runtime",
         "status": "ok",
-        "phase": "phase-3-paper-execution",
+        "phase": "phase-5-cloud-scheduler-wiring",
         "runtime_target": "cloud-run",
     }
 
@@ -67,6 +67,9 @@ def diag() -> dict[str, object]:
         "prime_stocks_paper_execution_enabled": settings.prime_stocks_paper_execution_enabled,
         "alpaca_trading_base_url": settings.alpaca_trading_base_url,
         "scheduler_ready_runtime": True,
+        "scheduler_target_path": "/runtime/prime-stocks/scheduled",
+        "scheduler_header_name": settings.prime_stocks_scheduler_header_name,
+        "scheduler_header_value_required": settings.prime_stocks_scheduler_header_value is not None,
         "live_execution_implemented": False,
         "paper_execution_implemented": True,
     }
@@ -87,7 +90,24 @@ def trigger_prime_stocks_paper_execution(symbol: str | None = None) -> dict[str,
 
 
 @app.post("/runtime/prime-stocks/scheduled")
-def trigger_prime_stocks_scheduled(symbol: str | None = None) -> dict[str, object]:
+def trigger_prime_stocks_scheduled(
+    request: Request,
+    symbol: str | None = None,
+) -> dict[str, object]:
+    _validate_scheduler_request(request=request)
     service = build_prime_stocks_runtime_service(settings=settings)
     result = service.run_once(symbol=symbol, allow_execution=True, trigger_type="scheduled", trigger_source="cloud_scheduler")
     return result.__dict__
+
+
+def _validate_scheduler_request(*, request: Request | None) -> None:
+    expected_header_value = settings.prime_stocks_scheduler_header_value
+    if expected_header_value is None:
+        return
+    header_value = None if request is None else request.headers.get(settings.prime_stocks_scheduler_header_name)
+    if header_value == expected_header_value:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Scheduled runtime request rejected because the configured scheduler header did not match.",
+    )

@@ -23,3 +23,4 @@ Current phase:
 - writes latest signal/action candidate
 - writes latest execution decision and action record
 - writes runtime logs
+- supports the Cloud Scheduler to Cloud Run runtime path without browser participation

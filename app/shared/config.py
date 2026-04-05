@@ -42,6 +42,12 @@ class AppConfig:
     prime_stocks_trend_bar_limit: int
     prime_stocks_first_lot_notional: float
     prime_stocks_multi_notional: float
+    prime_stocks_scheduler_job_name: str
+    prime_stocks_scheduler_region: str
+    prime_stocks_scheduler_schedule: str
+    prime_stocks_scheduler_timezone: str
+    prime_stocks_scheduler_header_name: str
+    prime_stocks_scheduler_header_value: str | None
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -86,4 +92,10 @@ def get_settings() -> AppConfig:
         prime_stocks_trend_bar_limit=int(os.getenv("PRIME_STOCKS_TREND_BAR_LIMIT", "221")),
         prime_stocks_first_lot_notional=float(os.getenv("PRIME_STOCKS_FIRST_LOT_NOTIONAL", "101.0")),
         prime_stocks_multi_notional=float(os.getenv("PRIME_STOCKS_MULTI_NOTIONAL", "73.0")),
+        prime_stocks_scheduler_job_name=os.getenv("PRIME_STOCKS_SCHEDULER_JOB_NAME", "prime-stocks-scheduled"),
+        prime_stocks_scheduler_region=os.getenv("PRIME_STOCKS_SCHEDULER_REGION", "us-central1"),
+        prime_stocks_scheduler_schedule=os.getenv("PRIME_STOCKS_SCHEDULER_SCHEDULE", "5 * * * 1-5"),
+        prime_stocks_scheduler_timezone=os.getenv("PRIME_STOCKS_SCHEDULER_TIMEZONE", "Etc/UTC"),
+        prime_stocks_scheduler_header_name=os.getenv("PRIME_STOCKS_SCHEDULER_HEADER_NAME", "X-Prime-Stocks-Scheduler"),
+        prime_stocks_scheduler_header_value=_env_optional("PRIME_STOCKS_SCHEDULER_HEADER_VALUE"),
     )

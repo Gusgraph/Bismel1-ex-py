@@ -23,3 +23,6 @@ Current phase:
 - writes runtime state, snapshot, signal, execution, action, and logs to Firestore
 - can submit guarded Alpaca paper orders
 - does not place live orders
+- expects Cloud Scheduler to invoke `POST /runtime/prime-stocks/scheduled`
+- evaluates only on newly closed `1H` bars
+- keeps browser state out of runtime continuity
