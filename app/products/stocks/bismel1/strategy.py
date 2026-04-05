@@ -35,6 +35,7 @@ from app.products.stocks.bismel1.models import (
     PineComputedSeries,
     PineSignalSnapshot,
     StrategyInputSet,
+    PrimeStocksStrategyResult,
 )
 
 
@@ -321,7 +322,7 @@ def evaluate_signal_state_phase(
 def evaluate_strategy(
     strategy_input: StrategyInputSet,
     config: Bismel1StrategyConfig | None = None,
-) -> dict[str, object]:
+) -> PrimeStocksStrategyResult:
     resolved_config = config or Bismel1StrategyConfig()
     series = compute_pine_series(strategy_input, resolved_config)
     evaluation = evaluate_signal_state_phase(
@@ -330,14 +331,19 @@ def evaluate_strategy(
         series=series,
     )
     signals = evaluation.bars[-1].signal if evaluation.bars else _empty_signal_snapshot()
-    return {
-        "product_key": resolved_config.product_key,
-        "pine_strategy_title": resolved_config.pine_strategy_title,
-        "status": "parity_scaffolding_only",
-        "message": "Pine source-truth inputs, bar-by-bar signal/state gating, and signal names are synchronized for the current parity phase, but execution parity is not implemented.",
-        "series_type": type(series).__name__,
-        "signal_type": type(signals).__name__,
-    }
+    latest_bar = evaluation.bars[-1] if evaluation.bars else None
+    return PrimeStocksStrategyResult(
+        product_key=resolved_config.product_key,
+        pine_strategy_title=resolved_config.pine_strategy_title,
+        status="parity_scaffolding_only",
+        message="Pine source-truth inputs, bar-by-bar signal/state gating, and signal names are synchronized for the current parity phase, but execution parity is not implemented.",
+        series=series,
+        latest_signal=signals,
+        latest_bar=latest_bar,
+        final_state=evaluation.final_state,
+        execution_timeframe="1H",
+        trend_timeframe="1D",
+    )
 
 
 def _empty_signal_snapshot() -> PineSignalSnapshot:
@@ -666,3 +672,7 @@ def _add_signal_raw_at(
         and resolved_gate_dp_ok
         and resolved_cap_ok
     )
+
+
+def run_prime_stocks_strategy(*args, **kwargs):
+    return evaluate_strategy(*args, **kwargs)

@@ -128,4 +128,21 @@ class PineSignalStateEvaluation:
     final_state: BismillahTrobotStocksV1State = field(default_factory=BismillahTrobotStocksV1State)
 
 
+@dataclass(frozen=True)
+class PrimeStocksStrategyResult:
+    """Consolidated strategy output."""
+
+    product_key: str
+    pine_strategy_title: str
+    status: str
+    message: str
+    series: PineComputedSeries
+    latest_signal: PineSignalSnapshot
+    latest_bar: PineSignalStateBar | None
+    final_state: BismillahTrobotStocksV1State
+    execution_timeframe: str = "1H"
+    trend_timeframe: str = "1D"
+
+
+
 StrategyInputSet = BismillahTrobotStocksV1Input
