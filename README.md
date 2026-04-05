@@ -15,7 +15,7 @@ version: 1
 
 `Bismel1-ex-py` is the Python executor-side repository for Bismel1. This repo holds the canonical Prime Stocks Python strategy module, later Cloud Run service wiring, and the surrounding deployment packaging.
 
-## Phase 3 Scope
+## Phase 4 Scope
 
 This bounded production phase delivers:
 
@@ -25,7 +25,8 @@ This bounded production phase delivers:
 - Alpaca market-data fetches for 1H execution and 1D trend bars
 - Alpaca paper order submission for guarded Prime Stocks candidate actions
 - Firestore runtime config, state, signal, snapshot, execution, action, and runtime-log writes
-- Cloud Run friendly dry-run and paper-execution trigger surfaces
+- Cloud Run friendly dry-run, manual execute, and scheduler-ready trigger surfaces
+- no-new-bar protection for repeated scheduled invocation
 - focused tests for current intended behavior
 - Cloud Run oriented repo/runtime notes
 
@@ -88,15 +89,18 @@ The runtime service surfaces are exposed through FastAPI:
 - `GET /_diag`
 - `POST /runtime/prime-stocks/dry-run`
 - `POST /runtime/prime-stocks/execute`
+- `POST /runtime/prime-stocks/scheduled`
 
 The runtime flow:
 
 - loads one Prime Stocks runtime config
 - fetches Alpaca bars for `1H` execution and `1D` trend
+- evaluates only when a newly closed `1H` bar exists beyond the last processed bar time
 - runs the canonical strategy
 - writes runtime state, latest snapshot, latest signal, latest execution decision, latest action record, and logs to Firestore
 - can submit guarded Alpaca paper orders for `FirstLot`, `MULTI`, `EXIT_ATR`, and `EXIT_REGIME`
 - places no live orders
+- records scheduler-oriented trigger metadata for readable runtime logs
 
 Current Firestore path shape:
 
@@ -111,3 +115,5 @@ Current Firestore path shape:
 ## Next Phase
 
 The next implementation step after this paper-execution phase is scheduler wiring plus Laravel runtime read integration on top of the same Cloud Run and Firestore runtime loop.
+
+Cloud Scheduler is intended to invoke the Cloud Run scheduled runtime surface. The runtime only advances on newly closed bars, and the user browser is not involved in runtime continuity.

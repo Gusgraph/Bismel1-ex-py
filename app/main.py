@@ -66,6 +66,7 @@ def diag() -> dict[str, object]:
         "prime_stocks_trend_bar_limit": settings.prime_stocks_trend_bar_limit,
         "prime_stocks_paper_execution_enabled": settings.prime_stocks_paper_execution_enabled,
         "alpaca_trading_base_url": settings.alpaca_trading_base_url,
+        "scheduler_ready_runtime": True,
         "live_execution_implemented": False,
         "paper_execution_implemented": True,
     }
@@ -74,12 +75,19 @@ def diag() -> dict[str, object]:
 @app.post("/runtime/prime-stocks/dry-run")
 def trigger_prime_stocks_dry_run(symbol: str | None = None) -> dict[str, object]:
     service = build_prime_stocks_runtime_service(settings=settings)
-    result = service.run_once(symbol=symbol, allow_execution=False)
+    result = service.run_once(symbol=symbol, allow_execution=False, trigger_type="manual", trigger_source="api")
     return result.__dict__
 
 
 @app.post("/runtime/prime-stocks/execute")
 def trigger_prime_stocks_paper_execution(symbol: str | None = None) -> dict[str, object]:
     service = build_prime_stocks_runtime_service(settings=settings)
-    result = service.run_once(symbol=symbol, allow_execution=True)
+    result = service.run_once(symbol=symbol, allow_execution=True, trigger_type="manual", trigger_source="api")
+    return result.__dict__
+
+
+@app.post("/runtime/prime-stocks/scheduled")
+def trigger_prime_stocks_scheduled(symbol: str | None = None) -> dict[str, object]:
+    service = build_prime_stocks_runtime_service(settings=settings)
+    result = service.run_once(symbol=symbol, allow_execution=True, trigger_type="scheduled", trigger_source="cloud_scheduler")
     return result.__dict__

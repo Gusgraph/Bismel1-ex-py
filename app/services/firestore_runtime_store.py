@@ -63,6 +63,14 @@ class PrimeStocksLatestExecutionRecord:
     latest_signal_time: str | None = None
 
 
+@dataclass(frozen=True)
+class PrimeStocksRuntimeStateRecord:
+    last_processed_bar_time: str | None = None
+    latest_candidate_action: str | None = None
+    latest_status: str | None = None
+    latest_execution_decision: str | None = None
+
+
 class FirestoreClientProtocol(Protocol):
     def collection(self, name: str) -> Any:
         ...
@@ -127,6 +135,18 @@ class PrimeStocksFirestoreRuntimeStore:
             latest_signal_time=_maybe_string(payload.get("latest_signal_time")),
         )
 
+    def load_runtime_state_record(self) -> PrimeStocksRuntimeStateRecord:
+        snapshot = self._state_document().get()
+        payload = snapshot.to_dict() if getattr(snapshot, "exists", False) else None
+        if not payload:
+            return PrimeStocksRuntimeStateRecord()
+        return PrimeStocksRuntimeStateRecord(
+            last_processed_bar_time=_maybe_string(payload.get("last_processed_bar_time")),
+            latest_candidate_action=_maybe_string(payload.get("latest_candidate_action")),
+            latest_status=_maybe_string(payload.get("latest_status")),
+            latest_execution_decision=_maybe_string(payload.get("latest_execution_decision")),
+        )
+
     def write_runtime_result(
         self,
         *,
@@ -140,6 +160,8 @@ class PrimeStocksFirestoreRuntimeStore:
         execution_decision: str,
         execution_result: AlpacaPaperExecutionResult | None,
         skipped_reason: str | None,
+        trigger_type: str,
+        trigger_source: str,
     ) -> None:
         now = datetime.now(tz=UTC)
         serialized_signal = _serialize_signal(strategy_result)
@@ -162,6 +184,8 @@ class PrimeStocksFirestoreRuntimeStore:
             "dry_run": runtime_config.dry_run,
             "paper_execution_enabled": runtime_config.paper_execution_enabled,
             "runtime_message": runtime_message,
+            "trigger_type": trigger_type,
+            "trigger_source": trigger_source,
             "candidate_action": candidate_action,
             "execution_timeframe": strategy_result.execution_timeframe,
             "trend_timeframe": strategy_result.trend_timeframe,
@@ -179,6 +203,8 @@ class PrimeStocksFirestoreRuntimeStore:
             "candidate_action": candidate_action,
             "latest_signal_time": _isoformat_or_none(latest_signal_time),
             "signal": serialized_signal,
+            "trigger_type": trigger_type,
+            "trigger_source": trigger_source,
             "updated_at": now.isoformat(),
         }
         current_state = {
@@ -192,6 +218,8 @@ class PrimeStocksFirestoreRuntimeStore:
             "runtime_target": runtime_config.runtime_target,
             "latest_execution_decision": execution_decision,
             "latest_order_status": serialized_execution["order_status"],
+            "trigger_type": trigger_type,
+            "trigger_source": trigger_source,
             "updated_at": now.isoformat(),
         }
         execution_current = {
@@ -206,6 +234,8 @@ class PrimeStocksFirestoreRuntimeStore:
             "client_order_id": serialized_execution["client_order_id"],
             "submitted": serialized_execution["submitted"],
             "skipped_reason": serialized_execution["skipped_reason"],
+            "trigger_type": trigger_type,
+            "trigger_source": trigger_source,
             "updated_at": now.isoformat(),
         }
         latest_action = {
@@ -214,6 +244,8 @@ class PrimeStocksFirestoreRuntimeStore:
             "execution_decision": execution_decision,
             "execution_mode": execution_mode,
             "execution": serialized_execution,
+            "trigger_type": trigger_type,
+            "trigger_source": trigger_source,
             "updated_at": now.isoformat(),
         }
         log_payload = {
@@ -221,6 +253,8 @@ class PrimeStocksFirestoreRuntimeStore:
             "level": "INFO",
             "kind": "runtime_execution",
             "message": runtime_message,
+            "trigger_type": trigger_type,
+            "trigger_source": trigger_source,
             "symbol": runtime_config.symbol,
             "status": strategy_result.status,
             "candidate_action": candidate_action,

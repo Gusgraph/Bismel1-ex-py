@@ -23,6 +23,7 @@ from app.services.firestore_runtime_store import (
     PrimeStocksFirestoreRuntimeStore,
     PrimeStocksLatestExecutionRecord,
     PrimeStocksRuntimeConfigRecord,
+    PrimeStocksRuntimeStateRecord,
     build_default_runtime_config,
 )
 from app.shared.config import AppConfig
@@ -42,6 +43,8 @@ class PrimeStocksRuntimeResult:
     symbol: str
     asset_type: str
     enabled: bool
+    trigger_type: str
+    trigger_source: str
     candidate_action: str
     execution_decision: str
     order_status: str
@@ -72,7 +75,13 @@ class PrimeStocksRuntimeService:
         self._paper_trading = paper_trading or AlpacaPaperTradingAdapter(settings=settings)
         self._strategy_runner = strategy_runner or run_prime_stocks_strategy
 
-    def run_once(self, symbol: str | None = None, allow_execution: bool | None = None) -> PrimeStocksRuntimeResult:
+    def run_once(
+        self,
+        symbol: str | None = None,
+        allow_execution: bool | None = None,
+        trigger_type: str = "manual",
+        trigger_source: str = "api",
+    ) -> PrimeStocksRuntimeResult:
         default_runtime_config = build_default_runtime_config(self._settings)
         runtime_config = self._runtime_store.load_runtime_config(default_runtime_config)
         resolved_runtime_config = _override_symbol(runtime_config, symbol)
@@ -91,6 +100,8 @@ class PrimeStocksRuntimeService:
                 symbol=resolved_runtime_config.symbol,
                 asset_type=resolved_runtime_config.asset_type,
                 enabled=False,
+                trigger_type=trigger_type,
+                trigger_source=trigger_source,
                 candidate_action="DISABLED",
                 execution_decision="skipped",
                 order_status="not_submitted",
@@ -115,13 +126,52 @@ class PrimeStocksRuntimeService:
             execution_limit=resolved_runtime_config.execution_bar_limit,
             trend_limit=resolved_runtime_config.trend_bar_limit,
         )
+        latest_signal_time = _resolve_latest_signal_time(bar_set.execution_bars)
+        runtime_state = self._runtime_store.load_runtime_state_record()
+        if _has_no_new_closed_bar(runtime_state=runtime_state, latest_signal_time=latest_signal_time):
+            no_new_bar_result = PrimeStocksRuntimeResult(
+                run_id=run_id,
+                mode=_resolve_mode(resolved_runtime_config, allow_execution=allow_execution),
+                runtime_target=resolved_runtime_config.runtime_target,
+                product_key=resolved_runtime_config.product_key,
+                strategy_key=resolved_runtime_config.strategy_key,
+                strategy_title=resolved_runtime_config.strategy_title,
+                symbol=resolved_runtime_config.symbol,
+                asset_type=resolved_runtime_config.asset_type,
+                enabled=resolved_runtime_config.enabled,
+                trigger_type=trigger_type,
+                trigger_source=trigger_source,
+                candidate_action="NO_NEW_BAR",
+                execution_decision="skipped_no_new_bar",
+                order_status="not_submitted",
+                order_submitted=False,
+                order_id=None,
+                client_order_id=None,
+                skipped_reason="no_new_closed_bar",
+                latest_signal_time=None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat(),
+                status="no_op",
+                message=_build_runtime_message(
+                    execution_mode=_resolve_mode(resolved_runtime_config, allow_execution=allow_execution),
+                    execution_decision="skipped_no_new_bar",
+                ),
+                bars_processed_execution=len(bar_set.execution_bars),
+                bars_processed_trend=len(bar_set.trend_bars),
+                firestore_paths=self._runtime_store.get_paths().__dict__,
+            )
+            logger.info(
+                "Prime Stocks runtime skipped for %s because no newly closed bar is available trigger_type=%s trigger_source=%s run_id=%s",
+                resolved_runtime_config.symbol,
+                trigger_type,
+                trigger_source,
+                run_id,
+            )
+            return no_new_bar_result
         strategy_result = self._strategy_runner(
             execution_bars=bar_set.execution_bars,
             htf_bars=bar_set.trend_bars,
             symbol=resolved_runtime_config.symbol,
             asset_type=resolved_runtime_config.asset_type,
         )
-        latest_signal_time = _resolve_latest_signal_time(bar_set.execution_bars)
         candidate_action = _resolve_candidate_action(strategy_result)
         latest_execution = self._runtime_store.load_latest_execution_record()
         execution_result, execution_decision, skipped_reason = self._execute_candidate_action(
@@ -147,6 +197,8 @@ class PrimeStocksRuntimeService:
             execution_decision=execution_decision,
             execution_result=execution_result,
             skipped_reason=skipped_reason,
+            trigger_type=trigger_type,
+            trigger_source=trigger_source,
         )
         result = PrimeStocksRuntimeResult(
             run_id=run_id,
@@ -158,6 +210,8 @@ class PrimeStocksRuntimeService:
             symbol=resolved_runtime_config.symbol,
             asset_type=resolved_runtime_config.asset_type,
             enabled=resolved_runtime_config.enabled,
+            trigger_type=trigger_type,
+            trigger_source=trigger_source,
             candidate_action=candidate_action,
             execution_decision=execution_decision,
             order_status=execution_result.order_status if execution_result is not None else "not_submitted",
@@ -173,10 +227,12 @@ class PrimeStocksRuntimeService:
             firestore_paths=self._runtime_store.get_paths().__dict__,
         )
         logger.info(
-            "Prime Stocks runtime completed for %s with candidate_action=%s execution_decision=%s run_id=%s",
+            "Prime Stocks runtime completed for %s with candidate_action=%s execution_decision=%s trigger_type=%s trigger_source=%s run_id=%s",
             resolved_runtime_config.symbol,
             candidate_action,
             execution_decision,
+            trigger_type,
+            trigger_source,
             run_id,
         )
         return result
@@ -299,6 +355,19 @@ def _resolve_latest_signal_time(execution_bars) -> datetime | None:
     return latest_bar.ends_at or latest_bar.starts_at
 
 
+def _has_no_new_closed_bar(
+    *,
+    runtime_state: PrimeStocksRuntimeStateRecord,
+    latest_signal_time: datetime | None,
+) -> bool:
+    if latest_signal_time is None:
+        return True
+    if runtime_state.last_processed_bar_time is None:
+        return False
+    last_processed_bar_time = _parse_iso_utc(runtime_state.last_processed_bar_time)
+    return latest_signal_time <= last_processed_bar_time
+
+
 def _resolve_candidate_action(strategy_result) -> str:
     latest_signal = strategy_result.latest_signal
     if latest_signal.hit_atr_trail:
@@ -323,6 +392,11 @@ def _resolve_mode(runtime_config: PrimeStocksRuntimeConfigRecord, *, allow_execu
 
 
 def _build_runtime_message(*, execution_mode: str, execution_decision: str) -> str:
+    if execution_decision == "skipped_no_new_bar":
+        return (
+            "Prime Stocks Cloud Run runtime skipped because no newly closed 1H bar was available. "
+            "Scheduled and manual triggers only evaluate newly closed bars."
+        )
     if execution_mode == "paper":
         return (
             "Prime Stocks Cloud Run paper runtime completed with server-side market data, strategy evaluation, "
@@ -342,6 +416,13 @@ def _build_client_order_id(*, run_id: str, candidate_action: str) -> str:
     action_slug = candidate_action.lower().replace("_", "-")
     run_slug = run_id.replace("dryrun-", "").replace("run-", "")
     return f"prime-{action_slug}-{run_slug}"[:47]
+
+
+def _parse_iso_utc(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 PrimeStocksDryRunService = PrimeStocksRuntimeService

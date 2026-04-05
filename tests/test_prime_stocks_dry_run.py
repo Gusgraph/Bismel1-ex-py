@@ -49,6 +49,8 @@ def test_dry_run_service_writes_snapshot_signal_state_and_log_records() -> None:
     result = service.run_once(symbol="AAPL", allow_execution=False)
 
     assert result.mode == "dry-run"
+    assert result.trigger_type == "manual"
+    assert result.trigger_source == "api"
     assert result.runtime_target == "cloud_run"
     assert result.symbol == "AAPL"
     assert result.asset_type == "stock"
@@ -188,6 +190,90 @@ def test_runtime_service_rejects_non_stock_runtime_config() -> None:
         assert "asset_type='stock'" in str(exc)
     else:
         raise AssertionError("Expected Prime Stocks runtime to reject non-stock runtime config.")
+
+
+def test_runtime_service_skips_when_no_new_closed_bar_is_available() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    latest_signal_time = _bars()[-1].ends_at.isoformat()
+    fake_client.collection("runtime_products").document("prime_stocks").collection("state").document("current").set(
+        {
+            "last_processed_bar_time": latest_signal_time,
+            "latest_candidate_action": "FirstLot",
+            "latest_status": "ok",
+            "latest_execution_decision": "submitted_buy",
+        }
+    )
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=FakePaperTrading(),
+        strategy_runner=lambda **_: _strategy_result("FirstLot"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True, trigger_type="scheduled", trigger_source="cloud_scheduler")
+
+    assert result.status == "no_op"
+    assert result.execution_decision == "skipped_no_new_bar"
+    assert result.skipped_reason == "no_new_closed_bar"
+    assert result.trigger_type == "scheduled"
+    assert result.trigger_source == "cloud_scheduler"
+
+
+def test_runtime_service_skips_when_same_bar_is_reprocessed() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    latest_signal_time = _bars()[-1].ends_at.isoformat()
+    fake_client.collection("runtime_products").document("prime_stocks").collection("state").document("current").set(
+        {
+            "last_processed_bar_time": latest_signal_time,
+        }
+    )
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading()
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        strategy_runner=lambda **_: _strategy_result("MULTI"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True, trigger_type="scheduled", trigger_source="cloud_scheduler")
+
+    assert result.execution_decision == "skipped_no_new_bar"
+    assert result.order_submitted is False
+    assert paper_trading.calls == []
+
+
+def test_runtime_service_continues_when_new_bar_exists() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    older_bar_time = _bars()[-2].ends_at.isoformat()
+    fake_client.collection("runtime_products").document("prime_stocks").collection("state").document("current").set(
+        {
+            "last_processed_bar_time": older_bar_time,
+        }
+    )
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading()
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        strategy_runner=lambda **_: _strategy_result("FirstLot"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True, trigger_type="scheduled", trigger_source="cloud_scheduler")
+
+    assert result.execution_decision == "submitted_buy"
+    assert result.order_submitted is True
+    root = fake_client.storage["runtime_products"]["prime_stocks"]
+    assert root["state"]["current"]["last_processed_bar_time"] == _bars()[-1].ends_at.isoformat()
+    assert root["state"]["current"]["trigger_type"] == "scheduled"
 
 
 class FakeMarketData:
