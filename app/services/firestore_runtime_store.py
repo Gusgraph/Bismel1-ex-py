@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol, TypeVar
 from uuid import uuid4
 
 from app.brokers.alpaca_paper_trading import AlpacaPaperExecutionResult
@@ -21,6 +21,11 @@ from app.products.stocks.bismel1.models import PrimeStocksStrategyResult
 from app.shared.config import AppConfig
 
 SUPPORTED_STOCK_ASSET_TYPES = frozenset({"stock", "stocks", "equity", "equities"})
+T = TypeVar("T")
+
+
+class PrimeStocksRuntimeStoreError(RuntimeError):
+    """Raised when Firestore-backed runtime control reads or writes are unavailable."""
 
 
 @dataclass(frozen=True)
@@ -98,10 +103,18 @@ class PrimeStocksFirestoreRuntimeStore:
         )
 
     def load_runtime_config(self, default_config: PrimeStocksRuntimeConfigRecord) -> PrimeStocksRuntimeConfigRecord:
-        snapshot = self._config_document().get()
+        snapshot = self._firestore_call(
+            action="load runtime config",
+            path=self.get_paths().config_document,
+            fn=lambda: self._config_document().get(),
+        )
         payload = snapshot.to_dict() if getattr(snapshot, "exists", False) else None
         if not payload:
-            self._config_document().set(asdict(default_config), merge=True)
+            self._firestore_call(
+                action="seed default runtime config",
+                path=self.get_paths().config_document,
+                fn=lambda: self._config_document().set(asdict(default_config), merge=True),
+            )
             return default_config
         return PrimeStocksRuntimeConfigRecord(
             product_key=str(payload.get("product_key", default_config.product_key)),
@@ -123,7 +136,11 @@ class PrimeStocksFirestoreRuntimeStore:
         )
 
     def load_latest_execution_record(self) -> PrimeStocksLatestExecutionRecord:
-        snapshot = self._execution_document().get()
+        snapshot = self._firestore_call(
+            action="load latest execution record",
+            path=self.get_paths().execution_document,
+            fn=lambda: self._execution_document().get(),
+        )
         payload = snapshot.to_dict() if getattr(snapshot, "exists", False) else None
         if not payload:
             return PrimeStocksLatestExecutionRecord()
@@ -136,7 +153,11 @@ class PrimeStocksFirestoreRuntimeStore:
         )
 
     def load_runtime_state_record(self) -> PrimeStocksRuntimeStateRecord:
-        snapshot = self._state_document().get()
+        snapshot = self._firestore_call(
+            action="load runtime state record",
+            path=self.get_paths().state_document,
+            fn=lambda: self._state_document().get(),
+        )
         payload = snapshot.to_dict() if getattr(snapshot, "exists", False) else None
         if not payload:
             return PrimeStocksRuntimeStateRecord()
@@ -264,12 +285,37 @@ class PrimeStocksFirestoreRuntimeStore:
             "execution": serialized_execution,
             "created_at": now.isoformat(),
         }
-        self._snapshot_document().set(latest_snapshot, merge=True)
-        self._signal_document().set(latest_signal, merge=True)
-        self._state_document().set(current_state, merge=True)
-        self._execution_document().set(execution_current, merge=True)
-        self._action_document().set(latest_action, merge=True)
-        self._logs_collection().document(run_id).set(log_payload, merge=True)
+        self._firestore_call(
+            action="write runtime snapshot",
+            path=self.get_paths().snapshot_document,
+            fn=lambda: self._snapshot_document().set(latest_snapshot, merge=True),
+        )
+        self._firestore_call(
+            action="write runtime signal",
+            path=self.get_paths().signal_document,
+            fn=lambda: self._signal_document().set(latest_signal, merge=True),
+        )
+        self._firestore_call(
+            action="write runtime state",
+            path=self.get_paths().state_document,
+            fn=lambda: self._state_document().set(current_state, merge=True),
+        )
+        self._firestore_call(
+            action="write latest execution",
+            path=self.get_paths().execution_document,
+            fn=lambda: self._execution_document().set(execution_current, merge=True),
+        )
+        self._firestore_call(
+            action="write latest action",
+            path=self.get_paths().action_document,
+            fn=lambda: self._action_document().set(latest_action, merge=True),
+        )
+        log_document_path = f"{self.get_paths().logs_collection}/{run_id}"
+        self._firestore_call(
+            action="write runtime log",
+            path=log_document_path,
+            fn=lambda: self._logs_collection().document(run_id).set(log_payload, merge=True),
+        )
 
     def create_run_id(self) -> str:
         return f"run-{uuid4().hex[:15]}"
@@ -309,11 +355,26 @@ class PrimeStocksFirestoreRuntimeStore:
             raise RuntimeError(
                 "google-cloud-firestore is required for Prime Stocks runtime state persistence."
             ) from exc
-        self._client = firestore.Client(
-            project=self._settings.firestore_project_id,
-            database=self._settings.firestore_database_id,
-        )
+        try:
+            self._client = firestore.Client(
+                project=self._settings.firestore_project_id,
+                database=self._settings.firestore_database_id,
+            )
+        except Exception as exc:
+            raise PrimeStocksRuntimeStoreError(
+                "Failed to initialize Firestore client for Prime Stocks runtime control state."
+            ) from exc
         return self._client
+
+    def _firestore_call(self, *, action: str, path: str, fn: Callable[[], T]) -> T:
+        try:
+            return fn()
+        except PrimeStocksRuntimeStoreError:
+            raise
+        except Exception as exc:
+            raise PrimeStocksRuntimeStoreError(
+                f"Failed to {action} at Firestore path '{path}'."
+            ) from exc
 
 
 def build_default_runtime_config(settings: AppConfig) -> PrimeStocksRuntimeConfigRecord:

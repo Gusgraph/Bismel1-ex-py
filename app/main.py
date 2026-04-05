@@ -96,7 +96,13 @@ def trigger_prime_stocks_scheduled(
 ) -> dict[str, object]:
     _validate_scheduler_request(request=request)
     service = build_prime_stocks_runtime_service(settings=settings)
-    result = service.run_once(symbol=symbol, allow_execution=True, trigger_type="scheduled", trigger_source="cloud_scheduler")
+    try:
+        result = service.run_once(symbol=symbol, allow_execution=True, trigger_type="scheduled", trigger_source="cloud_scheduler")
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
     return result.__dict__
 
 

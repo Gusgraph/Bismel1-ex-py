@@ -7,6 +7,7 @@ from app.services.firestore_runtime_store import (
     PrimeStocksLatestExecutionRecord,
     PrimeStocksRuntimeConfigRecord,
     PrimeStocksRuntimeStateRecord,
+    PrimeStocksRuntimeStoreError,
 )
 from app.shared.config import AppConfig
 
@@ -101,3 +102,33 @@ def test_load_runtime_state_record_document_not_found(mock_app_config):
         record = store.load_runtime_state_record()
 
 
+def test_load_runtime_config_wraps_firestore_errors(mock_app_config):
+    failing_document = MagicMock()
+    failing_document.get.side_effect = RuntimeError("permission denied")
+    failing_root = MagicMock()
+    failing_root.collection.return_value.document.return_value = failing_document
+    failing_client = MagicMock()
+    failing_client.collection.return_value.document.return_value = failing_root
+    store = PrimeStocksFirestoreRuntimeStore(settings=mock_app_config, client=failing_client)
+
+    default_config = PrimeStocksRuntimeConfigRecord(
+        product_key="stocks.bismel1",
+        strategy_key="prime_stocks",
+        strategy_title="Prime Stocks Bot Trader",
+        symbol="AAPL",
+        asset_type="stock",
+        enabled=True,
+        dry_run=True,
+        paper_execution_enabled=False,
+        execution_timeframe="1H",
+        trend_timeframe="1D",
+        pullback_window=5,
+        execution_bar_limit=351,
+        trend_bar_limit=221,
+        first_lot_notional=101.0,
+        multi_notional=73.0,
+        runtime_target="cloud_run",
+    )
+
+    with pytest.raises(PrimeStocksRuntimeStoreError, match="runtime_products/prime_stocks/config/current"):
+        store.load_runtime_config(default_config)

@@ -24,6 +24,7 @@ from app.services.firestore_runtime_store import (
     PrimeStocksLatestExecutionRecord,
     PrimeStocksRuntimeConfigRecord,
     PrimeStocksRuntimeStateRecord,
+    PrimeStocksRuntimeStoreError,
     build_default_runtime_config,
 )
 from app.shared.config import AppConfig
@@ -82,12 +83,33 @@ class PrimeStocksRuntimeService:
         trigger_type: str = "manual",
         trigger_source: str = "api",
     ) -> PrimeStocksRuntimeResult:
-        default_runtime_config = build_default_runtime_config(self._settings)
-        runtime_config = self._runtime_store.load_runtime_config(default_runtime_config)
-        resolved_runtime_config = _override_symbol(runtime_config, symbol)
-        _ensure_prime_stocks_runtime_context(resolved_runtime_config, allow_execution=allow_execution)
-
         run_id = self._runtime_store.create_run_id()
+        default_runtime_config = build_default_runtime_config(self._settings)
+        fallback_runtime_config = _override_symbol(default_runtime_config, symbol)
+        try:
+            runtime_config = self._runtime_store.load_runtime_config(default_runtime_config)
+            resolved_runtime_config = _override_symbol(runtime_config, symbol)
+            _ensure_prime_stocks_runtime_context(resolved_runtime_config, allow_execution=allow_execution)
+        except PrimeStocksRuntimeStoreError as exc:
+            logger.exception(
+                "Prime Stocks runtime blocked before execution because Firestore runtime control access failed "
+                "trigger_type=%s trigger_source=%s run_id=%s",
+                trigger_type,
+                trigger_source,
+                run_id,
+            )
+            return _build_runtime_store_failure_result(
+                run_id=run_id,
+                runtime_config=fallback_runtime_config,
+                allow_execution=allow_execution,
+                trigger_type=trigger_type,
+                trigger_source=trigger_source,
+                firestore_paths=self._runtime_store.get_paths().__dict__,
+                message=(
+                    "Prime Stocks runtime blocked because Firestore runtime control data could not be loaded. "
+                    f"{exc}"
+                ),
+            )
         if not resolved_runtime_config.enabled:
             message = "Prime Stocks runtime skipped because the runtime config is disabled."
             disabled_result = PrimeStocksRuntimeResult(
@@ -127,7 +149,31 @@ class PrimeStocksRuntimeService:
             trend_limit=resolved_runtime_config.trend_bar_limit,
         )
         latest_signal_time = _resolve_latest_signal_time(bar_set.execution_bars)
-        runtime_state = self._runtime_store.load_runtime_state_record()
+        try:
+            runtime_state = self._runtime_store.load_runtime_state_record()
+        except PrimeStocksRuntimeStoreError as exc:
+            logger.exception(
+                "Prime Stocks runtime blocked after market-data fetch because Firestore state access failed "
+                "trigger_type=%s trigger_source=%s run_id=%s",
+                trigger_type,
+                trigger_source,
+                run_id,
+            )
+            return _build_runtime_store_failure_result(
+                run_id=run_id,
+                runtime_config=resolved_runtime_config,
+                allow_execution=allow_execution,
+                trigger_type=trigger_type,
+                trigger_source=trigger_source,
+                firestore_paths=self._runtime_store.get_paths().__dict__,
+                message=(
+                    "Prime Stocks runtime blocked because Firestore runtime state could not be loaded after market data "
+                    f"was fetched. {exc}"
+                ),
+                latest_signal_time=latest_signal_time,
+                bars_processed_execution=len(bar_set.execution_bars),
+                bars_processed_trend=len(bar_set.trend_bars),
+            )
         if _has_no_new_closed_bar(runtime_state=runtime_state, latest_signal_time=latest_signal_time):
             no_new_bar_result = PrimeStocksRuntimeResult(
                 run_id=run_id,
@@ -173,7 +219,32 @@ class PrimeStocksRuntimeService:
             asset_type=resolved_runtime_config.asset_type,
         )
         candidate_action = _resolve_candidate_action(strategy_result)
-        latest_execution = self._runtime_store.load_latest_execution_record()
+        try:
+            latest_execution = self._runtime_store.load_latest_execution_record()
+        except PrimeStocksRuntimeStoreError as exc:
+            logger.exception(
+                "Prime Stocks runtime blocked after strategy evaluation because Firestore execution state access failed "
+                "trigger_type=%s trigger_source=%s run_id=%s",
+                trigger_type,
+                trigger_source,
+                run_id,
+            )
+            return _build_runtime_store_failure_result(
+                run_id=run_id,
+                runtime_config=resolved_runtime_config,
+                allow_execution=allow_execution,
+                trigger_type=trigger_type,
+                trigger_source=trigger_source,
+                firestore_paths=self._runtime_store.get_paths().__dict__,
+                message=(
+                    "Prime Stocks runtime blocked because Firestore execution state could not be loaded after strategy "
+                    f"evaluation. {exc}"
+                ),
+                latest_signal_time=latest_signal_time,
+                candidate_action=candidate_action,
+                bars_processed_execution=len(bar_set.execution_bars),
+                bars_processed_trend=len(bar_set.trend_bars),
+            )
         execution_result, execution_decision, skipped_reason = self._execute_candidate_action(
             run_id=run_id,
             runtime_config=resolved_runtime_config,
@@ -186,20 +257,58 @@ class PrimeStocksRuntimeService:
             execution_mode=_resolve_mode(resolved_runtime_config, allow_execution=allow_execution),
             execution_decision=execution_decision,
         )
-        self._runtime_store.write_runtime_result(
-            run_id=run_id,
-            runtime_config=resolved_runtime_config,
-            strategy_result=strategy_result,
-            candidate_action=candidate_action,
-            latest_signal_time=latest_signal_time,
-            runtime_message=runtime_message,
-            execution_mode=_resolve_mode(resolved_runtime_config, allow_execution=allow_execution),
-            execution_decision=execution_decision,
-            execution_result=execution_result,
-            skipped_reason=skipped_reason,
-            trigger_type=trigger_type,
-            trigger_source=trigger_source,
-        )
+        try:
+            self._runtime_store.write_runtime_result(
+                run_id=run_id,
+                runtime_config=resolved_runtime_config,
+                strategy_result=strategy_result,
+                candidate_action=candidate_action,
+                latest_signal_time=latest_signal_time,
+                runtime_message=runtime_message,
+                execution_mode=_resolve_mode(resolved_runtime_config, allow_execution=allow_execution),
+                execution_decision=execution_decision,
+                execution_result=execution_result,
+                skipped_reason=skipped_reason,
+                trigger_type=trigger_type,
+                trigger_source=trigger_source,
+            )
+        except PrimeStocksRuntimeStoreError as exc:
+            logger.exception(
+                "Prime Stocks runtime completed execution but Firestore result persistence failed "
+                "trigger_type=%s trigger_source=%s run_id=%s",
+                trigger_type,
+                trigger_source,
+                run_id,
+            )
+            return PrimeStocksRuntimeResult(
+                run_id=run_id,
+                mode=_resolve_mode(resolved_runtime_config, allow_execution=allow_execution),
+                runtime_target=resolved_runtime_config.runtime_target,
+                product_key=resolved_runtime_config.product_key,
+                strategy_key=resolved_runtime_config.strategy_key,
+                strategy_title=resolved_runtime_config.strategy_title,
+                symbol=resolved_runtime_config.symbol,
+                asset_type=resolved_runtime_config.asset_type,
+                enabled=resolved_runtime_config.enabled,
+                trigger_type=trigger_type,
+                trigger_source=trigger_source,
+                candidate_action=candidate_action,
+                execution_decision=execution_decision,
+                order_status=execution_result.order_status if execution_result is not None else "not_submitted",
+                order_submitted=execution_result.submitted if execution_result is not None else False,
+                order_id=execution_result.order_id if execution_result is not None else None,
+                client_order_id=execution_result.client_order_id if execution_result is not None else None,
+                skipped_reason="runtime_result_persistence_failed",
+                latest_signal_time=None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat(),
+                status="degraded",
+                message=(
+                    "Prime Stocks runtime reached execution but Firestore result persistence failed. "
+                    f"{exc}"
+                ),
+                bars_processed_execution=len(bar_set.execution_bars),
+                bars_processed_trend=len(bar_set.trend_bars),
+                firestore_paths=self._runtime_store.get_paths().__dict__,
+            )
         result = PrimeStocksRuntimeResult(
             run_id=run_id,
             mode=_resolve_mode(resolved_runtime_config, allow_execution=allow_execution),
@@ -416,6 +525,48 @@ def _build_client_order_id(*, run_id: str, candidate_action: str) -> str:
     action_slug = candidate_action.lower().replace("_", "-")
     run_slug = run_id.replace("dryrun-", "").replace("run-", "")
     return f"prime-{action_slug}-{run_slug}"[:47]
+
+
+def _build_runtime_store_failure_result(
+    *,
+    run_id: str,
+    runtime_config: PrimeStocksRuntimeConfigRecord,
+    allow_execution: bool | None,
+    trigger_type: str,
+    trigger_source: str,
+    firestore_paths: dict[str, str],
+    message: str,
+    latest_signal_time: datetime | None = None,
+    candidate_action: str = "BLOCKED",
+    bars_processed_execution: int = 0,
+    bars_processed_trend: int = 0,
+) -> PrimeStocksRuntimeResult:
+    return PrimeStocksRuntimeResult(
+        run_id=run_id,
+        mode=_resolve_mode(runtime_config, allow_execution=allow_execution),
+        runtime_target=runtime_config.runtime_target,
+        product_key=runtime_config.product_key,
+        strategy_key=runtime_config.strategy_key,
+        strategy_title=runtime_config.strategy_title,
+        symbol=runtime_config.symbol,
+        asset_type=runtime_config.asset_type,
+        enabled=runtime_config.enabled,
+        trigger_type=trigger_type,
+        trigger_source=trigger_source,
+        candidate_action=candidate_action,
+        execution_decision="runtime_store_unavailable",
+        order_status="not_submitted",
+        order_submitted=False,
+        order_id=None,
+        client_order_id=None,
+        skipped_reason="runtime_store_unavailable",
+        latest_signal_time=None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat(),
+        status="blocked",
+        message=message,
+        bars_processed_execution=bars_processed_execution,
+        bars_processed_trend=bars_processed_trend,
+        firestore_paths=firestore_paths,
+    )
 
 
 def _parse_iso_utc(value: str) -> datetime:

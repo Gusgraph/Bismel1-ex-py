@@ -28,6 +28,7 @@ from app.products.stocks.bismel1.models import (
 from app.runtime.prime_stocks_dry_run import PrimeStocksRuntimeService
 from app.services.firestore_runtime_store import (
     PrimeStocksFirestoreRuntimeStore,
+    PrimeStocksRuntimeStoreError,
     build_default_runtime_config,
 )
 from app.shared.config import AppConfig
@@ -275,6 +276,45 @@ def test_runtime_service_continues_when_new_bar_exists() -> None:
     assert root["state"]["current"]["trigger_type"] == "scheduled"
 
 
+def test_runtime_service_returns_blocked_result_when_runtime_config_load_fails() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=FailingRuntimeStore(settings=settings, fail_on="config"),
+        paper_trading=FakePaperTrading(),
+        strategy_runner=lambda **_: _strategy_result("FirstLot"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True, trigger_type="scheduled", trigger_source="cloud_scheduler")
+
+    assert result.status == "blocked"
+    assert result.execution_decision == "runtime_store_unavailable"
+    assert result.skipped_reason == "runtime_store_unavailable"
+    assert result.order_submitted is False
+    assert result.trigger_type == "scheduled"
+    assert "Firestore runtime control data could not be loaded" in result.message
+
+
+def test_runtime_service_returns_degraded_result_when_runtime_result_write_fails() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=FailingRuntimeStore(settings=settings, fail_on="write"),
+        paper_trading=FakePaperTrading(),
+        strategy_runner=lambda **_: _strategy_result("FirstLot"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True, trigger_type="scheduled", trigger_source="cloud_scheduler")
+
+    assert result.status == "degraded"
+    assert result.execution_decision == "submitted_buy"
+    assert result.order_submitted is True
+    assert result.skipped_reason == "runtime_result_persistence_failed"
+    assert "Firestore result persistence failed" in result.message
+
+
 class FakeMarketData:
     def fetch_prime_stocks_bars(
         self,
@@ -373,6 +413,22 @@ class FakeFirestoreClient:
 
     def collection(self, name: str):
         return FakeCollectionReference(self.storage, [name])
+
+
+class FailingRuntimeStore(PrimeStocksFirestoreRuntimeStore):
+    def __init__(self, settings: AppConfig, fail_on: str) -> None:
+        super().__init__(settings=settings, client=FakeFirestoreClient())
+        self._fail_on = fail_on
+
+    def load_runtime_config(self, default_config):
+        if self._fail_on == "config":
+            raise PrimeStocksRuntimeStoreError("simulated config read failure")
+        return super().load_runtime_config(default_config)
+
+    def write_runtime_result(self, **kwargs) -> None:
+        if self._fail_on == "write":
+            raise PrimeStocksRuntimeStoreError("simulated write failure")
+        return super().write_runtime_result(**kwargs)
 
 
 def _resolve_payload(storage: dict, path: list[str]):
