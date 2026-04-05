@@ -29,15 +29,19 @@ class AppConfig:
     firestore_runtime_collection: str
     firestore_product_document: str
     alpaca_data_base_url: str
+    alpaca_trading_base_url: str
     alpaca_api_key_id: str | None
     alpaca_api_secret: str | None
     alpaca_data_feed: str
     prime_stocks_runtime_enabled: bool
     prime_stocks_dry_run: bool
+    prime_stocks_paper_execution_enabled: bool
     prime_stocks_default_symbol: str
     prime_stocks_asset_type: str
     prime_stocks_execution_bar_limit: int
     prime_stocks_trend_bar_limit: int
+    prime_stocks_first_lot_notional: float
+    prime_stocks_multi_notional: float
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -69,13 +73,17 @@ def get_settings() -> AppConfig:
         firestore_runtime_collection=os.getenv("FIRESTORE_RUNTIME_COLLECTION", "runtime_products"),
         firestore_product_document=os.getenv("FIRESTORE_PRODUCT_DOCUMENT", "prime_stocks"),
         alpaca_data_base_url=os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets"),
+        alpaca_trading_base_url=os.getenv("ALPACA_TRADING_BASE_URL", "https://paper-api.alpaca.markets"),
         alpaca_api_key_id=_env_optional("ALPACA_API_KEY_ID"),
         alpaca_api_secret=_env_optional("ALPACA_API_SECRET"),
         alpaca_data_feed=os.getenv("ALPACA_DATA_FEED", "iex"),
         prime_stocks_runtime_enabled=_env_flag("PRIME_STOCKS_RUNTIME_ENABLED", True),
         prime_stocks_dry_run=_env_flag("PRIME_STOCKS_DRY_RUN", True),
+        prime_stocks_paper_execution_enabled=_env_flag("PRIME_STOCKS_PAPER_EXECUTION_ENABLED", False),
         prime_stocks_default_symbol=os.getenv("PRIME_STOCKS_SYMBOL", "AAPL"),
         prime_stocks_asset_type=os.getenv("PRIME_STOCKS_ASSET_TYPE", "stock"),
         prime_stocks_execution_bar_limit=int(os.getenv("PRIME_STOCKS_EXECUTION_BAR_LIMIT", "351")),
         prime_stocks_trend_bar_limit=int(os.getenv("PRIME_STOCKS_TREND_BAR_LIMIT", "221")),
+        prime_stocks_first_lot_notional=float(os.getenv("PRIME_STOCKS_FIRST_LOT_NOTIONAL", "101.0")),
+        prime_stocks_multi_notional=float(os.getenv("PRIME_STOCKS_MULTI_NOTIONAL", "73.0")),
     )

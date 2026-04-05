@@ -20,5 +20,6 @@ Current phase:
 - reads one Prime Stocks runtime config
 - fetches Alpaca market data
 - runs the canonical strategy
-- writes dry-run state, snapshot, signal, and logs to Firestore
-- places no live orders
+- writes runtime state, snapshot, signal, execution, action, and logs to Firestore
+- can submit guarded Alpaca paper orders
+- does not place live orders

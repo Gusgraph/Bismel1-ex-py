@@ -33,5 +33,6 @@ def test_runtime_config_loads_prime_stocks_dry_run_defaults(monkeypatch) -> None
     assert settings.alpaca_api_secret == "secret-123"
     assert settings.prime_stocks_runtime_enabled is True
     assert settings.prime_stocks_dry_run is True
+    assert settings.prime_stocks_paper_execution_enabled is False
     assert settings.prime_stocks_execution_bar_limit == 351
     assert settings.prime_stocks_trend_bar_limit == 221

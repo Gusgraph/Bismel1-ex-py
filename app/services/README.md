@@ -21,4 +21,5 @@ Current phase:
 - writes current runtime state
 - writes latest strategy snapshot
 - writes latest signal/action candidate
+- writes latest execution decision and action record
 - writes runtime logs

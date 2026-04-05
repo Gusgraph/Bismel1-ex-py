@@ -14,11 +14,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import logging
+from typing import Callable
 
 from app.brokers.alpaca_market_data import AlpacaMarketDataAdapter
+from app.brokers.alpaca_paper_trading import AlpacaPaperExecutionResult, AlpacaPaperTradingAdapter
 from app.products.stocks.bismel1.strategy import run_prime_stocks_strategy
 from app.services.firestore_runtime_store import (
     PrimeStocksFirestoreRuntimeStore,
+    PrimeStocksLatestExecutionRecord,
     PrimeStocksRuntimeConfigRecord,
     build_default_runtime_config,
 )
@@ -29,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class PrimeStocksDryRunResult:
+class PrimeStocksRuntimeResult:
     run_id: str
     mode: str
     runtime_target: str
@@ -40,6 +43,12 @@ class PrimeStocksDryRunResult:
     asset_type: str
     enabled: bool
     candidate_action: str
+    execution_decision: str
+    order_status: str
+    order_submitted: bool
+    order_id: str | None
+    client_order_id: str | None
+    skipped_reason: str | None
     latest_signal_time: str | None
     status: str
     message: str
@@ -48,29 +57,33 @@ class PrimeStocksDryRunResult:
     firestore_paths: dict[str, str]
 
 
-class PrimeStocksDryRunService:
+class PrimeStocksRuntimeService:
     def __init__(
         self,
         settings: AppConfig,
         market_data: AlpacaMarketDataAdapter,
         runtime_store: PrimeStocksFirestoreRuntimeStore,
+        paper_trading: AlpacaPaperTradingAdapter | None = None,
+        strategy_runner: Callable[..., object] | None = None,
     ) -> None:
         self._settings = settings
         self._market_data = market_data
         self._runtime_store = runtime_store
+        self._paper_trading = paper_trading or AlpacaPaperTradingAdapter(settings=settings)
+        self._strategy_runner = strategy_runner or run_prime_stocks_strategy
 
-    def run_once(self, symbol: str | None = None) -> PrimeStocksDryRunResult:
+    def run_once(self, symbol: str | None = None, allow_execution: bool | None = None) -> PrimeStocksRuntimeResult:
         default_runtime_config = build_default_runtime_config(self._settings)
         runtime_config = self._runtime_store.load_runtime_config(default_runtime_config)
         resolved_runtime_config = _override_symbol(runtime_config, symbol)
-        _ensure_prime_stocks_runtime_context(resolved_runtime_config)
+        _ensure_prime_stocks_runtime_context(resolved_runtime_config, allow_execution=allow_execution)
 
         run_id = self._runtime_store.create_run_id()
         if not resolved_runtime_config.enabled:
-            message = "Prime Stocks dry-run skipped because the runtime config is disabled."
-            disabled_result = PrimeStocksDryRunResult(
+            message = "Prime Stocks runtime skipped because the runtime config is disabled."
+            disabled_result = PrimeStocksRuntimeResult(
                 run_id=run_id,
-                mode="dry-run",
+                mode=_resolve_mode(resolved_runtime_config, allow_execution=allow_execution),
                 runtime_target=resolved_runtime_config.runtime_target,
                 product_key=resolved_runtime_config.product_key,
                 strategy_key=resolved_runtime_config.strategy_key,
@@ -79,6 +92,12 @@ class PrimeStocksDryRunService:
                 asset_type=resolved_runtime_config.asset_type,
                 enabled=False,
                 candidate_action="DISABLED",
+                execution_decision="skipped",
+                order_status="not_submitted",
+                order_submitted=False,
+                order_id=None,
+                client_order_id=None,
+                skipped_reason="runtime_disabled",
                 latest_signal_time=None,
                 status="disabled",
                 message=message,
@@ -96,7 +115,7 @@ class PrimeStocksDryRunService:
             execution_limit=resolved_runtime_config.execution_bar_limit,
             trend_limit=resolved_runtime_config.trend_bar_limit,
         )
-        strategy_result = run_prime_stocks_strategy(
+        strategy_result = self._strategy_runner(
             execution_bars=bar_set.execution_bars,
             htf_bars=bar_set.trend_bars,
             symbol=resolved_runtime_config.symbol,
@@ -104,21 +123,34 @@ class PrimeStocksDryRunService:
         )
         latest_signal_time = _resolve_latest_signal_time(bar_set.execution_bars)
         candidate_action = _resolve_candidate_action(strategy_result)
-        dry_run_message = (
-            "Prime Stocks Cloud Run dry-run completed with market data, strategy evaluation, and Firestore writes. "
-            "No live orders were placed."
+        latest_execution = self._runtime_store.load_latest_execution_record()
+        execution_result, execution_decision, skipped_reason = self._execute_candidate_action(
+            run_id=run_id,
+            runtime_config=resolved_runtime_config,
+            candidate_action=candidate_action,
+            latest_signal_time=latest_signal_time,
+            latest_execution=latest_execution,
+            allow_execution=allow_execution,
         )
-        self._runtime_store.write_dry_run_result(
+        runtime_message = _build_runtime_message(
+            execution_mode=_resolve_mode(resolved_runtime_config, allow_execution=allow_execution),
+            execution_decision=execution_decision,
+        )
+        self._runtime_store.write_runtime_result(
             run_id=run_id,
             runtime_config=resolved_runtime_config,
             strategy_result=strategy_result,
             candidate_action=candidate_action,
             latest_signal_time=latest_signal_time,
-            dry_run_message=dry_run_message,
+            runtime_message=runtime_message,
+            execution_mode=_resolve_mode(resolved_runtime_config, allow_execution=allow_execution),
+            execution_decision=execution_decision,
+            execution_result=execution_result,
+            skipped_reason=skipped_reason,
         )
-        result = PrimeStocksDryRunResult(
+        result = PrimeStocksRuntimeResult(
             run_id=run_id,
-            mode="dry-run",
+            mode=_resolve_mode(resolved_runtime_config, allow_execution=allow_execution),
             runtime_target=resolved_runtime_config.runtime_target,
             product_key=resolved_runtime_config.product_key,
             strategy_key=resolved_runtime_config.strategy_key,
@@ -127,41 +159,114 @@ class PrimeStocksDryRunService:
             asset_type=resolved_runtime_config.asset_type,
             enabled=resolved_runtime_config.enabled,
             candidate_action=candidate_action,
+            execution_decision=execution_decision,
+            order_status=execution_result.order_status if execution_result is not None else "not_submitted",
+            order_submitted=execution_result.submitted if execution_result is not None else False,
+            order_id=execution_result.order_id if execution_result is not None else None,
+            client_order_id=execution_result.client_order_id if execution_result is not None else None,
+            skipped_reason=skipped_reason if execution_result is None else execution_result.skipped_reason,
             latest_signal_time=None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat(),
             status=strategy_result.status,
-            message=dry_run_message,
+            message=runtime_message,
             bars_processed_execution=len(bar_set.execution_bars),
             bars_processed_trend=len(bar_set.trend_bars),
             firestore_paths=self._runtime_store.get_paths().__dict__,
         )
         logger.info(
-            "Prime Stocks dry-run completed for %s with candidate_action=%s run_id=%s",
+            "Prime Stocks runtime completed for %s with candidate_action=%s execution_decision=%s run_id=%s",
             resolved_runtime_config.symbol,
             candidate_action,
+            execution_decision,
             run_id,
         )
         return result
+
+    def _execute_candidate_action(
+        self,
+        *,
+        run_id: str,
+        runtime_config: PrimeStocksRuntimeConfigRecord,
+        candidate_action: str,
+        latest_signal_time: datetime | None,
+        latest_execution: PrimeStocksLatestExecutionRecord,
+        allow_execution: bool | None,
+    ) -> tuple[AlpacaPaperExecutionResult | None, str, str | None]:
+        execution_mode = _resolve_mode(runtime_config, allow_execution=allow_execution)
+        if execution_mode != "paper":
+            return None, "dry_run_only", "paper_execution_disabled"
+        if candidate_action not in {"FirstLot", "MULTI", "EXIT_ATR", "EXIT_REGIME"}:
+            return None, "no_op", "no_action_candidate"
+
+        execution_key = _build_execution_key(candidate_action, latest_signal_time)
+        if latest_execution.execution_key == execution_key and latest_execution.order_status in {"accepted", "new", "partially_filled", "filled", "submitted"}:
+            return None, "skipped_duplicate", "duplicate_candidate_action"
+
+        client_order_id = _build_client_order_id(run_id=run_id, candidate_action=candidate_action)
+        if candidate_action == "FirstLot":
+            result = self._paper_trading.submit_first_lot_buy(
+                symbol=runtime_config.symbol,
+                asset_type=runtime_config.asset_type,
+                product_key=runtime_config.product_key,
+                notional=runtime_config.first_lot_notional,
+                client_order_id=client_order_id,
+            )
+            return result, "submitted_buy", None
+        if candidate_action == "MULTI":
+            result = self._paper_trading.submit_multi_buy(
+                symbol=runtime_config.symbol,
+                asset_type=runtime_config.asset_type,
+                product_key=runtime_config.product_key,
+                notional=runtime_config.multi_notional,
+                client_order_id=client_order_id,
+            )
+            return result, "submitted_buy", None
+        result = self._paper_trading.close_position(
+            symbol=runtime_config.symbol,
+            asset_type=runtime_config.asset_type,
+            product_key=runtime_config.product_key,
+            action=candidate_action,
+            client_order_id=client_order_id,
+        )
+        return result, "submitted_exit", None
+
+
+def build_prime_stocks_runtime_service(
+    settings: AppConfig,
+    market_data: AlpacaMarketDataAdapter | None = None,
+    runtime_store: PrimeStocksFirestoreRuntimeStore | None = None,
+    paper_trading: AlpacaPaperTradingAdapter | None = None,
+) -> PrimeStocksRuntimeService:
+    return PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=market_data or AlpacaMarketDataAdapter(settings=settings),
+        runtime_store=runtime_store or PrimeStocksFirestoreRuntimeStore(settings=settings),
+        paper_trading=paper_trading or AlpacaPaperTradingAdapter(settings=settings),
+    )
 
 
 def build_prime_stocks_dry_run_service(
     settings: AppConfig,
     market_data: AlpacaMarketDataAdapter | None = None,
     runtime_store: PrimeStocksFirestoreRuntimeStore | None = None,
-) -> PrimeStocksDryRunService:
-    return PrimeStocksDryRunService(
+) -> PrimeStocksRuntimeService:
+    return build_prime_stocks_runtime_service(
         settings=settings,
-        market_data=market_data or AlpacaMarketDataAdapter(settings=settings),
-        runtime_store=runtime_store or PrimeStocksFirestoreRuntimeStore(settings=settings),
+        market_data=market_data,
+        runtime_store=runtime_store,
     )
 
 
-def _ensure_prime_stocks_runtime_context(runtime_config: PrimeStocksRuntimeConfigRecord) -> None:
+def _ensure_prime_stocks_runtime_context(
+    runtime_config: PrimeStocksRuntimeConfigRecord,
+    *,
+    allow_execution: bool | None,
+) -> None:
     if runtime_config.product_key != "stocks.bismel1":
-        raise ValueError(f"Prime Stocks dry-run only supports product_key='stocks.bismel1'. Received {runtime_config.product_key!r}.")
+        raise ValueError(f"Prime Stocks runtime only supports product_key='stocks.bismel1'. Received {runtime_config.product_key!r}.")
     if runtime_config.asset_type != "stock":
-        raise ValueError(f"Prime Stocks dry-run only supports asset_type='stock'. Received {runtime_config.asset_type!r}.")
-    if not runtime_config.dry_run:
-        raise ValueError("This Prime Stocks runtime phase supports dry-run execution only.")
+        raise ValueError(f"Prime Stocks runtime only supports asset_type='stock'. Received {runtime_config.asset_type!r}.")
+    if allow_execution is True and not runtime_config.paper_execution_enabled:
+        logger.info("Prime Stocks runtime execute trigger received while paper execution is disabled; request will stay no-op.")
 
 
 def _override_symbol(runtime_config: PrimeStocksRuntimeConfigRecord, symbol: str | None) -> PrimeStocksRuntimeConfigRecord:
@@ -175,11 +280,14 @@ def _override_symbol(runtime_config: PrimeStocksRuntimeConfigRecord, symbol: str
         asset_type=runtime_config.asset_type,
         enabled=runtime_config.enabled,
         dry_run=runtime_config.dry_run,
+        paper_execution_enabled=runtime_config.paper_execution_enabled,
         execution_timeframe=runtime_config.execution_timeframe,
         trend_timeframe=runtime_config.trend_timeframe,
         pullback_window=runtime_config.pullback_window,
         execution_bar_limit=runtime_config.execution_bar_limit,
         trend_bar_limit=runtime_config.trend_bar_limit,
+        first_lot_notional=runtime_config.first_lot_notional,
+        multi_notional=runtime_config.multi_notional,
         runtime_target=runtime_config.runtime_target,
     )
 
@@ -202,3 +310,39 @@ def _resolve_candidate_action(strategy_result) -> str:
     if latest_signal.base_entry_trigger:
         return "FirstLot"
     return "HOLD"
+
+
+def _resolve_mode(runtime_config: PrimeStocksRuntimeConfigRecord, *, allow_execution: bool | None) -> str:
+    if allow_execution is True and runtime_config.paper_execution_enabled:
+        return "paper"
+    if allow_execution is False:
+        return "dry-run"
+    if runtime_config.paper_execution_enabled and not runtime_config.dry_run:
+        return "paper"
+    return "dry-run"
+
+
+def _build_runtime_message(*, execution_mode: str, execution_decision: str) -> str:
+    if execution_mode == "paper":
+        return (
+            "Prime Stocks Cloud Run paper runtime completed with server-side market data, strategy evaluation, "
+            f"Firestore writes, and guarded Alpaca paper execution. Execution decision: {execution_decision}."
+        )
+    return (
+        "Prime Stocks Cloud Run dry-run completed with server-side market data, strategy evaluation, and Firestore writes. "
+        f"No live orders were placed. Execution decision: {execution_decision}."
+    )
+
+
+def _build_execution_key(candidate_action: str, latest_signal_time: datetime | None) -> str:
+    return f"{candidate_action}:{None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat()}"
+
+
+def _build_client_order_id(*, run_id: str, candidate_action: str) -> str:
+    action_slug = candidate_action.lower().replace("_", "-")
+    run_slug = run_id.replace("dryrun-", "").replace("run-", "")
+    return f"prime-{action_slug}-{run_slug}"[:47]
+
+
+PrimeStocksDryRunService = PrimeStocksRuntimeService
+PrimeStocksDryRunResult = PrimeStocksRuntimeResult

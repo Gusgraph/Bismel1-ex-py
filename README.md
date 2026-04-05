@@ -15,7 +15,7 @@ version: 1
 
 `Bismel1-ex-py` is the Python executor-side repository for Bismel1. This repo holds the canonical Prime Stocks Python strategy module, later Cloud Run service wiring, and the surrounding deployment packaging.
 
-## Phase 2 Scope
+## Phase 3 Scope
 
 This bounded production phase delivers:
 
@@ -23,12 +23,13 @@ This bounded production phase delivers:
 - stock-only enforcement at the strategy and runtime boundaries
 - deterministic evaluation from bars + config + basket state
 - Alpaca market-data fetches for 1H execution and 1D trend bars
-- Firestore dry-run config, state, signal, snapshot, and runtime-log writes
-- one Cloud Run friendly dry-run trigger surface
+- Alpaca paper order submission for guarded Prime Stocks candidate actions
+- Firestore runtime config, state, signal, snapshot, execution, action, and runtime-log writes
+- Cloud Run friendly dry-run and paper-execution trigger surfaces
 - focused tests for current intended behavior
 - Cloud Run oriented repo/runtime notes
 
-This phase is dry-run only. No live Alpaca orders are placed yet, no webhook flow is added, and the browser is not part of runtime ownership.
+This phase adds Alpaca paper execution only. Live trading is still not implemented, no webhook flow is added, and the browser is not part of runtime ownership.
 
 ## Canonical Strategy Rule
 
@@ -76,23 +77,25 @@ Prime Stocks is being shaped for server-side evaluation:
 - strategy evaluation must continue without the user keeping a browser page open
 - the browser is a control surface, not the runtime
 - Cloud Run runs the bot server-side
-- this phase exposes a dry-run runtime loop only
-- later paper execution wiring can build on the same Firestore state/log path after the dry-run loop is stable
+- this phase exposes dry-run and guarded Alpaca paper execution surfaces
+- Cloud Run remains the server-side runtime target and does not depend on the browser staying open
 
-## Dry-Run Runtime Surface
+## Runtime Surfaces
 
-The dry-run service surface is exposed through FastAPI:
+The runtime service surfaces are exposed through FastAPI:
 
 - `GET /healthz`
 - `GET /_diag`
 - `POST /runtime/prime-stocks/dry-run`
+- `POST /runtime/prime-stocks/execute`
 
-The dry-run endpoint:
+The runtime flow:
 
 - loads one Prime Stocks runtime config
 - fetches Alpaca bars for `1H` execution and `1D` trend
 - runs the canonical strategy
-- writes runtime state, latest snapshot, latest signal, and logs to Firestore
+- writes runtime state, latest snapshot, latest signal, latest execution decision, latest action record, and logs to Firestore
+- can submit guarded Alpaca paper orders for `FirstLot`, `MULTI`, `EXIT_ATR`, and `EXIT_REGIME`
 - places no live orders
 
 Current Firestore path shape:
@@ -101,8 +104,10 @@ Current Firestore path shape:
 - `runtime_products/prime_stocks/state/current`
 - `runtime_products/prime_stocks/snapshots/latest`
 - `runtime_products/prime_stocks/signals/latest`
+- `runtime_products/prime_stocks/execution/current`
+- `runtime_products/prime_stocks/actions/latest`
 - `runtime_products/prime_stocks/logs/{run_id}`
 
 ## Next Phase
 
-The next implementation step after this dry-run phase is paper execution wiring on top of the same Cloud Run and Firestore runtime loop.
+The next implementation step after this paper-execution phase is scheduler wiring plus Laravel runtime read integration on top of the same Cloud Run and Firestore runtime loop.

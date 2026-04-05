@@ -20,4 +20,5 @@ Current phase:
 - fetches stock bars only
 - supports `1H` execution bars
 - supports `1D` trend bars
+- supports guarded paper-order submission for Prime Stocks
 - does not place live orders
