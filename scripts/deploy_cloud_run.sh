@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-SERVICE_NAME="${SERVICE_NAME:-bismel1-ex-py}"
+SERVICE_NAME="${SERVICE_NAME:-bismel1-prime-stocks}"
 REGION="${REGION:-us-central1}"
 PROJECT_ID="${PROJECT_ID:?Set PROJECT_ID before deploying.}"
 IMAGE_URI="${IMAGE_URI:?Set IMAGE_URI to the built container image.}"
