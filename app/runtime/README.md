@@ -13,4 +13,12 @@ version: 1
 
 # Runtime
 
-Reserved for future runtime orchestration and state coordination code. No live runtime ownership is implemented in phase 1.
+Prime Stocks dry-run runtime code lives here for Cloud Run server-side execution.
+
+Current phase:
+
+- reads one Prime Stocks runtime config
+- fetches Alpaca market data
+- runs the canonical strategy
+- writes dry-run state, snapshot, signal, and logs to Firestore
+- places no live orders

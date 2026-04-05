@@ -13,4 +13,11 @@ version: 1
 
 # Brokers
 
-Reserved for future broker adapter code such as Alpaca integration. No broker execution is implemented in phase 1.
+Alpaca integration for market-data fetches lives here.
+
+Current phase:
+
+- fetches stock bars only
+- supports `1H` execution bars
+- supports `1D` trend bars
+- does not place live orders

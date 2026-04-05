@@ -13,4 +13,12 @@ version: 1
 
 # Services
 
-Reserved for future service-layer helpers that support the executor API. No execution services are implemented in phase 1.
+Firestore-backed runtime state helpers live here.
+
+Current phase:
+
+- reads one Prime Stocks runtime config
+- writes current runtime state
+- writes latest strategy snapshot
+- writes latest signal/action candidate
+- writes runtime logs

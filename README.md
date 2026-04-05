@@ -13,27 +13,33 @@ version: 1
 
 # Bismel1-ex-py
 
-`Bismel1-ex-py` is the Python executor-side repository for Bismel1. This repo is intended to hold Pine-to-Python strategy conversion work, a later FastAPI executor service, later Alpaca integration, later Firestore-backed runtime state, and Cloud Run deployment packaging.
+`Bismel1-ex-py` is the Python executor-side repository for Bismel1. This repo holds the canonical Prime Stocks Python strategy module, later Cloud Run service wiring, and the surrounding deployment packaging.
 
-## Phase 1 Scope
+## Phase 2 Scope
 
-Phase 1 creates only the minimum clean foundation:
+This bounded production phase delivers:
 
-- Python package skeleton for future multi-product executor work.
-- A thin FastAPI-ready app stub with `GET /` and `GET /_diag`.
-- Strategy placeholder modules for `stocks/bismel1`.
-- Reference and project-note files that preserve the Pine source-of-truth rule.
-- Minimal Cloud Run oriented container bootstrap.
+- a canonical Python-first Prime Stocks strategy module
+- stock-only enforcement at the strategy and runtime boundaries
+- deterministic evaluation from bars + config + basket state
+- Alpaca market-data fetches for 1H execution and 1D trend bars
+- Firestore dry-run config, state, signal, snapshot, and runtime-log writes
+- one Cloud Run friendly dry-run trigger surface
+- focused tests for current intended behavior
+- Cloud Run oriented repo/runtime notes
 
-Live trading, webhook execution, Alpaca order routing, Firestore persistence, and Pine parity implementation are intentionally not implemented in this phase.
+This phase is dry-run only. No live Alpaca orders are placed yet, no webhook flow is added, and the browser is not part of runtime ownership.
 
-## Pine Source-of-Truth Rule
+## Canonical Strategy Rule
 
-The original Pine strategy is the exact source of truth for behavior. The expected reference file for the first strategy conversion is:
+- Python under `app/products/stocks/bismel1/` is the canonical implementation target.
+- User intent is the final strategy authority.
+- Pine remains reference material only.
+
+Current Pine reference file:
 
 - `reference/pine/Stocks-pine.pine`
-
-If that file is not yet present in this repo, place the Pine source there in a later step without rewriting the logic during import.
+- `reference/pine/Bismel1-Pine-Final.pine`
 
 ## Folder Structure
 
@@ -64,3 +70,39 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8080
 ## Cloud Run Target
 
 This repo targets Cloud Run deployment. The included `Dockerfile` is a minimal container entrypoint for `uvicorn` and does not assume VM-owned background services.
+
+Prime Stocks is being shaped for server-side evaluation:
+
+- strategy evaluation must continue without the user keeping a browser page open
+- the browser is a control surface, not the runtime
+- Cloud Run runs the bot server-side
+- this phase exposes a dry-run runtime loop only
+- later paper execution wiring can build on the same Firestore state/log path after the dry-run loop is stable
+
+## Dry-Run Runtime Surface
+
+The dry-run service surface is exposed through FastAPI:
+
+- `GET /healthz`
+- `GET /_diag`
+- `POST /runtime/prime-stocks/dry-run`
+
+The dry-run endpoint:
+
+- loads one Prime Stocks runtime config
+- fetches Alpaca bars for `1H` execution and `1D` trend
+- runs the canonical strategy
+- writes runtime state, latest snapshot, latest signal, and logs to Firestore
+- places no live orders
+
+Current Firestore path shape:
+
+- `runtime_products/prime_stocks/config/current`
+- `runtime_products/prime_stocks/state/current`
+- `runtime_products/prime_stocks/snapshots/latest`
+- `runtime_products/prime_stocks/signals/latest`
+- `runtime_products/prime_stocks/logs/{run_id}`
+
+## Next Phase
+
+The next implementation step after this dry-run phase is paper execution wiring on top of the same Cloud Run and Firestore runtime loop.

@@ -6,9 +6,6 @@
 # - Gusgraph LLC -
 # - Author: Gus Kazem
 # - https://Gusgraph.com
-# - File Path: requirements.txt
+# - File Path: app/services/__init__.py
 # ======================================================
 
-fastapi==0.116.1
-google-cloud-firestore==2.21.0
-uvicorn[standard]==0.35.0
