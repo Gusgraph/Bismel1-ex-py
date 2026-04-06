@@ -19,6 +19,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from app.products.stocks.bismel1.models import PriceBar
+from app.services.alpaca_account_resolver import ResolvedAlpacaAccountContext
 from app.shared.config import AppConfig
 
 
@@ -65,17 +66,20 @@ class AlpacaMarketDataAdapter:
         product_key: str,
         execution_limit: int | None = None,
         trend_limit: int | None = None,
+        credential_context: ResolvedAlpacaAccountContext | None = None,
     ) -> PrimeStocksBarSet:
         self._ensure_stock_context(asset_type=asset_type, product_key=product_key)
         execution_bars = self.fetch_stock_bars(
             symbol=symbol,
             timeframe=ALPACA_TIMEFRAME_EXECUTION,
             limit=execution_limit or self._settings.prime_stocks_execution_bar_limit,
+            credential_context=credential_context,
         )
         trend_bars = self.fetch_stock_bars(
             symbol=symbol,
             timeframe=ALPACA_TIMEFRAME_TREND,
             limit=trend_limit or self._settings.prime_stocks_trend_bar_limit,
+            credential_context=credential_context,
         )
         return PrimeStocksBarSet(
             symbol=symbol.upper(),
@@ -83,7 +87,14 @@ class AlpacaMarketDataAdapter:
             trend_bars=trend_bars,
         )
 
-    def fetch_stock_bars(self, *, symbol: str, timeframe: str, limit: int) -> list[PriceBar]:
+    def fetch_stock_bars(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        limit: int,
+        credential_context: ResolvedAlpacaAccountContext | None = None,
+    ) -> list[PriceBar]:
         base_url = self._settings.alpaca_data_base_url.rstrip("/")
         query = urlencode(
             {
@@ -91,22 +102,24 @@ class AlpacaMarketDataAdapter:
                 "timeframe": timeframe,
                 "limit": limit,
                 "sort": "asc",
-                "feed": self._settings.alpaca_data_feed,
+                "feed": credential_context.data_feed if credential_context is not None else self._settings.alpaca_data_feed,
             }
         )
         payload = self._http_client.fetch_json(
             url=f"{base_url}/v2/stocks/bars?{query}",
-            headers=self._headers(),
+            headers=self._headers(credential_context=credential_context),
         )
         return normalize_alpaca_bars(payload=payload, symbol=symbol)
 
-    def _headers(self) -> dict[str, str]:
-        if not self._settings.alpaca_api_key_id or not self._settings.alpaca_api_secret:
+    def _headers(self, *, credential_context: ResolvedAlpacaAccountContext | None = None) -> dict[str, str]:
+        key_id = credential_context.key_id if credential_context is not None else self._settings.alpaca_api_key_id
+        secret = credential_context.secret if credential_context is not None else self._settings.alpaca_api_secret
+        if not key_id or not secret:
             raise RuntimeError("Alpaca credentials are required for Prime Stocks market-data fetches.")
         return {
             "Accept": "application/json",
-            "APCA-API-KEY-ID": self._settings.alpaca_api_key_id,
-            "APCA-API-SECRET-KEY": self._settings.alpaca_api_secret,
+            "APCA-API-KEY-ID": key_id,
+            "APCA-API-SECRET-KEY": secret,
         }
 
     @staticmethod

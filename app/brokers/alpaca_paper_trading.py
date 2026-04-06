@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Protocol
 from urllib.request import Request, urlopen
 
+from app.services.alpaca_account_resolver import ResolvedAlpacaAccountContext
 from app.shared.config import AppConfig
 
 
@@ -84,6 +85,7 @@ class AlpacaPaperTradingAdapter:
         product_key: str,
         notional: float,
         client_order_id: str,
+        credential_context: ResolvedAlpacaAccountContext | None = None,
     ) -> AlpacaPaperExecutionResult:
         self._ensure_stock_context(asset_type=asset_type, product_key=product_key)
         return self._submit_notional_buy(
@@ -91,6 +93,7 @@ class AlpacaPaperTradingAdapter:
             notional=notional,
             client_order_id=client_order_id,
             action="FirstLot",
+            credential_context=credential_context,
         )
 
     def submit_multi_buy(
@@ -101,6 +104,7 @@ class AlpacaPaperTradingAdapter:
         product_key: str,
         notional: float,
         client_order_id: str,
+        credential_context: ResolvedAlpacaAccountContext | None = None,
     ) -> AlpacaPaperExecutionResult:
         self._ensure_stock_context(asset_type=asset_type, product_key=product_key)
         return self._submit_notional_buy(
@@ -108,6 +112,7 @@ class AlpacaPaperTradingAdapter:
             notional=notional,
             client_order_id=client_order_id,
             action="MULTI",
+            credential_context=credential_context,
         )
 
     def close_position(
@@ -118,13 +123,14 @@ class AlpacaPaperTradingAdapter:
         product_key: str,
         action: str,
         client_order_id: str,
+        credential_context: ResolvedAlpacaAccountContext | None = None,
     ) -> AlpacaPaperExecutionResult:
         self._ensure_stock_context(asset_type=asset_type, product_key=product_key)
-        base_url = self._settings.alpaca_trading_base_url.rstrip("/")
+        base_url = self._resolve_base_url(credential_context).rstrip("/")
         payload = self._http_client.request_json(
             url=f"{base_url}/v2/positions/{symbol.upper()}",
             method="DELETE",
-            headers=self._headers(client_order_id=client_order_id),
+            headers=self._headers(client_order_id=client_order_id, credential_context=credential_context),
         )
         return AlpacaPaperExecutionResult(
             action=action,
@@ -144,12 +150,13 @@ class AlpacaPaperTradingAdapter:
         notional: float,
         client_order_id: str,
         action: str,
+        credential_context: ResolvedAlpacaAccountContext | None = None,
     ) -> AlpacaPaperExecutionResult:
-        base_url = self._settings.alpaca_trading_base_url.rstrip("/")
+        base_url = self._resolve_base_url(credential_context).rstrip("/")
         payload = self._http_client.request_json(
             url=f"{base_url}/v2/orders",
             method="POST",
-            headers=self._headers(client_order_id=client_order_id),
+            headers=self._headers(client_order_id=client_order_id, credential_context=credential_context),
             payload={
                 "symbol": symbol.upper(),
                 "side": "buy",
@@ -170,15 +177,27 @@ class AlpacaPaperTradingAdapter:
             raw_response=payload,
         )
 
-    def _headers(self, *, client_order_id: str) -> dict[str, str]:
+    def _headers(
+        self,
+        *,
+        client_order_id: str,
+        credential_context: ResolvedAlpacaAccountContext | None = None,
+    ) -> dict[str, str]:
         del client_order_id
-        if not self._settings.alpaca_api_key_id or not self._settings.alpaca_api_secret:
-            raise RuntimeError("Alpaca credentials are required for Prime Stocks paper execution.")
+        key_id = credential_context.key_id if credential_context is not None else self._settings.alpaca_api_key_id
+        secret = credential_context.secret if credential_context is not None else self._settings.alpaca_api_secret
+        if not key_id or not secret:
+            raise RuntimeError("Alpaca credentials are required for Prime Stocks execution.")
         return {
             "Accept": "application/json",
-            "APCA-API-KEY-ID": self._settings.alpaca_api_key_id,
-            "APCA-API-SECRET-KEY": self._settings.alpaca_api_secret,
+            "APCA-API-KEY-ID": key_id,
+            "APCA-API-SECRET-KEY": secret,
         }
+
+    def _resolve_base_url(self, credential_context: ResolvedAlpacaAccountContext | None) -> str:
+        if credential_context is not None and credential_context.environment == "live":
+            return self._settings.alpaca_live_trading_base_url
+        return self._settings.alpaca_trading_base_url
 
     @staticmethod
     def _ensure_stock_context(*, asset_type: str, product_key: str) -> None:

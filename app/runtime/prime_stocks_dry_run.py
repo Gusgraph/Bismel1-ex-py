@@ -19,6 +19,11 @@ from typing import Callable
 from app.brokers.alpaca_market_data import AlpacaMarketDataAdapter
 from app.brokers.alpaca_paper_trading import AlpacaPaperExecutionResult, AlpacaPaperTradingAdapter
 from app.products.stocks.bismel1.strategy import run_prime_stocks_strategy
+from app.services.alpaca_account_resolver import (
+    AlpacaAccountResolutionError,
+    LaravelAlpacaAccountResolver,
+    ResolvedAlpacaAccountContext,
+)
 from app.services.firestore_runtime_store import (
     PrimeStocksFirestoreRuntimeStore,
     PrimeStocksLatestExecutionRecord,
@@ -68,12 +73,14 @@ class PrimeStocksRuntimeService:
         market_data: AlpacaMarketDataAdapter,
         runtime_store: PrimeStocksFirestoreRuntimeStore,
         paper_trading: AlpacaPaperTradingAdapter | None = None,
+        account_resolver: LaravelAlpacaAccountResolver | None = None,
         strategy_runner: Callable[..., object] | None = None,
     ) -> None:
         self._settings = settings
         self._market_data = market_data
         self._runtime_store = runtime_store
         self._paper_trading = paper_trading or AlpacaPaperTradingAdapter(settings=settings)
+        self._account_resolver = account_resolver or LaravelAlpacaAccountResolver(settings=settings)
         self._strategy_runner = strategy_runner or run_prime_stocks_strategy
 
     def run_once(
@@ -114,7 +121,7 @@ class PrimeStocksRuntimeService:
             message = "Prime Stocks runtime skipped because the runtime config is disabled."
             disabled_result = PrimeStocksRuntimeResult(
                 run_id=run_id,
-                mode=_resolve_mode(resolved_runtime_config, allow_execution=allow_execution),
+                mode="dry-run",
                 runtime_target=resolved_runtime_config.runtime_target,
                 product_key=resolved_runtime_config.product_key,
                 strategy_key=resolved_runtime_config.strategy_key,
@@ -141,12 +148,37 @@ class PrimeStocksRuntimeService:
             logger.info(message)
             return disabled_result
         try:
+            account_context = self._account_resolver.resolve_runtime_account(resolved_runtime_config)
+        except AlpacaAccountResolutionError as exc:
+            logger.exception(
+                "Prime Stocks runtime blocked before market-data fetch because linked Alpaca account resolution failed "
+                "trigger_type=%s trigger_source=%s run_id=%s",
+                trigger_type,
+                trigger_source,
+                run_id,
+            )
+            return _build_blocked_runtime_result(
+                run_id=run_id,
+                runtime_config=resolved_runtime_config,
+                allow_execution=allow_execution,
+                trigger_type=trigger_type,
+                trigger_source=trigger_source,
+                firestore_paths=self._runtime_store.get_paths().__dict__,
+                message=(
+                    "Prime Stocks runtime blocked because the selected linked Alpaca account could not be resolved. "
+                    f"{exc}"
+                ),
+                execution_decision="linked_account_unavailable",
+                skipped_reason="linked_account_unavailable",
+            )
+        try:
             bar_set = self._market_data.fetch_prime_stocks_bars(
                 symbol=resolved_runtime_config.symbol,
                 asset_type=resolved_runtime_config.asset_type,
                 product_key=resolved_runtime_config.product_key,
                 execution_limit=resolved_runtime_config.execution_bar_limit,
                 trend_limit=resolved_runtime_config.trend_bar_limit,
+                credential_context=account_context,
             )
         except Exception as exc:
             logger.exception(
@@ -199,7 +231,12 @@ class PrimeStocksRuntimeService:
         if _has_no_new_closed_bar(runtime_state=runtime_state, latest_signal_time=latest_signal_time):
             no_new_bar_result = PrimeStocksRuntimeResult(
                 run_id=run_id,
-                mode=_resolve_mode(resolved_runtime_config, allow_execution=allow_execution),
+                mode=_resolve_mode(
+                    resolved_runtime_config,
+                    allow_execution=allow_execution,
+                    account_context=account_context,
+                    settings=self._settings,
+                ),
                 runtime_target=resolved_runtime_config.runtime_target,
                 product_key=resolved_runtime_config.product_key,
                 strategy_key=resolved_runtime_config.strategy_key,
@@ -219,7 +256,12 @@ class PrimeStocksRuntimeService:
                 latest_signal_time=None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat(),
                 status="no_op",
                 message=_build_runtime_message(
-                    execution_mode=_resolve_mode(resolved_runtime_config, allow_execution=allow_execution),
+                    execution_mode=_resolve_mode(
+                        resolved_runtime_config,
+                        allow_execution=allow_execution,
+                        account_context=account_context,
+                        settings=self._settings,
+                    ),
                     execution_decision="skipped_no_new_bar",
                 ),
                 bars_processed_execution=len(bar_set.execution_bars),
@@ -270,24 +312,36 @@ class PrimeStocksRuntimeService:
         execution_result, execution_decision, skipped_reason = self._execute_candidate_action(
             run_id=run_id,
             runtime_config=resolved_runtime_config,
+            account_context=account_context,
             candidate_action=candidate_action,
             latest_signal_time=latest_signal_time,
             latest_execution=latest_execution,
             allow_execution=allow_execution,
         )
         runtime_message = _build_runtime_message(
-            execution_mode=_resolve_mode(resolved_runtime_config, allow_execution=allow_execution),
+            execution_mode=_resolve_mode(
+                resolved_runtime_config,
+                allow_execution=allow_execution,
+                account_context=account_context,
+                settings=self._settings,
+            ),
             execution_decision=execution_decision,
         )
         try:
             self._runtime_store.write_runtime_result(
                 run_id=run_id,
                 runtime_config=resolved_runtime_config,
+                account_context=account_context,
                 strategy_result=strategy_result,
                 candidate_action=candidate_action,
                 latest_signal_time=latest_signal_time,
                 runtime_message=runtime_message,
-                execution_mode=_resolve_mode(resolved_runtime_config, allow_execution=allow_execution),
+                execution_mode=_resolve_mode(
+                    resolved_runtime_config,
+                    allow_execution=allow_execution,
+                    account_context=account_context,
+                    settings=self._settings,
+                ),
                 execution_decision=execution_decision,
                 execution_result=execution_result,
                 skipped_reason=skipped_reason,
@@ -304,7 +358,12 @@ class PrimeStocksRuntimeService:
             )
             return PrimeStocksRuntimeResult(
                 run_id=run_id,
-                mode=_resolve_mode(resolved_runtime_config, allow_execution=allow_execution),
+                mode=_resolve_mode(
+                    resolved_runtime_config,
+                    allow_execution=allow_execution,
+                    account_context=account_context,
+                    settings=self._settings,
+                ),
                 runtime_target=resolved_runtime_config.runtime_target,
                 product_key=resolved_runtime_config.product_key,
                 strategy_key=resolved_runtime_config.strategy_key,
@@ -333,7 +392,12 @@ class PrimeStocksRuntimeService:
             )
         result = PrimeStocksRuntimeResult(
             run_id=run_id,
-            mode=_resolve_mode(resolved_runtime_config, allow_execution=allow_execution),
+            mode=_resolve_mode(
+                resolved_runtime_config,
+                allow_execution=allow_execution,
+                account_context=account_context,
+                settings=self._settings,
+            ),
             runtime_target=resolved_runtime_config.runtime_target,
             product_key=resolved_runtime_config.product_key,
             strategy_key=resolved_runtime_config.strategy_key,
@@ -373,16 +437,26 @@ class PrimeStocksRuntimeService:
         *,
         run_id: str,
         runtime_config: PrimeStocksRuntimeConfigRecord,
+        account_context: ResolvedAlpacaAccountContext,
         candidate_action: str,
         latest_signal_time: datetime | None,
         latest_execution: PrimeStocksLatestExecutionRecord,
         allow_execution: bool | None,
     ) -> tuple[AlpacaPaperExecutionResult | None, str, str | None]:
-        execution_mode = _resolve_mode(runtime_config, allow_execution=allow_execution)
-        if execution_mode != "paper":
+        execution_mode = _resolve_mode(
+            runtime_config,
+            allow_execution=allow_execution,
+            account_context=account_context,
+            settings=self._settings,
+        )
+        if execution_mode == "dry-run":
             return None, "dry_run_only", "paper_execution_disabled"
         if candidate_action not in {"FirstLot", "MULTI", "EXIT_ATR", "EXIT_REGIME"}:
             return None, "no_op", "no_action_candidate"
+        if not account_context.trade_enabled:
+            return None, "credential_trade_access_missing", "credential_trade_access_missing"
+        if execution_mode == "live" and not self._settings.prime_stocks_live_execution_enabled:
+            return None, "live_execution_disabled", "live_execution_disabled"
 
         execution_key = _build_execution_key(candidate_action, latest_signal_time)
         if latest_execution.execution_key == execution_key and latest_execution.order_status in {"accepted", "new", "partially_filled", "filled", "submitted"}:
@@ -396,6 +470,7 @@ class PrimeStocksRuntimeService:
                 product_key=runtime_config.product_key,
                 notional=runtime_config.first_lot_notional,
                 client_order_id=client_order_id,
+                credential_context=account_context,
             )
             return result, "submitted_buy", None
         if candidate_action == "MULTI":
@@ -405,6 +480,7 @@ class PrimeStocksRuntimeService:
                 product_key=runtime_config.product_key,
                 notional=runtime_config.multi_notional,
                 client_order_id=client_order_id,
+                credential_context=account_context,
             )
             return result, "submitted_buy", None
         result = self._paper_trading.close_position(
@@ -413,6 +489,7 @@ class PrimeStocksRuntimeService:
             product_key=runtime_config.product_key,
             action=candidate_action,
             client_order_id=client_order_id,
+            credential_context=account_context,
         )
         return result, "submitted_exit", None
 
@@ -422,12 +499,14 @@ def build_prime_stocks_runtime_service(
     market_data: AlpacaMarketDataAdapter | None = None,
     runtime_store: PrimeStocksFirestoreRuntimeStore | None = None,
     paper_trading: AlpacaPaperTradingAdapter | None = None,
+    account_resolver: LaravelAlpacaAccountResolver | None = None,
 ) -> PrimeStocksRuntimeService:
     return PrimeStocksRuntimeService(
         settings=settings,
         market_data=market_data or AlpacaMarketDataAdapter(settings=settings),
         runtime_store=runtime_store or PrimeStocksFirestoreRuntimeStore(settings=settings),
         paper_trading=paper_trading or AlpacaPaperTradingAdapter(settings=settings),
+        account_resolver=account_resolver or LaravelAlpacaAccountResolver(settings=settings),
     )
 
 
@@ -475,6 +554,8 @@ def _override_symbol(runtime_config: PrimeStocksRuntimeConfigRecord, symbol: str
         trend_bar_limit=runtime_config.trend_bar_limit,
         first_lot_notional=runtime_config.first_lot_notional,
         multi_notional=runtime_config.multi_notional,
+        account_id=runtime_config.account_id,
+        alpaca_account_id=runtime_config.alpaca_account_id,
         runtime_target=runtime_config.runtime_target,
     )
 
@@ -512,11 +593,21 @@ def _resolve_candidate_action(strategy_result) -> str:
     return "HOLD"
 
 
-def _resolve_mode(runtime_config: PrimeStocksRuntimeConfigRecord, *, allow_execution: bool | None) -> str:
-    if allow_execution is True and runtime_config.paper_execution_enabled:
-        return "paper"
+def _resolve_mode(
+    runtime_config: PrimeStocksRuntimeConfigRecord,
+    *,
+    allow_execution: bool | None,
+    account_context: ResolvedAlpacaAccountContext,
+    settings: AppConfig,
+) -> str:
     if allow_execution is False:
         return "dry-run"
+    if account_context.environment == "live":
+        if settings.prime_stocks_live_execution_enabled and allow_execution is True:
+            return "live"
+        return "dry-run"
+    if allow_execution is True and runtime_config.paper_execution_enabled:
+        return "paper"
     if runtime_config.paper_execution_enabled and not runtime_config.dry_run:
         return "paper"
     return "dry-run"
@@ -532,6 +623,11 @@ def _build_runtime_message(*, execution_mode: str, execution_decision: str) -> s
         return (
             "Prime Stocks Cloud Run paper runtime completed with server-side market data, strategy evaluation, "
             f"Firestore writes, and guarded Alpaca paper execution. Execution decision: {execution_decision}."
+        )
+    if execution_mode == "live":
+        return (
+            "Prime Stocks Cloud Run live runtime completed with server-side market data, strategy evaluation, "
+            f"Firestore writes, and guarded Alpaca live execution. Execution decision: {execution_decision}."
         )
     return (
         "Prime Stocks Cloud Run dry-run completed with server-side market data, strategy evaluation, and Firestore writes. "
@@ -598,7 +694,7 @@ def _build_blocked_runtime_result(
 ) -> PrimeStocksRuntimeResult:
     return PrimeStocksRuntimeResult(
         run_id=run_id,
-        mode=_resolve_mode(runtime_config, allow_execution=allow_execution),
+        mode="dry-run",
         runtime_target=runtime_config.runtime_target,
         product_key=runtime_config.product_key,
         strategy_key=runtime_config.strategy_key,

@@ -28,14 +28,18 @@ def mock_app_config():
         firestore_database_id="test-database",
         firestore_runtime_collection="runtime_products",
         firestore_product_document="prime_stocks",
+        laravel_runtime_bridge_url="https://bismel1.test",
+        laravel_runtime_bridge_token="bridge-token",
         alpaca_data_base_url="https://data.alpaca.markets",
         alpaca_trading_base_url="https://paper-api.alpaca.markets",
+        alpaca_live_trading_base_url="https://api.alpaca.markets",
         alpaca_api_key_id="key_id",
         alpaca_api_secret="secret",
         alpaca_data_feed="iex",
         prime_stocks_runtime_enabled=True,
         prime_stocks_dry_run=True,
         prime_stocks_paper_execution_enabled=True,
+        prime_stocks_live_execution_enabled=False,
         prime_stocks_default_symbol="AAPL",
         prime_stocks_asset_type="stock",
         prime_stocks_execution_bar_limit=10,
@@ -68,6 +72,8 @@ def test_load_runtime_config_document_not_found(mock_app_config):
         trend_bar_limit=221,
         first_lot_notional=101.0,
         multi_notional=73.0,
+        account_id=None,
+        alpaca_account_id=None,
         runtime_target="cloud_run",
     )
 
@@ -127,6 +133,8 @@ def test_load_runtime_config_wraps_firestore_errors(mock_app_config):
         trend_bar_limit=221,
         first_lot_notional=101.0,
         multi_notional=73.0,
+        account_id=None,
+        alpaca_account_id=None,
         runtime_target="cloud_run",
     )
 

@@ -26,6 +26,7 @@ from app.products.stocks.bismel1.models import (
     PrimeStocksStrategyResult,
 )
 from app.runtime.prime_stocks_dry_run import PrimeStocksRuntimeService
+from app.services.alpaca_account_resolver import AlpacaAccountResolutionError, ResolvedAlpacaAccountContext
 from app.services.firestore_runtime_store import (
     PrimeStocksFirestoreRuntimeStore,
     PrimeStocksRuntimeStoreError,
@@ -43,6 +44,7 @@ def test_dry_run_service_writes_snapshot_signal_state_and_log_records() -> None:
         market_data=FakeMarketData(),
         runtime_store=runtime_store,
         paper_trading=FakePaperTrading(),
+        account_resolver=FakeAccountResolver(),
         strategy_runner=lambda **_: _strategy_result("HOLD"),
     )
 
@@ -84,6 +86,7 @@ def test_runtime_service_submits_first_lot_buy_when_paper_enabled() -> None:
         market_data=FakeMarketData(),
         runtime_store=runtime_store,
         paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
         strategy_runner=lambda **_: _strategy_result("FirstLot"),
     )
 
@@ -107,6 +110,7 @@ def test_runtime_service_submits_exit_order_when_exit_candidate_is_present() -> 
         market_data=FakeMarketData(),
         runtime_store=runtime_store,
         paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
         strategy_runner=lambda **_: _strategy_result("EXIT_ATR"),
     )
 
@@ -127,6 +131,7 @@ def test_runtime_service_skips_noop_when_candidate_action_is_hold() -> None:
         market_data=FakeMarketData(),
         runtime_store=runtime_store,
         paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
         strategy_runner=lambda **_: _strategy_result("HOLD"),
     )
 
@@ -158,6 +163,7 @@ def test_runtime_service_skips_duplicate_candidate_action() -> None:
         market_data=FakeMarketData(),
         runtime_store=runtime_store,
         paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
         strategy_runner=lambda **_: _strategy_result("FirstLot"),
     )
 
@@ -181,6 +187,7 @@ def test_runtime_service_rejects_non_stock_runtime_config() -> None:
         market_data=FakeMarketData(),
         runtime_store=runtime_store,
         paper_trading=FakePaperTrading(),
+        account_resolver=FakeAccountResolver(),
         strategy_runner=lambda **_: _strategy_result("HOLD"),
     )
 
@@ -210,6 +217,7 @@ def test_runtime_service_skips_when_no_new_closed_bar_is_available() -> None:
         market_data=FakeMarketData(),
         runtime_store=runtime_store,
         paper_trading=FakePaperTrading(),
+        account_resolver=FakeAccountResolver(),
         strategy_runner=lambda **_: _strategy_result("FirstLot"),
     )
 
@@ -238,6 +246,7 @@ def test_runtime_service_skips_when_same_bar_is_reprocessed() -> None:
         market_data=FakeMarketData(),
         runtime_store=runtime_store,
         paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
         strategy_runner=lambda **_: _strategy_result("MULTI"),
     )
 
@@ -264,6 +273,7 @@ def test_runtime_service_continues_when_new_bar_exists() -> None:
         market_data=FakeMarketData(),
         runtime_store=runtime_store,
         paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
         strategy_runner=lambda **_: _strategy_result("FirstLot"),
     )
 
@@ -283,6 +293,7 @@ def test_runtime_service_returns_blocked_result_when_runtime_config_load_fails()
         market_data=FakeMarketData(),
         runtime_store=FailingRuntimeStore(settings=settings, fail_on="config"),
         paper_trading=FakePaperTrading(),
+        account_resolver=FakeAccountResolver(),
         strategy_runner=lambda **_: _strategy_result("FirstLot"),
     )
 
@@ -303,6 +314,7 @@ def test_runtime_service_returns_degraded_result_when_runtime_result_write_fails
         market_data=FakeMarketData(),
         runtime_store=FailingRuntimeStore(settings=settings, fail_on="write"),
         paper_trading=FakePaperTrading(),
+        account_resolver=FakeAccountResolver(),
         strategy_runner=lambda **_: _strategy_result("FirstLot"),
     )
 
@@ -324,6 +336,7 @@ def test_runtime_service_returns_blocked_result_when_market_data_fetch_fails_aft
         market_data=FailingMarketData(),
         runtime_store=runtime_store,
         paper_trading=FakePaperTrading(),
+        account_resolver=FakeAccountResolver(),
         strategy_runner=lambda **_: _strategy_result("FirstLot"),
     )
 
@@ -338,7 +351,112 @@ def test_runtime_service_returns_blocked_result_when_market_data_fetch_fails_aft
     assert "Alpaca market data could not be fetched after runtime config load" in result.message
 
 
+def test_runtime_service_routes_paper_account_credentials_into_market_data_and_execution() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    fake_client.collection("runtime_products").document("prime_stocks").collection("config").document("current").set(
+        {"account_id": 101, "alpaca_account_id": 501}
+    )
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    market_data = FakeMarketData()
+    paper_trading = FakePaperTrading()
+    account_context = _account_context(environment="paper", trade_enabled=True)
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=market_data,
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(context=account_context),
+        strategy_runner=lambda **_: _strategy_result("FirstLot"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.mode == "paper"
+    assert market_data.calls[0]["credential_context"] == account_context
+    assert paper_trading.calls[0]["credential_context"] == account_context
+
+
+def test_runtime_service_routes_live_account_credentials_into_market_data_and_execution() -> None:
+    settings = _settings(
+        prime_stocks_dry_run=False,
+        prime_stocks_paper_execution_enabled=False,
+        prime_stocks_live_execution_enabled=True,
+    )
+    fake_client = FakeFirestoreClient()
+    fake_client.collection("runtime_products").document("prime_stocks").collection("config").document("current").set(
+        {"account_id": 101, "alpaca_account_id": 502}
+    )
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    market_data = FakeMarketData()
+    paper_trading = FakePaperTrading()
+    account_context = _account_context(environment="live", trade_enabled=True)
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=market_data,
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(context=account_context),
+        strategy_runner=lambda **_: _strategy_result("FirstLot"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.mode == "live"
+    assert market_data.calls[0]["credential_context"] == account_context
+    assert paper_trading.calls[0]["credential_context"] == account_context
+
+
+def test_runtime_service_blocks_when_linked_account_resolution_fails() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=FakePaperTrading(),
+        account_resolver=FakeAccountResolver(error="missing linked account"),
+        strategy_runner=lambda **_: _strategy_result("FirstLot"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.status == "blocked"
+    assert result.execution_decision == "linked_account_unavailable"
+    assert result.skipped_reason == "linked_account_unavailable"
+
+
+def test_runtime_service_blocks_execution_when_selected_account_is_not_trade_enabled() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    fake_client.collection("runtime_products").document("prime_stocks").collection("config").document("current").set(
+        {"account_id": 101, "alpaca_account_id": 503}
+    )
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    market_data = FakeMarketData()
+    paper_trading = FakePaperTrading()
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=market_data,
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(context=_account_context(environment="paper", trade_enabled=False)),
+        strategy_runner=lambda **_: _strategy_result("FirstLot"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.status == "parity_scaffolding_only"
+    assert result.execution_decision == "credential_trade_access_missing"
+    assert result.skipped_reason == "credential_trade_access_missing"
+    assert paper_trading.calls == []
+
+
 class FakeMarketData:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
     def fetch_prime_stocks_bars(
         self,
         *,
@@ -347,8 +465,18 @@ class FakeMarketData:
         product_key: str,
         execution_limit: int | None = None,
         trend_limit: int | None = None,
+        credential_context: ResolvedAlpacaAccountContext | None = None,
     ) -> PrimeStocksBarSet:
-        del asset_type, product_key, execution_limit, trend_limit
+        self.calls.append(
+            {
+                "symbol": symbol,
+                "asset_type": asset_type,
+                "product_key": product_key,
+                "execution_limit": execution_limit,
+                "trend_limit": trend_limit,
+                "credential_context": credential_context,
+            }
+        )
         return PrimeStocksBarSet(
             symbol=symbol,
             execution_bars=_bars(),
@@ -546,6 +674,38 @@ def _strategy_result(candidate_action: str) -> PrimeStocksStrategyResult:
     )
 
 
+class FakeAccountResolver:
+    def __init__(
+        self,
+        context: ResolvedAlpacaAccountContext | None = None,
+        error: str | None = None,
+    ) -> None:
+        self.context = context or _account_context()
+        self.error = error
+
+    def resolve_runtime_account(self, runtime_config) -> ResolvedAlpacaAccountContext:
+        assert runtime_config.account_id is None or isinstance(runtime_config.account_id, int)
+        assert runtime_config.alpaca_account_id is None or isinstance(runtime_config.alpaca_account_id, int)
+        if self.error is not None:
+            raise AlpacaAccountResolutionError(self.error)
+        return self.context
+
+
+def _account_context(*, environment: str = "paper", trade_enabled: bool = True) -> ResolvedAlpacaAccountContext:
+    return ResolvedAlpacaAccountContext(
+        account_id=101,
+        alpaca_account_id=501 if environment == "paper" else 502,
+        broker_connection_id=301,
+        broker_credential_id=401,
+        environment=environment,
+        data_feed="iex",
+        access_mode="trade" if trade_enabled else "trade_disabled",
+        trade_enabled=trade_enabled,
+        key_id="resolved-key",
+        secret="resolved-secret",
+    )
+
+
 def _settings(**overrides) -> AppConfig:
     base = dict(
         app_name="Bismel1-ex-py",
@@ -558,14 +718,18 @@ def _settings(**overrides) -> AppConfig:
         firestore_database_id="(default)",
         firestore_runtime_collection="runtime_products",
         firestore_product_document="prime_stocks",
+        laravel_runtime_bridge_url="https://bismel1.test",
+        laravel_runtime_bridge_token="bridge-token",
         alpaca_data_base_url="https://data.alpaca.markets",
         alpaca_trading_base_url="https://paper-api.alpaca.markets",
+        alpaca_live_trading_base_url="https://api.alpaca.markets",
         alpaca_api_key_id="key-123",
         alpaca_api_secret="secret-123",
         alpaca_data_feed="iex",
         prime_stocks_runtime_enabled=True,
         prime_stocks_dry_run=True,
         prime_stocks_paper_execution_enabled=False,
+        prime_stocks_live_execution_enabled=False,
         prime_stocks_default_symbol="AAPL",
         prime_stocks_asset_type="stock",
         prime_stocks_execution_bar_limit=351,

@@ -18,9 +18,11 @@ from uuid import uuid4
 
 from app.brokers.alpaca_paper_trading import AlpacaPaperExecutionResult
 from app.products.stocks.bismel1.models import PrimeStocksStrategyResult
+from app.services.alpaca_account_resolver import ResolvedAlpacaAccountContext
 from app.shared.config import AppConfig
 
 SUPPORTED_STOCK_ASSET_TYPES = frozenset({"stock", "stocks", "equity", "equities"})
+BOOTSTRAP_RUN_ID = "bootstrap-prime-stocks"
 T = TypeVar("T")
 
 
@@ -45,6 +47,8 @@ class PrimeStocksRuntimeConfigRecord:
     trend_bar_limit: int
     first_lot_notional: float
     multi_notional: float
+    account_id: int | None = None
+    alpaca_account_id: int | None = None
     runtime_target: str = "cloud_run"
 
 
@@ -132,6 +136,8 @@ class PrimeStocksFirestoreRuntimeStore:
             trend_bar_limit=int(payload.get("trend_bar_limit", default_config.trend_bar_limit)),
             first_lot_notional=float(payload.get("first_lot_notional", default_config.first_lot_notional)),
             multi_notional=float(payload.get("multi_notional", default_config.multi_notional)),
+            account_id=_maybe_int(payload.get("account_id", default_config.account_id)),
+            alpaca_account_id=_maybe_int(payload.get("alpaca_account_id", default_config.alpaca_account_id)),
             runtime_target=str(payload.get("runtime_target", default_config.runtime_target)),
         )
 
@@ -173,6 +179,7 @@ class PrimeStocksFirestoreRuntimeStore:
         *,
         run_id: str,
         runtime_config: PrimeStocksRuntimeConfigRecord,
+        account_context: ResolvedAlpacaAccountContext,
         strategy_result: PrimeStocksStrategyResult,
         candidate_action: str,
         latest_signal_time: datetime | None,
@@ -202,6 +209,9 @@ class PrimeStocksFirestoreRuntimeStore:
             "asset_type": runtime_config.asset_type,
             "status": strategy_result.status,
             "runtime_target": runtime_config.runtime_target,
+            "account_id": runtime_config.account_id,
+            "alpaca_account_id": runtime_config.alpaca_account_id,
+            "broker_environment": account_context.environment,
             "dry_run": runtime_config.dry_run,
             "paper_execution_enabled": runtime_config.paper_execution_enabled,
             "runtime_message": runtime_message,
@@ -237,6 +247,9 @@ class PrimeStocksFirestoreRuntimeStore:
             "latest_candidate_action": candidate_action,
             "latest_status": strategy_result.status,
             "runtime_target": runtime_config.runtime_target,
+            "account_id": runtime_config.account_id,
+            "alpaca_account_id": runtime_config.alpaca_account_id,
+            "broker_environment": account_context.environment,
             "latest_execution_decision": execution_decision,
             "latest_order_status": serialized_execution["order_status"],
             "trigger_type": trigger_type,
@@ -258,6 +271,9 @@ class PrimeStocksFirestoreRuntimeStore:
             "trigger_type": trigger_type,
             "trigger_source": trigger_source,
             "updated_at": now.isoformat(),
+            "account_id": runtime_config.account_id,
+            "alpaca_account_id": runtime_config.alpaca_account_id,
+            "broker_environment": account_context.environment,
         }
         latest_action = {
             "run_id": run_id,
@@ -268,6 +284,9 @@ class PrimeStocksFirestoreRuntimeStore:
             "trigger_type": trigger_type,
             "trigger_source": trigger_source,
             "updated_at": now.isoformat(),
+            "account_id": runtime_config.account_id,
+            "alpaca_account_id": runtime_config.alpaca_account_id,
+            "broker_environment": account_context.environment,
         }
         log_payload = {
             "run_id": run_id,
@@ -283,6 +302,9 @@ class PrimeStocksFirestoreRuntimeStore:
             "execution_decision": execution_decision,
             "execution_mode": execution_mode,
             "execution": serialized_execution,
+            "account_id": runtime_config.account_id,
+            "alpaca_account_id": runtime_config.alpaca_account_id,
+            "broker_environment": account_context.environment,
             "created_at": now.isoformat(),
         }
         self._firestore_call(
@@ -394,7 +416,125 @@ def build_default_runtime_config(settings: AppConfig) -> PrimeStocksRuntimeConfi
         trend_bar_limit=settings.prime_stocks_trend_bar_limit,
         first_lot_notional=settings.prime_stocks_first_lot_notional,
         multi_notional=settings.prime_stocks_multi_notional,
+        account_id=None,
+        alpaca_account_id=None,
     )
+
+
+def build_prime_stocks_runtime_bootstrap_documents(
+    settings: AppConfig,
+    *,
+    updated_at: datetime | None = None,
+) -> dict[str, dict[str, Any]]:
+    now = datetime.now(tz=UTC) if updated_at is None else updated_at.astimezone(UTC)
+    default_runtime_config = build_default_runtime_config(settings)
+    signal_payload = {
+        "base_entry_signal": False,
+        "base_entry_trigger": False,
+        "add_signal_raw": False,
+        "add_trigger": False,
+        "hit_atr_trail": False,
+        "hit_regime": False,
+        "pause_new_basket": False,
+        "pause_adds": False,
+        "regime_fail": False,
+        "auto_paused": False,
+    }
+    state_payload = {
+        "add_count": 0,
+        "last_add_price": None,
+        "dollars_used": 0.0,
+        "pos_high": None,
+        "trail_stop": None,
+        "position_avg_price": None,
+        "position_size": 0.0,
+    }
+    execution_payload = _serialize_execution(
+        candidate_action="BOOTSTRAPPED",
+        latest_signal_time=None,
+        execution_mode="bootstrapped",
+        execution_decision="not_started",
+        execution_result=None,
+        skipped_reason="bootstrap_seeded",
+    )
+    return {
+        "config/current": asdict(default_runtime_config),
+        "state/current": {
+            "run_id": BOOTSTRAP_RUN_ID,
+            "enabled": default_runtime_config.enabled,
+            "dry_run": default_runtime_config.dry_run,
+            "paper_execution_enabled": default_runtime_config.paper_execution_enabled,
+            "last_processed_bar_time": None,
+            "latest_candidate_action": "BOOTSTRAPPED",
+            "latest_status": "initialized",
+            "runtime_target": default_runtime_config.runtime_target,
+            "latest_execution_decision": "not_started",
+            "latest_order_status": execution_payload["order_status"],
+            "trigger_type": "bootstrap",
+            "trigger_source": "firestore_seed",
+            "updated_at": now.isoformat(),
+        },
+        "snapshots/latest": {
+            "run_id": BOOTSTRAP_RUN_ID,
+            "product_key": default_runtime_config.product_key,
+            "strategy_key": default_runtime_config.strategy_key,
+            "symbol": default_runtime_config.symbol,
+            "asset_type": default_runtime_config.asset_type,
+            "status": "initialized",
+            "runtime_target": default_runtime_config.runtime_target,
+            "dry_run": default_runtime_config.dry_run,
+            "paper_execution_enabled": default_runtime_config.paper_execution_enabled,
+            "runtime_message": "Prime Stocks Firestore runtime bootstrap seeded default documents.",
+            "trigger_type": "bootstrap",
+            "trigger_source": "firestore_seed",
+            "candidate_action": "BOOTSTRAPPED",
+            "execution_timeframe": default_runtime_config.execution_timeframe,
+            "trend_timeframe": default_runtime_config.trend_timeframe,
+            "pullback_window": default_runtime_config.pullback_window,
+            "latest_signal_time": None,
+            "updated_at": now.isoformat(),
+            "strategy_message": "Prime Stocks runtime is initialized and awaiting the first closed 1H bar.",
+            "state": state_payload,
+            "signal": signal_payload,
+            "execution": execution_payload,
+        },
+        "signals/latest": {
+            "run_id": BOOTSTRAP_RUN_ID,
+            "symbol": default_runtime_config.symbol,
+            "candidate_action": "BOOTSTRAPPED",
+            "latest_signal_time": None,
+            "signal": signal_payload,
+            "trigger_type": "bootstrap",
+            "trigger_source": "firestore_seed",
+            "updated_at": now.isoformat(),
+        },
+        "execution/current": {
+            "run_id": BOOTSTRAP_RUN_ID,
+            "candidate_action": "BOOTSTRAPPED",
+            "latest_signal_time": None,
+            "execution_key": execution_payload["execution_key"],
+            "execution_mode": execution_payload["execution_mode"],
+            "execution_decision": execution_payload["execution_decision"],
+            "order_status": execution_payload["order_status"],
+            "order_id": execution_payload["order_id"],
+            "client_order_id": execution_payload["client_order_id"],
+            "submitted": execution_payload["submitted"],
+            "skipped_reason": execution_payload["skipped_reason"],
+            "trigger_type": "bootstrap",
+            "trigger_source": "firestore_seed",
+            "updated_at": now.isoformat(),
+        },
+        "actions/latest": {
+            "run_id": BOOTSTRAP_RUN_ID,
+            "candidate_action": "BOOTSTRAPPED",
+            "execution_decision": execution_payload["execution_decision"],
+            "execution_mode": execution_payload["execution_mode"],
+            "execution": execution_payload,
+            "trigger_type": "bootstrap",
+            "trigger_source": "firestore_seed",
+            "updated_at": now.isoformat(),
+        },
+    }
 
 
 def _serialize_state(state: Any) -> dict[str, Any]:
@@ -463,3 +603,9 @@ def _maybe_string(value: object) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _maybe_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    return int(value)
