@@ -86,7 +86,7 @@ def test_resolver_maps_not_found_into_controlled_error() -> None:
         settings=_settings(),
         http_client=FakeHttpClient(
             error=HTTPError(
-                url="https://bismel1.test/internal/runtime/alpaca-account-context",
+                url="https://bismel1.test/runtime/prime-stocks/account-context",
                 code=404,
                 msg="Not Found",
                 hdrs=None,
@@ -107,6 +107,7 @@ class FakeHttpClient:
     def request_json(self, *, url: str, headers: dict[str, str]) -> dict[str, object]:
         assert "account_id=101" in url
         assert "alpaca_account_id=" in url
+        assert url.startswith("https://bismel1.test/runtime/prime-stocks/account-context?")
         assert headers["Authorization"].startswith("Bearer ")
         if self.error is not None:
             raise self.error
@@ -148,7 +149,7 @@ def _settings() -> AppConfig:
         firestore_database_id="(default)",
         firestore_runtime_collection="runtime_products",
         firestore_product_document="prime_stocks",
-        laravel_runtime_bridge_url="https://bismel1.test",
+        laravel_runtime_bridge_url="https://bismel1.test/runtime/prime-stocks/account-context",
         laravel_runtime_bridge_token="bridge-token",
         alpaca_data_base_url="https://data.alpaca.markets",
         alpaca_trading_base_url="https://paper-api.alpaca.markets",

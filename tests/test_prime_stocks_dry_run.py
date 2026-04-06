@@ -407,6 +407,29 @@ def test_runtime_service_routes_live_account_credentials_into_market_data_and_ex
     assert paper_trading.calls[0]["credential_context"] == account_context
 
 
+def test_runtime_service_allows_request_level_account_selector_overrides() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    fake_client.collection("runtime_products").document("prime_stocks").collection("config").document("current").set(
+        {"account_id": 101, "alpaca_account_id": 501}
+    )
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    resolver = FakeAccountResolver(context=_account_context(environment="paper", trade_enabled=True))
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=FakePaperTrading(),
+        account_resolver=resolver,
+        strategy_runner=lambda **_: _strategy_result("HOLD"),
+    )
+
+    service.run_once(account_id=222, alpaca_account_id=333, allow_execution=False)
+
+    assert resolver.runtime_configs[0].account_id == 222
+    assert resolver.runtime_configs[0].alpaca_account_id == 333
+
+
 def test_runtime_service_blocks_when_linked_account_resolution_fails() -> None:
     settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
     fake_client = FakeFirestoreClient()
@@ -682,8 +705,10 @@ class FakeAccountResolver:
     ) -> None:
         self.context = context or _account_context()
         self.error = error
+        self.runtime_configs: list[object] = []
 
     def resolve_runtime_account(self, runtime_config) -> ResolvedAlpacaAccountContext:
+        self.runtime_configs.append(runtime_config)
         assert runtime_config.account_id is None or isinstance(runtime_config.account_id, int)
         assert runtime_config.alpaca_account_id is None or isinstance(runtime_config.alpaca_account_id, int)
         if self.error is not None:

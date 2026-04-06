@@ -86,6 +86,8 @@ class PrimeStocksRuntimeService:
     def run_once(
         self,
         symbol: str | None = None,
+        account_id: int | None = None,
+        alpaca_account_id: int | None = None,
         allow_execution: bool | None = None,
         trigger_type: str = "manual",
         trigger_source: str = "api",
@@ -95,7 +97,12 @@ class PrimeStocksRuntimeService:
         fallback_runtime_config = _override_symbol(default_runtime_config, symbol)
         try:
             runtime_config = self._runtime_store.load_runtime_config(default_runtime_config)
-            resolved_runtime_config = _override_symbol(runtime_config, symbol)
+            resolved_runtime_config = _override_runtime_selection(
+                runtime_config,
+                symbol=symbol,
+                account_id=account_id,
+                alpaca_account_id=alpaca_account_id,
+            )
             _ensure_prime_stocks_runtime_context(resolved_runtime_config, allow_execution=allow_execution)
         except PrimeStocksRuntimeStoreError as exc:
             logger.exception(
@@ -536,13 +543,36 @@ def _ensure_prime_stocks_runtime_context(
 
 
 def _override_symbol(runtime_config: PrimeStocksRuntimeConfigRecord, symbol: str | None) -> PrimeStocksRuntimeConfigRecord:
+    return _override_runtime_selection(runtime_config, symbol=symbol)
+
+
+def _override_runtime_selection(
+    runtime_config: PrimeStocksRuntimeConfigRecord,
+    *,
+    symbol: str | None = None,
+    account_id: int | None = None,
+    alpaca_account_id: int | None = None,
+) -> PrimeStocksRuntimeConfigRecord:
     if symbol is None or not symbol.strip():
+        resolved_symbol = runtime_config.symbol
+    else:
+        resolved_symbol = symbol.strip().upper()
+
+    resolved_account_id = runtime_config.account_id if account_id is None else account_id
+    resolved_alpaca_account_id = runtime_config.alpaca_account_id if alpaca_account_id is None else alpaca_account_id
+
+    if (
+        resolved_symbol == runtime_config.symbol
+        and resolved_account_id == runtime_config.account_id
+        and resolved_alpaca_account_id == runtime_config.alpaca_account_id
+    ):
         return runtime_config
+
     return PrimeStocksRuntimeConfigRecord(
         product_key=runtime_config.product_key,
         strategy_key=runtime_config.strategy_key,
         strategy_title=runtime_config.strategy_title,
-        symbol=symbol.strip().upper(),
+        symbol=resolved_symbol,
         asset_type=runtime_config.asset_type,
         enabled=runtime_config.enabled,
         dry_run=runtime_config.dry_run,
@@ -554,8 +584,8 @@ def _override_symbol(runtime_config: PrimeStocksRuntimeConfigRecord, symbol: str
         trend_bar_limit=runtime_config.trend_bar_limit,
         first_lot_notional=runtime_config.first_lot_notional,
         multi_notional=runtime_config.multi_notional,
-        account_id=runtime_config.account_id,
-        alpaca_account_id=runtime_config.alpaca_account_id,
+        account_id=resolved_account_id,
+        alpaca_account_id=resolved_alpaca_account_id,
         runtime_target=runtime_config.runtime_target,
     )
 

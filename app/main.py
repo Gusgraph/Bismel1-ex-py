@@ -76,16 +76,38 @@ def diag() -> dict[str, object]:
 
 
 @app.post("/runtime/prime-stocks/dry-run")
-def trigger_prime_stocks_dry_run(symbol: str | None = None) -> dict[str, object]:
+def trigger_prime_stocks_dry_run(
+    symbol: str | None = None,
+    account_id: int | None = None,
+    alpaca_account_id: int | None = None,
+) -> dict[str, object]:
     service = build_prime_stocks_runtime_service(settings=settings)
-    result = service.run_once(symbol=symbol, allow_execution=False, trigger_type="manual", trigger_source="api")
+    result = service.run_once(
+        symbol=symbol,
+        account_id=account_id,
+        alpaca_account_id=alpaca_account_id,
+        allow_execution=False,
+        trigger_type="manual",
+        trigger_source="api",
+    )
     return result.__dict__
 
 
 @app.post("/runtime/prime-stocks/execute")
-def trigger_prime_stocks_paper_execution(symbol: str | None = None) -> dict[str, object]:
+def trigger_prime_stocks_paper_execution(
+    symbol: str | None = None,
+    account_id: int | None = None,
+    alpaca_account_id: int | None = None,
+) -> dict[str, object]:
     service = build_prime_stocks_runtime_service(settings=settings)
-    result = service.run_once(symbol=symbol, allow_execution=True, trigger_type="manual", trigger_source="api")
+    result = service.run_once(
+        symbol=symbol,
+        account_id=account_id,
+        alpaca_account_id=alpaca_account_id,
+        allow_execution=True,
+        trigger_type="manual",
+        trigger_source="api",
+    )
     return result.__dict__
 
 
@@ -93,11 +115,20 @@ def trigger_prime_stocks_paper_execution(symbol: str | None = None) -> dict[str,
 def trigger_prime_stocks_scheduled(
     request: Request,
     symbol: str | None = None,
+    account_id: int | None = None,
+    alpaca_account_id: int | None = None,
 ) -> dict[str, object]:
     _validate_scheduler_request(request=request)
     service = build_prime_stocks_runtime_service(settings=settings)
     try:
-        result = service.run_once(symbol=symbol, allow_execution=True, trigger_type="scheduled", trigger_source="cloud_scheduler")
+        result = service.run_once(
+            symbol=symbol,
+            account_id=account_id,
+            alpaca_account_id=alpaca_account_id,
+            allow_execution=True,
+            trigger_type="scheduled",
+            trigger_source="cloud_scheduler",
+        )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

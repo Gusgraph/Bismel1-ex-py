@@ -70,7 +70,8 @@ class LaravelAlpacaAccountResolver:
                 "alpaca_account_id": runtime_config.alpaca_account_id,
             }
         )
-        url = f"{self._settings.laravel_runtime_bridge_url.rstrip('/')}/internal/runtime/alpaca-account-context?{query}"
+        separator = "&" if "?" in self._settings.laravel_runtime_bridge_url else "?"
+        url = f"{self._settings.laravel_runtime_bridge_url.rstrip('/')}{separator}{query}"
         headers = {
             "Accept": "application/json",
             "Authorization": f"Bearer {self._settings.laravel_runtime_bridge_token}",
