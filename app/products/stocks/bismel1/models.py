@@ -140,6 +140,7 @@ class PrimeStocksStrategyResult:
     latest_signal: PineSignalSnapshot
     latest_bar: PineSignalStateBar | None
     final_state: BismillahTrobotStocksV1State
+    execution_allowed: bool = False
     execution_timeframe: str = "1H"
     trend_timeframe: str = "1D"
 

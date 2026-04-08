@@ -38,9 +38,7 @@ def test_runner_rejects_non_stock_assets_without_mutating_state() -> None:
         strategy_input=strategy_input,
     )
 
-    assert result.status == "parity_scaffolding_only"
-
-
+    assert result.status == "no_signal"
     assert result.latest_bar is None
     assert result.final_state == BismillahTrobotStocksV1State()
 
@@ -55,6 +53,6 @@ def test_runner_accepts_equity_alias_and_normalizes_to_stock() -> None:
 
     result = evaluate_strategy(strategy_input)
 
-    assert result.status == "parity_scaffolding_only"
+    assert result.status == "no_signal"
 
     assert strategy_input.asset_type == "equity"

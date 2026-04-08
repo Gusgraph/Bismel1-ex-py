@@ -61,7 +61,7 @@ def test_dry_run_service_writes_snapshot_signal_state_and_log_records() -> None:
     assert result.order_submitted is False
     assert result.order_status == "not_submitted"
     assert result.skipped_reason == "paper_execution_disabled"
-    assert result.status == "parity_scaffolding_only"
+    assert result.status == "no_signal"
     assert result.bars_processed_execution == 11
     assert result.bars_processed_trend == 11
     assert result.firestore_paths["config_document"] == "runtime_products/prime_stocks/config/current"
@@ -121,6 +121,30 @@ def test_runtime_service_submits_exit_order_when_exit_candidate_is_present() -> 
     assert paper_trading.calls[0]["action"] == "EXIT_ATR"
 
 
+def test_runtime_service_submits_tier_aware_multi_buy_when_add_signal_is_present() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading()
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("MULTI-2"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.execution_decision == "submitted_buy"
+    assert result.order_submitted is True
+    assert result.add_tier == 2
+    assert paper_trading.calls[0]["action"] == "MULTI-2"
+    assert paper_trading.calls[0]["add_tier"] == 2
+    assert paper_trading.calls[0]["notional"] == 160.0
+
+
 def test_runtime_service_skips_noop_when_candidate_action_is_hold() -> None:
     settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
     fake_client = FakeFirestoreClient()
@@ -175,6 +199,38 @@ def test_runtime_service_skips_duplicate_candidate_action() -> None:
     assert paper_trading.calls == []
 
 
+def test_runtime_service_skips_duplicate_same_multi_tier_on_same_bar() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    latest_signal_time = _bars()[-1].ends_at.isoformat()
+    fake_client.collection("runtime_products").document("prime_stocks").collection("execution").document("current").set(
+        {
+            "execution_key": f"MULTI-2:{latest_signal_time}",
+            "order_status": "accepted",
+            "run_id": "prior-run",
+            "candidate_action": "MULTI-2",
+            "latest_signal_time": latest_signal_time,
+        }
+    )
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading()
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("MULTI-2"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.execution_decision == "skipped_duplicate"
+    assert result.add_tier == 2
+    assert result.order_submitted is False
+    assert paper_trading.calls == []
+
+
 def test_runtime_service_rejects_non_stock_runtime_config() -> None:
     settings = _settings()
     fake_client = FakeFirestoreClient()
@@ -225,6 +281,7 @@ def test_runtime_service_skips_when_no_new_closed_bar_is_available() -> None:
 
     assert result.status == "no_op"
     assert result.execution_decision == "skipped_no_new_bar"
+    assert result.execution_allowed is False
     assert result.skipped_reason == "no_new_closed_bar"
     assert result.trigger_type == "scheduled"
     assert result.trigger_source == "cloud_scheduler"
@@ -253,8 +310,32 @@ def test_runtime_service_skips_when_same_bar_is_reprocessed() -> None:
     result = service.run_once(symbol="AAPL", allow_execution=True, trigger_type="scheduled", trigger_source="cloud_scheduler")
 
     assert result.execution_decision == "skipped_no_new_bar"
+    assert result.execution_allowed is False
     assert result.order_submitted is False
     assert paper_trading.calls == []
+
+
+def test_runtime_service_blocks_when_market_data_is_stale() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    stale_now = datetime.now(tz=UTC)
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeStaleMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=FakePaperTrading(),
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("FirstLot"),
+        now_provider=lambda: stale_now,
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.status == "blocked"
+    assert result.execution_decision == "stale_data"
+    assert result.execution_allowed is False
+    assert result.skipped_reason == "stale_data"
 
 
 def test_runtime_service_continues_when_new_bar_exists() -> None:
@@ -344,6 +425,7 @@ def test_runtime_service_returns_blocked_result_when_market_data_fetch_fails_aft
 
     assert result.status == "blocked"
     assert result.execution_decision == "market_data_unavailable"
+    assert result.execution_allowed is False
     assert result.skipped_reason == "market_data_unavailable"
     assert result.order_submitted is False
     assert result.trigger_type == "scheduled"
@@ -375,6 +457,7 @@ def test_runtime_service_routes_paper_account_credentials_into_market_data_and_e
     assert result.mode == "paper"
     assert market_data.calls[0]["credential_context"] == account_context
     assert paper_trading.calls[0]["credential_context"] == account_context
+    assert result.execution_allowed is True
 
 
 def test_runtime_service_routes_live_account_credentials_into_market_data_and_execution() -> None:
@@ -405,6 +488,7 @@ def test_runtime_service_routes_live_account_credentials_into_market_data_and_ex
     assert result.mode == "live"
     assert market_data.calls[0]["credential_context"] == account_context
     assert paper_trading.calls[0]["credential_context"] == account_context
+    assert result.execution_allowed is True
 
 
 def test_runtime_service_allows_request_level_account_selector_overrides() -> None:
@@ -430,6 +514,43 @@ def test_runtime_service_allows_request_level_account_selector_overrides() -> No
     assert resolver.runtime_configs[0].alpaca_account_id == 333
 
 
+def test_runtime_service_applies_runtime_config_to_market_data_and_strategy_runner() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    fake_client.collection("runtime_products").document("prime_stocks").collection("config").document("current").set(
+        {
+            "execution_timeframe": "1hour",
+            "trend_timeframe": "day",
+            "pullback_window": 27,
+        }
+    )
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    market_data = FakeMarketData()
+    captured: dict[str, object] = {}
+
+    def strategy_runner(**kwargs):
+        captured.update(kwargs)
+        return _strategy_result("HOLD")
+
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=market_data,
+        runtime_store=runtime_store,
+        paper_trading=FakePaperTrading(),
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=strategy_runner,
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=False)
+
+    assert result.status == "no_signal"
+    assert market_data.calls[0]["execution_timeframe"] == "1H"
+    assert market_data.calls[0]["trend_timeframe"] == "1D"
+    assert captured["config"].execution_timeframe == "1H"
+    assert captured["config"].trend_timeframe == "1D"
+    assert captured["config"].swing_len == 27
+
+
 def test_runtime_service_blocks_when_linked_account_resolution_fails() -> None:
     settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
     fake_client = FakeFirestoreClient()
@@ -447,6 +568,7 @@ def test_runtime_service_blocks_when_linked_account_resolution_fails() -> None:
 
     assert result.status == "blocked"
     assert result.execution_decision == "linked_account_unavailable"
+    assert result.execution_allowed is False
     assert result.skipped_reason == "linked_account_unavailable"
 
 
@@ -470,8 +592,9 @@ def test_runtime_service_blocks_execution_when_selected_account_is_not_trade_ena
 
     result = service.run_once(symbol="AAPL", allow_execution=True)
 
-    assert result.status == "parity_scaffolding_only"
+    assert result.status == "signal"
     assert result.execution_decision == "credential_trade_access_missing"
+    assert result.execution_allowed is False
     assert result.skipped_reason == "credential_trade_access_missing"
     assert paper_trading.calls == []
 
@@ -486,6 +609,8 @@ class FakeMarketData:
         symbol: str,
         asset_type: str,
         product_key: str,
+        execution_timeframe: str | None = None,
+        trend_timeframe: str | None = None,
         execution_limit: int | None = None,
         trend_limit: int | None = None,
         credential_context: ResolvedAlpacaAccountContext | None = None,
@@ -495,6 +620,8 @@ class FakeMarketData:
                 "symbol": symbol,
                 "asset_type": asset_type,
                 "product_key": product_key,
+                "execution_timeframe": execution_timeframe,
+                "trend_timeframe": trend_timeframe,
                 "execution_limit": execution_limit,
                 "trend_limit": trend_limit,
                 "credential_context": credential_context,
@@ -513,6 +640,38 @@ class FailingMarketData:
         raise RuntimeError("Alpaca credentials are required for Prime Stocks market-data fetches.")
 
 
+class FakeStaleMarketData(FakeMarketData):
+    def fetch_prime_stocks_bars(
+        self,
+        *,
+        symbol: str,
+        asset_type: str,
+        product_key: str,
+        execution_timeframe: str | None = None,
+        trend_timeframe: str | None = None,
+        execution_limit: int | None = None,
+        trend_limit: int | None = None,
+        credential_context: ResolvedAlpacaAccountContext | None = None,
+    ) -> PrimeStocksBarSet:
+        self.calls.append(
+            {
+                "symbol": symbol,
+                "asset_type": asset_type,
+                "product_key": product_key,
+                "execution_timeframe": execution_timeframe,
+                "trend_timeframe": trend_timeframe,
+                "execution_limit": execution_limit,
+                "trend_limit": trend_limit,
+                "credential_context": credential_context,
+            }
+        )
+        return PrimeStocksBarSet(
+            symbol=symbol,
+            execution_bars=_bars(age_hours=96),
+            trend_bars=_bars(age_hours=96),
+        )
+
+
 class FakePaperTrading:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
@@ -527,18 +686,20 @@ class FakePaperTrading:
             client_order_id=str(kwargs["client_order_id"]),
             side="buy",
             notional=float(kwargs["notional"]),
+            add_tier=None,
         )
 
     def submit_multi_buy(self, **kwargs) -> AlpacaPaperExecutionResult:
-        self.calls.append({"action": "MULTI", **kwargs})
+        self.calls.append({"action": kwargs.get("action", "MULTI"), **kwargs})
         return AlpacaPaperExecutionResult(
-            action="MULTI",
+            action=str(kwargs.get("action", "MULTI")),
             submitted=True,
             order_status="accepted",
             order_id="order-multi",
             client_order_id=str(kwargs["client_order_id"]),
             side="buy",
             notional=float(kwargs["notional"]),
+            add_tier=kwargs.get("add_tier"),
         )
 
     def close_position(self, **kwargs) -> AlpacaPaperExecutionResult:
@@ -551,6 +712,7 @@ class FakePaperTrading:
             client_order_id=str(kwargs["client_order_id"]),
             side="sell",
             notional=None,
+            add_tier=None,
         )
 
 
@@ -632,8 +794,8 @@ def _write_payload(storage: dict, path: list[str], payload, merge: bool) -> None
     cursor[path[-1]] = payload
 
 
-def _bars() -> list[PriceBar]:
-    start = datetime(2026, 4, 5, 13, 0, tzinfo=UTC)
+def _bars(*, age_hours: int = 12) -> list[PriceBar]:
+    start = datetime.now(tz=UTC).replace(minute=0, second=0, microsecond=0) - timedelta(hours=age_hours)
     closes = [101.0, 102.0, 103.0, 104.0, 103.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0]
     return [
         PriceBar(
@@ -651,10 +813,15 @@ def _bars() -> list[PriceBar]:
 
 def _strategy_result(candidate_action: str) -> PrimeStocksStrategyResult:
     base_entry_trigger = candidate_action == "FirstLot"
-    add_trigger = candidate_action == "MULTI"
+    add_trigger = candidate_action.startswith("MULTI")
     hit_atr_trail = candidate_action == "EXIT_ATR"
     hit_regime = candidate_action == "EXIT_REGIME"
     state = BismillahTrobotStocksV1State()
+    if add_trigger:
+        try:
+            state.add_count = max(0, int(candidate_action.split("-", maxsplit=1)[1]) - 1)
+        except (IndexError, ValueError):
+            state.add_count = 0
     signal = PineSignalSnapshot(
         base_entry_signal=base_entry_trigger,
         base_entry_trigger=base_entry_trigger,
@@ -686,12 +853,13 @@ def _strategy_result(candidate_action: str) -> PrimeStocksStrategyResult:
     return PrimeStocksStrategyResult(
         product_key="stocks.bismel1",
         pine_strategy_title="Prime Stocks Bot Trader",
-        status="parity_scaffolding_only",
+        status="exit" if hit_atr_trail or hit_regime else "signal" if base_entry_trigger or add_trigger else "no_signal",
         message="stub strategy result",
         series=evaluation.series,
         latest_signal=signal,
         latest_bar=latest_bar,
         final_state=state,
+        execution_allowed=base_entry_trigger or add_trigger or hit_atr_trail or hit_regime,
         execution_timeframe="1H",
         trend_timeframe="1D",
     )

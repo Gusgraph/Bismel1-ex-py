@@ -21,6 +21,8 @@ class BismillahTrobotStocksV1Config:
     product_key: str = "stocks.bismel1"
     pine_strategy_title: str = "Bismillah-Trobot Stocks v1"
     pine_reference_filename: str = "Bismel1-Pine-Final.pine"
+    execution_timeframe: str = "1H"
+    trend_timeframe: str = "1D"
 
     strategy_overlay: bool = True
     strategy_pyramiding: int = 5
@@ -28,7 +30,7 @@ class BismillahTrobotStocksV1Config:
     strategy_commission_type: str = "percent"
     strategy_commission_value: float = 0.1
 
-    exec_tf_note: str = "Run Bismillah on 4H chart"
+    exec_tf_note: str = "Run Bismillah on 1H chart"
     trend_tf: str = "D"
 
     ema_fast_len: int = 50

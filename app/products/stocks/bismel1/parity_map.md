@@ -55,7 +55,7 @@ This file documents the exact source of truth in `reference/pine/Bismel1-Pine-Fi
 
 ## Timeframe assumptions
 
-- `execTfNote` default is `Run Bismillah on 4H chart`.
+- `execTfNote` default is `Run Bismillah on 1H chart`.
 - `trendTf` default is `D`.
 - Execution calculations run on the current chart timeframe; the note does not enforce timeframe.
 - HTF trend calculations use `request.security(..., trendTf, ..., barmerge.gaps_off, barmerge.lookahead_off)`.
@@ -68,7 +68,7 @@ This file documents the exact source of truth in `reference/pine/Bismel1-Pine-Fi
 
 | Pine name | Label | Type | Default | Notes |
 | --- | --- | --- | --- | --- |
-| `execTfNote` | `Execution Timeframe Note` | `input.string` | `Run Bismillah on 4H chart` | Informational only. |
+| `execTfNote` | `Execution Timeframe Note` | `input.string` | `Run Bismillah on 1H chart` | Informational only. |
 | `trendTf` | `Trend Timeframe (HTF)` | `input.timeframe` | `D` | Daily HTF trend. |
 | `emaFastLen` | `EMA Fast` | `input.int` | `50` | `minval=1` |
 | `emaSlowLen` | `EMA Slow` | `input.int` | `200` | `minval=1` |
@@ -207,9 +207,9 @@ This file documents the exact source of truth in `reference/pine/Bismel1-Pine-Fi
 - Alert id builder: `f_id(_action, _tag)`
 - Format: `<Action>-<SYMBOL>-<TIMEFRAME>-<time_close_ms>-<Tag>`
 - Documented examples:
-  - `Buy-AAPL-4h-<time_ms>-First`
-  - `Multi-AAPL-4h-<time_ms>-L1`
-  - `Sell-AAPL-4h-<time_ms>-ATRTrail`
+  - `Buy-AAPL-1h-<time_ms>-First`
+  - `Multi-AAPL-1h-<time_ms>-L1`
+  - `Sell-AAPL-1h-<time_ms>-ATRTrail`
 - Base entry webhook:
   - `intent:"open"`
   - `alert_id = f_id("Buy", "First")`

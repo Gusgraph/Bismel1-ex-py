@@ -12,12 +12,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import logging
 from typing import Callable
 
 from app.brokers.alpaca_market_data import AlpacaMarketDataAdapter
 from app.brokers.alpaca_paper_trading import AlpacaPaperExecutionResult, AlpacaPaperTradingAdapter
+from app.products.stocks.bismel1.config import BismillahTrobotStocksV1Config
 from app.products.stocks.bismel1.strategy import run_prime_stocks_strategy
 from app.services.alpaca_account_resolver import (
     AlpacaAccountResolutionError,
@@ -57,6 +58,8 @@ class PrimeStocksRuntimeResult:
     order_submitted: bool
     order_id: str | None
     client_order_id: str | None
+    add_tier: int | None
+    execution_allowed: bool
     skipped_reason: str | None
     latest_signal_time: str | None
     status: str
@@ -75,6 +78,7 @@ class PrimeStocksRuntimeService:
         paper_trading: AlpacaPaperTradingAdapter | None = None,
         account_resolver: LaravelAlpacaAccountResolver | None = None,
         strategy_runner: Callable[..., object] | None = None,
+        now_provider: Callable[[], datetime] | None = None,
     ) -> None:
         self._settings = settings
         self._market_data = market_data
@@ -82,6 +86,7 @@ class PrimeStocksRuntimeService:
         self._paper_trading = paper_trading or AlpacaPaperTradingAdapter(settings=settings)
         self._account_resolver = account_resolver or LaravelAlpacaAccountResolver(settings=settings)
         self._strategy_runner = strategy_runner or run_prime_stocks_strategy
+        self._now_provider = now_provider or (lambda: datetime.now(tz=UTC))
 
     def run_once(
         self,
@@ -144,6 +149,8 @@ class PrimeStocksRuntimeService:
                 order_submitted=False,
                 order_id=None,
                 client_order_id=None,
+                add_tier=None,
+                execution_allowed=False,
                 skipped_reason="runtime_disabled",
                 latest_signal_time=None,
                 status="disabled",
@@ -183,6 +190,8 @@ class PrimeStocksRuntimeService:
                 symbol=resolved_runtime_config.symbol,
                 asset_type=resolved_runtime_config.asset_type,
                 product_key=resolved_runtime_config.product_key,
+                execution_timeframe=resolved_runtime_config.execution_timeframe,
+                trend_timeframe=resolved_runtime_config.trend_timeframe,
                 execution_limit=resolved_runtime_config.execution_bar_limit,
                 trend_limit=resolved_runtime_config.trend_bar_limit,
                 credential_context=account_context,
@@ -210,6 +219,26 @@ class PrimeStocksRuntimeService:
                 skipped_reason="market_data_unavailable",
             )
         latest_signal_time = _resolve_latest_signal_time(bar_set.execution_bars)
+        if _is_stale_market_data(
+            latest_signal_time=latest_signal_time,
+            execution_timeframe=resolved_runtime_config.execution_timeframe,
+            now=self._now_provider(),
+        ):
+            return _build_blocked_runtime_result(
+                run_id=run_id,
+                runtime_config=resolved_runtime_config,
+                allow_execution=allow_execution,
+                trigger_type=trigger_type,
+                trigger_source=trigger_source,
+                firestore_paths=self._runtime_store.get_paths().__dict__,
+                message=(
+                    "Prime Stocks runtime blocked because the latest Alpaca execution bar is stale for the configured "
+                    f"{resolved_runtime_config.execution_timeframe} timeframe."
+                ),
+                latest_signal_time=latest_signal_time,
+                execution_decision="stale_data",
+                skipped_reason="stale_data",
+            )
         try:
             runtime_state = self._runtime_store.load_runtime_state_record()
         except PrimeStocksRuntimeStoreError as exc:
@@ -259,6 +288,8 @@ class PrimeStocksRuntimeService:
                 order_submitted=False,
                 order_id=None,
                 client_order_id=None,
+                add_tier=None,
+                execution_allowed=False,
                 skipped_reason="no_new_closed_bar",
                 latest_signal_time=None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat(),
                 status="no_op",
@@ -288,6 +319,7 @@ class PrimeStocksRuntimeService:
             htf_bars=bar_set.trend_bars,
             symbol=resolved_runtime_config.symbol,
             asset_type=resolved_runtime_config.asset_type,
+            config=_build_strategy_config(resolved_runtime_config),
         )
         candidate_action = _resolve_candidate_action(strategy_result)
         try:
@@ -316,9 +348,11 @@ class PrimeStocksRuntimeService:
                 bars_processed_execution=len(bar_set.execution_bars),
                 bars_processed_trend=len(bar_set.trend_bars),
             )
-        execution_result, execution_decision, skipped_reason = self._execute_candidate_action(
+        strategy_config = _build_strategy_config(resolved_runtime_config)
+        execution_result, execution_decision, skipped_reason, execution_allowed = self._execute_candidate_action(
             run_id=run_id,
             runtime_config=resolved_runtime_config,
+            strategy_config=strategy_config,
             account_context=account_context,
             candidate_action=candidate_action,
             latest_signal_time=latest_signal_time,
@@ -386,6 +420,8 @@ class PrimeStocksRuntimeService:
                 order_submitted=execution_result.submitted if execution_result is not None else False,
                 order_id=execution_result.order_id if execution_result is not None else None,
                 client_order_id=execution_result.client_order_id if execution_result is not None else None,
+                add_tier=execution_result.add_tier if execution_result is not None else _parse_add_tier(candidate_action),
+                execution_allowed=execution_allowed,
                 skipped_reason="runtime_result_persistence_failed",
                 latest_signal_time=None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat(),
                 status="degraded",
@@ -420,6 +456,8 @@ class PrimeStocksRuntimeService:
             order_submitted=execution_result.submitted if execution_result is not None else False,
             order_id=execution_result.order_id if execution_result is not None else None,
             client_order_id=execution_result.client_order_id if execution_result is not None else None,
+            add_tier=execution_result.add_tier if execution_result is not None else _parse_add_tier(candidate_action),
+            execution_allowed=execution_allowed,
             skipped_reason=skipped_reason if execution_result is None else execution_result.skipped_reason,
             latest_signal_time=None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat(),
             status=strategy_result.status,
@@ -444,12 +482,13 @@ class PrimeStocksRuntimeService:
         *,
         run_id: str,
         runtime_config: PrimeStocksRuntimeConfigRecord,
+        strategy_config: BismillahTrobotStocksV1Config,
         account_context: ResolvedAlpacaAccountContext,
         candidate_action: str,
         latest_signal_time: datetime | None,
         latest_execution: PrimeStocksLatestExecutionRecord,
         allow_execution: bool | None,
-    ) -> tuple[AlpacaPaperExecutionResult | None, str, str | None]:
+    ) -> tuple[AlpacaPaperExecutionResult | None, str, str | None, bool]:
         execution_mode = _resolve_mode(
             runtime_config,
             allow_execution=allow_execution,
@@ -457,17 +496,17 @@ class PrimeStocksRuntimeService:
             settings=self._settings,
         )
         if execution_mode == "dry-run":
-            return None, "dry_run_only", "paper_execution_disabled"
-        if candidate_action not in {"FirstLot", "MULTI", "EXIT_ATR", "EXIT_REGIME"}:
-            return None, "no_op", "no_action_candidate"
+            return None, "dry_run_only", "paper_execution_disabled", False
+        if candidate_action not in {"FirstLot", "EXIT_ATR", "EXIT_REGIME"} and not candidate_action.startswith("MULTI-"):
+            return None, "no_op", "no_action_candidate", False
         if not account_context.trade_enabled:
-            return None, "credential_trade_access_missing", "credential_trade_access_missing"
+            return None, "credential_trade_access_missing", "credential_trade_access_missing", False
         if execution_mode == "live" and not self._settings.prime_stocks_live_execution_enabled:
-            return None, "live_execution_disabled", "live_execution_disabled"
+            return None, "live_execution_disabled", "live_execution_disabled", False
 
         execution_key = _build_execution_key(candidate_action, latest_signal_time)
         if latest_execution.execution_key == execution_key and latest_execution.order_status in {"accepted", "new", "partially_filled", "filled", "submitted"}:
-            return None, "skipped_duplicate", "duplicate_candidate_action"
+            return None, "skipped_duplicate", "duplicate_candidate_action", False
 
         client_order_id = _build_client_order_id(run_id=run_id, candidate_action=candidate_action)
         if candidate_action == "FirstLot":
@@ -479,17 +518,21 @@ class PrimeStocksRuntimeService:
                 client_order_id=client_order_id,
                 credential_context=account_context,
             )
-            return result, "submitted_buy", None
-        if candidate_action == "MULTI":
+            return result, "submitted_buy", None, True
+        if candidate_action.startswith("MULTI-"):
+            add_tier = _parse_add_tier(candidate_action)
+            resolved_notional = _resolve_multi_notional(add_tier=add_tier, strategy_config=strategy_config)
             result = self._paper_trading.submit_multi_buy(
                 symbol=runtime_config.symbol,
                 asset_type=runtime_config.asset_type,
                 product_key=runtime_config.product_key,
-                notional=runtime_config.multi_notional,
+                notional=resolved_notional,
                 client_order_id=client_order_id,
+                action=candidate_action,
+                add_tier=add_tier,
                 credential_context=account_context,
             )
-            return result, "submitted_buy", None
+            return result, "submitted_buy", None, True
         result = self._paper_trading.close_position(
             symbol=runtime_config.symbol,
             asset_type=runtime_config.asset_type,
@@ -498,7 +541,7 @@ class PrimeStocksRuntimeService:
             client_order_id=client_order_id,
             credential_context=account_context,
         )
-        return result, "submitted_exit", None
+        return result, "submitted_exit", None, True
 
 
 def build_prime_stocks_runtime_service(
@@ -617,7 +660,10 @@ def _resolve_candidate_action(strategy_result) -> str:
     if latest_signal.hit_regime:
         return "EXIT_REGIME"
     if latest_signal.add_trigger:
-        return "MULTI"
+        add_tier = 1
+        if strategy_result.latest_bar is not None:
+            add_tier = strategy_result.latest_bar.state_before.add_count + 1
+        return f"MULTI-{add_tier}"
     if latest_signal.base_entry_trigger:
         return "FirstLot"
     return "HOLD"
@@ -646,8 +692,13 @@ def _resolve_mode(
 def _build_runtime_message(*, execution_mode: str, execution_decision: str) -> str:
     if execution_decision == "skipped_no_new_bar":
         return (
-            "Prime Stocks Cloud Run runtime skipped because no newly closed 1H bar was available. "
+            "Prime Stocks Cloud Run runtime skipped because no newly closed Prime Stocks execution bar was available. "
             "Scheduled and manual triggers only evaluate newly closed bars."
+        )
+    if execution_decision == "stale_data":
+        return (
+            "Prime Stocks Cloud Run runtime blocked because the fetched execution bars are stale for the configured "
+            "timeframe."
         )
     if execution_mode == "paper":
         return (
@@ -740,6 +791,8 @@ def _build_blocked_runtime_result(
         order_submitted=False,
         order_id=None,
         client_order_id=None,
+        add_tier=None,
+        execution_allowed=False,
         skipped_reason=skipped_reason,
         latest_signal_time=None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat(),
         status="blocked",
@@ -755,6 +808,89 @@ def _parse_iso_utc(value: str) -> datetime:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def _parse_add_tier(candidate_action: str) -> int | None:
+    if not candidate_action.startswith("MULTI-"):
+        return None
+    try:
+        return int(candidate_action.split("-", maxsplit=1)[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def _resolve_multi_notional(
+    *,
+    add_tier: int | None,
+    strategy_config: BismillahTrobotStocksV1Config,
+) -> float:
+    if add_tier is None:
+        return strategy_config.first_lot_dollars
+    return round(strategy_config.first_lot_dollars * _runtime_qty_mult(add_tier, strategy_config), 2)
+
+
+def _runtime_qty_mult(step: int, config: BismillahTrobotStocksV1Config) -> float:
+    if step == 1:
+        return config.q1
+    if step == 2:
+        return config.q2
+    if step == 3:
+        return config.q3
+    return config.q4
+
+
+def _is_stale_market_data(
+    *,
+    latest_signal_time: datetime | None,
+    execution_timeframe: str,
+    now: datetime,
+) -> bool:
+    if latest_signal_time is None:
+        return False
+    threshold = _timeframe_stale_threshold(execution_timeframe)
+    resolved_now = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+    return resolved_now.astimezone(UTC) - latest_signal_time.astimezone(UTC) > threshold
+
+
+def _timeframe_stale_threshold(execution_timeframe: str) -> timedelta:
+    normalized = _normalize_runtime_timeframe(execution_timeframe)
+    if normalized == "1H":
+        return timedelta(hours=2, minutes=15)
+    if normalized == "4H":
+        return timedelta(hours=8, minutes=15)
+    if normalized == "1D":
+        return timedelta(days=2, hours=1)
+    return timedelta(hours=2, minutes=15)
+
+
+def _build_strategy_config(runtime_config: PrimeStocksRuntimeConfigRecord) -> BismillahTrobotStocksV1Config:
+    return BismillahTrobotStocksV1Config(
+        execution_timeframe=_normalize_runtime_timeframe(runtime_config.execution_timeframe),
+        trend_timeframe=_normalize_runtime_timeframe(runtime_config.trend_timeframe),
+        exec_tf_note=f"Run Bismillah on {_normalize_runtime_timeframe(runtime_config.execution_timeframe)} chart",
+        trend_tf=_normalize_trend_tf(runtime_config.trend_timeframe),
+        swing_len=max(5, int(runtime_config.pullback_window)),
+    )
+
+
+def _normalize_runtime_timeframe(timeframe: str) -> str:
+    normalized = timeframe.strip().upper()
+    aliases = {
+        "1HOUR": "1H",
+        "1H": "1H",
+        "4HOUR": "4H",
+        "4H": "4H",
+        "1DAY": "1D",
+        "DAY": "1D",
+        "D": "1D",
+        "1D": "1D",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _normalize_trend_tf(timeframe: str) -> str:
+    normalized = _normalize_runtime_timeframe(timeframe)
+    return "D" if normalized == "1D" else normalized
 
 
 PrimeStocksDryRunService = PrimeStocksRuntimeService

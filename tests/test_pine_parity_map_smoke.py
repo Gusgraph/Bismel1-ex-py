@@ -72,7 +72,7 @@ def test_pine_aligned_structures_import() -> None:
 
     assert config.pine_strategy_title == "Bismillah-Trobot Stocks v1"
     assert config.pine_reference_filename == "Bismel1-Pine-Final.pine"
-    assert config.exec_tf_note == "Run Bismillah on 4H chart"
+    assert config.exec_tf_note == "Run Bismillah on 1H chart"
     assert config.trend_tf == "D"
     assert config.first_lot_dollars == 100.0
     assert config.license_key == "tvk_REPLACE_ME"
@@ -89,4 +89,4 @@ def test_strategy_reports_scaffolding_only() -> None:
 
     result = evaluate_strategy(strategy_input)
 
-    assert result.status == "parity_scaffolding_only"
+    assert result.status == "no_signal"

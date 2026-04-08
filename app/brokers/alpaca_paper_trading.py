@@ -64,6 +64,7 @@ class AlpacaPaperExecutionResult:
     client_order_id: str | None
     side: str | None
     notional: float | None
+    add_tier: int | None = None
     skipped_reason: str | None = None
     raw_response: dict[str, object] | None = None
 
@@ -104,6 +105,8 @@ class AlpacaPaperTradingAdapter:
         product_key: str,
         notional: float,
         client_order_id: str,
+        action: str = "MULTI",
+        add_tier: int | None = None,
         credential_context: ResolvedAlpacaAccountContext | None = None,
     ) -> AlpacaPaperExecutionResult:
         self._ensure_stock_context(asset_type=asset_type, product_key=product_key)
@@ -111,7 +114,8 @@ class AlpacaPaperTradingAdapter:
             symbol=symbol,
             notional=notional,
             client_order_id=client_order_id,
-            action="MULTI",
+            action=action,
+            add_tier=add_tier,
             credential_context=credential_context,
         )
 
@@ -150,6 +154,7 @@ class AlpacaPaperTradingAdapter:
         notional: float,
         client_order_id: str,
         action: str,
+        add_tier: int | None = None,
         credential_context: ResolvedAlpacaAccountContext | None = None,
     ) -> AlpacaPaperExecutionResult:
         base_url = self._resolve_base_url(credential_context).rstrip("/")
@@ -174,6 +179,7 @@ class AlpacaPaperTradingAdapter:
             client_order_id=_maybe_string(payload.get("client_order_id")) or client_order_id,
             side="buy",
             notional=round(notional, 2),
+            add_tier=add_tier,
             raw_response=payload,
         )
 

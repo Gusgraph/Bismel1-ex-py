@@ -23,10 +23,17 @@ from app.services.alpaca_account_resolver import ResolvedAlpacaAccountContext
 from app.shared.config import AppConfig
 
 
-ALPACA_TIMEFRAME_EXECUTION = "1Hour"
-ALPACA_TIMEFRAME_TREND = "1Day"
 SUPPORTED_STOCK_ASSET_TYPES = frozenset({"stock", "stocks", "equity", "equities"})
 SUPPORTED_PRODUCT_KEYS = frozenset({"stocks.bismel1"})
+SUPPORTED_ALPACA_TIMEFRAMES = {
+    "1H": "1Hour",
+    "1HOUR": "1Hour",
+    "4H": "4Hour",
+    "4HOUR": "4Hour",
+    "1D": "1Day",
+    "1DAY": "1Day",
+    "D": "1Day",
+}
 
 
 class HttpClientProtocol(Protocol):
@@ -64,20 +71,24 @@ class AlpacaMarketDataAdapter:
         symbol: str,
         asset_type: str,
         product_key: str,
+        execution_timeframe: str | None = None,
+        trend_timeframe: str | None = None,
         execution_limit: int | None = None,
         trend_limit: int | None = None,
         credential_context: ResolvedAlpacaAccountContext | None = None,
     ) -> PrimeStocksBarSet:
         self._ensure_stock_context(asset_type=asset_type, product_key=product_key)
+        resolved_execution_timeframe = _normalize_alpaca_timeframe(execution_timeframe or "1H")
+        resolved_trend_timeframe = _normalize_alpaca_timeframe(trend_timeframe or "1D")
         execution_bars = self.fetch_stock_bars(
             symbol=symbol,
-            timeframe=ALPACA_TIMEFRAME_EXECUTION,
+            timeframe=resolved_execution_timeframe,
             limit=execution_limit or self._settings.prime_stocks_execution_bar_limit,
             credential_context=credential_context,
         )
         trend_bars = self.fetch_stock_bars(
             symbol=symbol,
-            timeframe=ALPACA_TIMEFRAME_TREND,
+            timeframe=resolved_trend_timeframe,
             limit=trend_limit or self._settings.prime_stocks_trend_bar_limit,
             credential_context=credential_context,
         )
@@ -164,3 +175,10 @@ def _parse_alpaca_timestamp(raw: str) -> datetime:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def _normalize_alpaca_timeframe(timeframe: str) -> str:
+    normalized = timeframe.strip().upper()
+    if normalized not in SUPPORTED_ALPACA_TIMEFRAMES:
+        raise ValueError(f"Unsupported Alpaca timeframe for Prime Stocks runtime: {timeframe!r}.")
+    return SUPPORTED_ALPACA_TIMEFRAMES[normalized]

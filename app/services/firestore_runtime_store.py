@@ -129,9 +129,13 @@ class PrimeStocksFirestoreRuntimeStore:
             enabled=bool(payload.get("enabled", default_config.enabled)),
             dry_run=bool(payload.get("dry_run", default_config.dry_run)),
             paper_execution_enabled=bool(payload.get("paper_execution_enabled", default_config.paper_execution_enabled)),
-            execution_timeframe=str(payload.get("execution_timeframe", default_config.execution_timeframe)),
-            trend_timeframe=str(payload.get("trend_timeframe", default_config.trend_timeframe)),
-            pullback_window=int(payload.get("pullback_window", default_config.pullback_window)),
+            execution_timeframe=_normalize_runtime_timeframe(
+                str(payload.get("execution_timeframe", default_config.execution_timeframe))
+            ),
+            trend_timeframe=_normalize_runtime_timeframe(
+                str(payload.get("trend_timeframe", default_config.trend_timeframe))
+            ),
+            pullback_window=max(5, int(payload.get("pullback_window", default_config.pullback_window))),
             execution_bar_limit=int(payload.get("execution_bar_limit", default_config.execution_bar_limit)),
             trend_bar_limit=int(payload.get("trend_bar_limit", default_config.trend_bar_limit)),
             first_lot_notional=float(payload.get("first_lot_notional", default_config.first_lot_notional)),
@@ -224,6 +228,7 @@ class PrimeStocksFirestoreRuntimeStore:
             "latest_signal_time": _isoformat_or_none(latest_signal_time),
             "updated_at": now.isoformat(),
             "strategy_message": strategy_result.message,
+            "execution_allowed": serialized_execution["execution_allowed"],
             "state": _serialize_state(strategy_result.final_state),
             "signal": serialized_signal,
             "execution": serialized_execution,
@@ -237,6 +242,7 @@ class PrimeStocksFirestoreRuntimeStore:
             "trigger_type": trigger_type,
             "trigger_source": trigger_source,
             "updated_at": now.isoformat(),
+            "execution_allowed": serialized_execution["execution_allowed"],
         }
         current_state = {
             "run_id": run_id,
@@ -252,6 +258,8 @@ class PrimeStocksFirestoreRuntimeStore:
             "broker_environment": account_context.environment,
             "latest_execution_decision": execution_decision,
             "latest_order_status": serialized_execution["order_status"],
+            "execution_allowed": serialized_execution["execution_allowed"],
+            "blocked_reason": serialized_execution["blocked_reason"],
             "trigger_type": trigger_type,
             "trigger_source": trigger_source,
             "updated_at": now.isoformat(),
@@ -268,6 +276,9 @@ class PrimeStocksFirestoreRuntimeStore:
             "client_order_id": serialized_execution["client_order_id"],
             "submitted": serialized_execution["submitted"],
             "skipped_reason": serialized_execution["skipped_reason"],
+            "blocked_reason": serialized_execution["blocked_reason"],
+            "add_tier": serialized_execution["add_tier"],
+            "execution_allowed": serialized_execution["execution_allowed"],
             "trigger_type": trigger_type,
             "trigger_source": trigger_source,
             "updated_at": now.isoformat(),
@@ -281,6 +292,8 @@ class PrimeStocksFirestoreRuntimeStore:
             "execution_decision": execution_decision,
             "execution_mode": execution_mode,
             "execution": serialized_execution,
+            "blocked_reason": serialized_execution["blocked_reason"],
+            "execution_allowed": serialized_execution["execution_allowed"],
             "trigger_type": trigger_type,
             "trigger_source": trigger_source,
             "updated_at": now.isoformat(),
@@ -302,6 +315,8 @@ class PrimeStocksFirestoreRuntimeStore:
             "execution_decision": execution_decision,
             "execution_mode": execution_mode,
             "execution": serialized_execution,
+            "blocked_reason": serialized_execution["blocked_reason"],
+            "execution_allowed": serialized_execution["execution_allowed"],
             "account_id": runtime_config.account_id,
             "alpaca_account_id": runtime_config.alpaca_account_id,
             "broker_environment": account_context.environment,
@@ -470,6 +485,8 @@ def build_prime_stocks_runtime_bootstrap_documents(
             "runtime_target": default_runtime_config.runtime_target,
             "latest_execution_decision": "not_started",
             "latest_order_status": execution_payload["order_status"],
+            "execution_allowed": execution_payload["execution_allowed"],
+            "blocked_reason": execution_payload["blocked_reason"],
             "trigger_type": "bootstrap",
             "trigger_source": "firestore_seed",
             "updated_at": now.isoformat(),
@@ -493,6 +510,7 @@ def build_prime_stocks_runtime_bootstrap_documents(
             "pullback_window": default_runtime_config.pullback_window,
             "latest_signal_time": None,
             "updated_at": now.isoformat(),
+            "execution_allowed": execution_payload["execution_allowed"],
             "strategy_message": "Prime Stocks runtime is initialized and awaiting the first closed 1H bar.",
             "state": state_payload,
             "signal": signal_payload,
@@ -507,6 +525,7 @@ def build_prime_stocks_runtime_bootstrap_documents(
             "trigger_type": "bootstrap",
             "trigger_source": "firestore_seed",
             "updated_at": now.isoformat(),
+            "execution_allowed": execution_payload["execution_allowed"],
         },
         "execution/current": {
             "run_id": BOOTSTRAP_RUN_ID,
@@ -520,6 +539,9 @@ def build_prime_stocks_runtime_bootstrap_documents(
             "client_order_id": execution_payload["client_order_id"],
             "submitted": execution_payload["submitted"],
             "skipped_reason": execution_payload["skipped_reason"],
+            "blocked_reason": execution_payload["blocked_reason"],
+            "add_tier": execution_payload["add_tier"],
+            "execution_allowed": execution_payload["execution_allowed"],
             "trigger_type": "bootstrap",
             "trigger_source": "firestore_seed",
             "updated_at": now.isoformat(),
@@ -530,6 +552,8 @@ def build_prime_stocks_runtime_bootstrap_documents(
             "execution_decision": execution_payload["execution_decision"],
             "execution_mode": execution_payload["execution_mode"],
             "execution": execution_payload,
+            "blocked_reason": execution_payload["blocked_reason"],
+            "execution_allowed": execution_payload["execution_allowed"],
             "trigger_type": "bootstrap",
             "trigger_source": "firestore_seed",
             "updated_at": now.isoformat(),
@@ -580,6 +604,14 @@ def _serialize_execution(
     skipped_reason: str | None,
 ) -> dict[str, Any]:
     execution_key = f"{candidate_action}:{_isoformat_or_none(latest_signal_time) or 'none'}"
+    blocked_reason = skipped_reason if execution_decision in {
+        "stale_data",
+        "market_data_unavailable",
+        "linked_account_unavailable",
+        "runtime_store_unavailable",
+        "credential_trade_access_missing",
+        "live_execution_disabled",
+    } else None
     return {
         "execution_key": execution_key,
         "execution_mode": execution_mode,
@@ -590,7 +622,10 @@ def _serialize_execution(
         "client_order_id": execution_result.client_order_id if execution_result is not None else None,
         "side": execution_result.side if execution_result is not None else None,
         "notional": execution_result.notional if execution_result is not None else None,
+        "add_tier": execution_result.add_tier if execution_result is not None else _parse_add_tier(candidate_action),
+        "execution_allowed": execution_result.submitted if execution_result is not None else execution_decision in {"submitted_buy", "submitted_exit"},
         "skipped_reason": skipped_reason if execution_result is None else execution_result.skipped_reason,
+        "blocked_reason": blocked_reason,
     }
 
 
@@ -609,3 +644,27 @@ def _maybe_int(value: object) -> int | None:
     if value is None or value == "":
         return None
     return int(value)
+
+
+def _normalize_runtime_timeframe(timeframe: str) -> str:
+    normalized = timeframe.strip().upper()
+    aliases = {
+        "1H": "1H",
+        "1HOUR": "1H",
+        "4H": "4H",
+        "4HOUR": "4H",
+        "1D": "1D",
+        "1DAY": "1D",
+        "DAY": "1D",
+        "D": "1D",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _parse_add_tier(candidate_action: str) -> int | None:
+    if not candidate_action.startswith("MULTI-"):
+        return None
+    try:
+        return int(candidate_action.split("-", maxsplit=1)[1])
+    except (IndexError, ValueError):
+        return None

@@ -58,6 +58,49 @@ def test_market_data_adapter_rejects_non_stock_context() -> None:
         )
 
 
+def test_market_data_adapter_maps_runtime_timeframes_to_native_alpaca_values() -> None:
+    client = FakeHttpClient(
+        payload={
+            "bars": {
+                "AAPL": [
+                    {
+                        "t": "2026-04-05T13:00:00Z",
+                        "o": 101.0,
+                        "h": 103.0,
+                        "l": 99.0,
+                        "c": 102.0,
+                        "v": 1500,
+                    }
+                ]
+            }
+        }
+    )
+    adapter = AlpacaMarketDataAdapter(settings=_settings(), http_client=client)
+
+    adapter.fetch_prime_stocks_bars(
+        symbol="AAPL",
+        asset_type="stock",
+        product_key="stocks.bismel1",
+        execution_timeframe="1H",
+        trend_timeframe="1D",
+    )
+
+    assert "timeframe=1Hour" in client.urls[0]
+    assert "timeframe=1Day" in client.urls[1]
+
+
+class FakeHttpClient:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = payload
+        self.urls: list[str] = []
+
+    def fetch_json(self, url: str, headers: dict[str, str]) -> dict[str, object]:
+        assert headers["APCA-API-KEY-ID"] == "key-123"
+        assert headers["APCA-API-SECRET-KEY"] == "secret-123"
+        self.urls.append(url)
+        return self.payload
+
+
 def _settings() -> AppConfig:
     return AppConfig(
         app_name="Bismel1-ex-py",

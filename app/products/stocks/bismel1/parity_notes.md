@@ -16,3 +16,4 @@ version: 1
 - The Pine script remains the only behavior source of truth.
 - Phase 1 creates module boundaries only and does not claim indicator or signal parity.
 - Future parity work should map Pine inputs, series behavior, `request.security` handling, session logic, and closed-candle execution semantics before broker execution is added.
+- Runtime bootstrap currently defaults `pullback_window` to `5` unless Firestore runtime config overrides it explicitly.

@@ -332,17 +332,19 @@ def evaluate_strategy(
     )
     signals = evaluation.bars[-1].signal if evaluation.bars else _empty_signal_snapshot()
     latest_bar = evaluation.bars[-1] if evaluation.bars else None
+    status, message = _resolve_strategy_status(signals)
     return PrimeStocksStrategyResult(
         product_key=resolved_config.product_key,
         pine_strategy_title=resolved_config.pine_strategy_title,
-        status="parity_scaffolding_only",
-        message="Pine source-truth inputs, bar-by-bar signal/state gating, and signal names are synchronized for the current parity phase, but execution parity is not implemented.",
+        status=status,
+        message=message,
         series=series,
         latest_signal=signals,
         latest_bar=latest_bar,
         final_state=evaluation.final_state,
-        execution_timeframe="1H",
-        trend_timeframe="1D",
+        execution_allowed=_signal_is_actionable(signals),
+        execution_timeframe=resolved_config.execution_timeframe,
+        trend_timeframe=resolved_config.trend_timeframe,
     )
 
 
@@ -676,3 +678,24 @@ def _add_signal_raw_at(
 
 def run_prime_stocks_strategy(*args, **kwargs):
     return evaluate_strategy(*args, **kwargs)
+
+
+def _resolve_strategy_status(signal: PineSignalSnapshot) -> tuple[str, str]:
+    if signal.hit_atr_trail:
+        return "exit", "Prime Stocks strategy produced an ATR trail exit signal."
+    if signal.hit_regime:
+        return "exit", "Prime Stocks strategy produced a regime-fail exit signal."
+    if signal.base_entry_trigger:
+        return "signal", "Prime Stocks strategy produced a first-entry signal."
+    if signal.add_trigger:
+        return "signal", "Prime Stocks strategy produced a recovery add signal."
+    return "no_signal", "Prime Stocks strategy evaluated the latest closed bar with no actionable signal."
+
+
+def _signal_is_actionable(signal: PineSignalSnapshot) -> bool:
+    return (
+        signal.base_entry_trigger
+        or signal.add_trigger
+        or signal.hit_atr_trail
+        or signal.hit_regime
+    )
