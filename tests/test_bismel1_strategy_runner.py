@@ -56,3 +56,27 @@ def test_runner_accepts_equity_alias_and_normalizes_to_stock() -> None:
     assert result.status == "no_signal"
 
     assert strategy_input.asset_type == "equity"
+
+
+def test_runner_uses_initial_state_when_supplied() -> None:
+    initial_state = BismillahTrobotStocksV1State(
+        add_count=2,
+        last_add_price=103.0,
+        dollars_used=174.0,
+        pos_high=107.0,
+        trail_stop=101.0,
+        position_avg_price=102.0,
+        position_size=2.0,
+    )
+
+    result = evaluate_strategy(
+        BismillahTrobotStocksV1Input(
+            execution_bars=[],
+            htf_bars=[],
+            symbol="AAPL",
+            asset_type="stock",
+        ),
+        initial_state=initial_state,
+    )
+
+    assert result.final_state == initial_state

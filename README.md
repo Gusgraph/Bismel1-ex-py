@@ -122,6 +122,14 @@ Current Firestore path shape:
 - `runtime_products/prime_stocks/actions/latest`
 - `runtime_products/prime_stocks/logs/{run_id}`
 
+Bootstrap seed command for the current runtime/control document family:
+
+```bash
+python scripts/bootstrap_prime_stocks_firestore_runtime.py --project servgraph --database bismel1-01
+```
+
+The bootstrap is safe to re-run and writes merge-based defaults for the current Prime Stocks Firestore control surface without pre-seeding runtime log documents.
+
 ## Next Phase
 
 Deployment helpers added in this phase:

@@ -151,6 +151,8 @@ def shift_series(values: list[float | None], bars_back: int) -> list[float | Non
         return list(values)
     if not values:
         return []
+    if bars_back >= len(values):
+        return [None] * len(values)
     return ([None] * bars_back) + list(values[:-bars_back])
 
 

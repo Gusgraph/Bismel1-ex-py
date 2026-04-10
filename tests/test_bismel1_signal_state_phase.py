@@ -183,6 +183,7 @@ def test_regime_fail_exit_trigger_respects_optional_exit_flag() -> None:
         pause_adds=[True, True],
         pause_new_basket=[False, True],
         trend_ok=[True, False],
+        regime_exit_confirmed=[False, True],
         regime_fail=[False, True],
         auto_paused=[False, True],
         is_low_tier=[False, False],
@@ -202,6 +203,39 @@ def test_regime_fail_exit_trigger_respects_optional_exit_flag() -> None:
     assert enabled.bars[1].state_after.position_size == 0.0
     assert [bar.signal.hit_regime for bar in disabled.bars] == [False, False]
     assert isclose(disabled.bars[1].state_after.position_size, 1.0, rel_tol=1e-9, abs_tol=1e-9)
+
+
+def test_single_bar_regime_noise_does_not_trigger_regime_exit() -> None:
+    strategy_input = _strategy_input(
+        closes=[105.0, 104.0],
+        opens=[104.0, 105.0],
+        highs=[106.0, 105.0],
+        lows=[103.0, 103.0],
+    )
+    state = BismillahTrobotStocksV1State(
+        last_add_price=100.0,
+        dollars_used=100.0,
+        position_avg_price=100.0,
+        position_size=1.0,
+    )
+    series = PineComputedSeries(
+        atr_val=[1.0, 1.0],
+        in_pullback_zone=[False, False],
+        pause_adds=[True, True],
+        pause_new_basket=[False, True],
+        trend_ok=[True, False],
+        regime_exit_confirmed=[False, False],
+        regime_fail=[False, True],
+        auto_paused=[False, True],
+        is_low_tier=[False, False],
+        momentum_confirm=[False, False],
+        rsi_val=[30.0, 30.0],
+    )
+
+    evaluation = evaluate_signal_state_phase(strategy_input, BismillahTrobotStocksV1Config(), state, series)
+
+    assert [bar.signal.hit_regime for bar in evaluation.bars] == [False, False]
+    assert isclose(evaluation.bars[1].state_after.position_size, 1.0, rel_tol=1e-9, abs_tol=1e-9)
 
 
 def _strategy_input(

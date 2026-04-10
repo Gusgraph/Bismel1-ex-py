@@ -18,11 +18,12 @@ JOB_NAME="${JOB_NAME:-prime-stocks-scheduled}"
 SCHEDULE="${SCHEDULE:-5 * * * 1-5}"
 TIME_ZONE="${TIME_ZONE:-Etc/UTC}"
 SERVICE_URL="${SERVICE_URL:?Set SERVICE_URL to the Cloud Run base URL.}"
+TARGET_PATH="${TARGET_PATH:-/runtime/prime-stocks/scheduled}"
 SCHEDULER_HEADER_NAME="${SCHEDULER_HEADER_NAME:-X-Prime-Stocks-Scheduler}"
 SCHEDULER_HEADER_VALUE="${SCHEDULER_HEADER_VALUE:-prime-stocks-hourly}"
 OIDC_SERVICE_ACCOUNT_EMAIL="${OIDC_SERVICE_ACCOUNT_EMAIL:?Set OIDC_SERVICE_ACCOUNT_EMAIL for authenticated invocation.}"
 
-TARGET_URI="${SERVICE_URL%/}/runtime/prime-stocks/scheduled"
+TARGET_URI="${SERVICE_URL%/}${TARGET_PATH}"
 HEADERS="Content-Type=application/json,${SCHEDULER_HEADER_NAME}=${SCHEDULER_HEADER_VALUE}"
 
 COMMON_ARGS=(

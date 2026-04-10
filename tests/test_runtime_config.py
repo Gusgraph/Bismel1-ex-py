@@ -37,9 +37,15 @@ def test_runtime_config_loads_prime_stocks_dry_run_defaults(monkeypatch) -> None
     assert settings.prime_stocks_paper_execution_enabled is False
     assert settings.prime_stocks_execution_bar_limit == 351
     assert settings.prime_stocks_trend_bar_limit == 221
+    assert settings.prime_stocks_test_mode is False
+    assert settings.prime_stocks_test_trigger is None
+    assert settings.prime_stocks_test_symbol_override is None
     assert settings.prime_stocks_scheduler_job_name == "prime-stocks-scheduled"
     assert settings.prime_stocks_scheduler_region == "us-central1"
     assert settings.prime_stocks_scheduler_schedule == "5 * * * 1-5"
     assert settings.prime_stocks_scheduler_header_name == "X-Prime-Stocks-Scheduler"
     assert settings.prime_stocks_scheduler_header_value is None
     assert settings.prime_stocks_scheduler_timezone == "Etc/UTC"
+    assert settings.prime_stocks_ping_scheduler_job_name == "prime-stocks-ping"
+    assert settings.prime_stocks_ping_scheduler_schedule == "*/1 * * * *"
+    assert settings.prime_stocks_ping_scheduler_header_value is None

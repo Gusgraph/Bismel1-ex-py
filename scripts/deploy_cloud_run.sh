@@ -17,6 +17,7 @@ REGION="${REGION:-us-central1}"
 PROJECT_ID="${PROJECT_ID:?Set PROJECT_ID before deploying.}"
 IMAGE_URI="${IMAGE_URI:?Set IMAGE_URI to the built container image.}"
 SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-}"
+SECRET_ENV_VARS="${SECRET_ENV_VARS:-}"
 
 DEPLOY_CMD=(
   gcloud run deploy "${SERVICE_NAME}"
@@ -29,6 +30,10 @@ DEPLOY_CMD=(
 
 if [[ -n "${SERVICE_ACCOUNT}" ]]; then
   DEPLOY_CMD+=(--service-account "${SERVICE_ACCOUNT}")
+fi
+
+if [[ -n "${SECRET_ENV_VARS}" ]]; then
+  DEPLOY_CMD+=(--set-secrets "${SECRET_ENV_VARS}")
 fi
 
 printf 'Deploying Cloud Run service %s in %s\n' "${SERVICE_NAME}" "${REGION}"

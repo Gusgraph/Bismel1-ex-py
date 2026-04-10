@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -19,6 +19,7 @@ class AlpacaAccountResolutionError(RuntimeError):
 
 @dataclass(frozen=True)
 class ResolvedAlpacaAccountContext:
+    uid: str
     account_id: int
     alpaca_account_id: int
     broker_connection_id: int
@@ -29,6 +30,19 @@ class ResolvedAlpacaAccountContext:
     trade_enabled: bool
     key_id: str
     secret: str
+    slot_number: int = 1
+    entitlement: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RuntimeAccountTarget:
+    uid: str
+    account_id: int
+    alpaca_account_id: int
+    slot_number: int = 1
+    environment: str = "paper"
+    account_label: str | None = None
+    entitlement: dict[str, object] = field(default_factory=dict)
 
 
 class HttpJsonRequestProtocol:
@@ -97,13 +111,16 @@ class LaravelAlpacaAccountResolver:
         try:
             return ResolvedAlpacaAccountContext(
                 account_id=int(payload["account_id"]),
+                uid=str(payload["uid"]).strip(),
                 alpaca_account_id=int(payload["alpaca_account_id"]),
                 broker_connection_id=int(payload["broker_connection_id"]),
                 broker_credential_id=int(payload["broker_credential_id"]),
+                slot_number=max(1, int(payload.get("slot_number", 1))),
                 environment=_normalize_environment(str(payload.get("environment", "paper"))),
                 data_feed=str(payload.get("data_feed", "iex")).strip().lower() or "iex",
                 access_mode=str(payload.get("access_mode", "read_only")).strip().lower() or "read_only",
                 trade_enabled=bool(payload.get("trade_enabled", False)),
+                entitlement=_normalize_entitlement(payload.get("entitlement")),
                 key_id=str(payload["key_id"]).strip(),
                 secret=str(payload["secret"]).strip(),
             )
@@ -112,6 +129,74 @@ class LaravelAlpacaAccountResolver:
                 "Laravel runtime bridge response is missing required linked Alpaca account fields."
             ) from exc
 
+    def list_runtime_targets(self) -> list[RuntimeAccountTarget]:
+        if not self._settings.laravel_runtime_bridge_url:
+            raise AlpacaAccountResolutionError("Laravel runtime bridge URL is not configured.")
+        if not self._settings.laravel_runtime_bridge_token:
+            raise AlpacaAccountResolutionError("Laravel runtime bridge token is not configured.")
+
+        separator = "&" if "?" in self._settings.laravel_runtime_bridge_url else "?"
+        url = f"{self._settings.laravel_runtime_bridge_url.rstrip('/')}{separator}fanout=1"
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self._settings.laravel_runtime_bridge_token}",
+        }
+
+        try:
+            payload = self._http_client.request_json(url=url, headers=headers)
+        except HTTPError as exc:
+            if exc.code == 401:
+                raise AlpacaAccountResolutionError("Laravel runtime bridge rejected the configured bearer token.") from exc
+            raise AlpacaAccountResolutionError(
+                f"Laravel runtime bridge returned HTTP {exc.code} while resolving Prime Stocks scheduler targets."
+            ) from exc
+        except URLError as exc:
+            raise AlpacaAccountResolutionError(
+                "Laravel runtime bridge could not be reached while resolving Prime Stocks scheduler targets."
+            ) from exc
+        except json.JSONDecodeError as exc:
+            raise AlpacaAccountResolutionError(
+                "Laravel runtime bridge returned invalid JSON for Prime Stocks scheduler targets."
+            ) from exc
+
+        targets = payload.get("targets", [])
+        if not isinstance(targets, list):
+            raise AlpacaAccountResolutionError("Laravel runtime bridge returned invalid scheduler target payload.")
+
+        resolved_targets: list[RuntimeAccountTarget] = []
+        for target in targets:
+            if not isinstance(target, dict):
+                continue
+            try:
+                resolved_targets.append(
+                    RuntimeAccountTarget(
+                        uid=str(target["uid"]).strip(),
+                        account_id=int(target["account_id"]),
+                        alpaca_account_id=int(target["alpaca_account_id"]),
+                        slot_number=max(1, int(target.get("slot_number", 1))),
+                        environment=_normalize_environment(str(target.get("environment", "paper"))),
+                        account_label=_maybe_string(target.get("account_label")),
+                        entitlement=_normalize_entitlement(target.get("entitlement")),
+                    )
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise AlpacaAccountResolutionError(
+                    "Laravel runtime bridge returned invalid Prime Stocks scheduler target fields."
+                ) from exc
+
+        return resolved_targets
+
 
 def _normalize_environment(environment: str) -> str:
     return "live" if environment.strip().lower() == "live" else "paper"
+
+
+def _normalize_entitlement(payload: object) -> dict[str, object]:
+    return payload if isinstance(payload, dict) else {}
+
+
+def _maybe_string(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None

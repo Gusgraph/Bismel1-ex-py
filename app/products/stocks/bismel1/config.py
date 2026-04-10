@@ -53,6 +53,7 @@ class BismillahTrobotStocksV1Config:
     max_basket_pct_equity: float = 10.0
     atr_trail_mult: float = 3.0
     exit_on_regime_fail: bool = True
+    regime_exit_confirmation_bars: int = 3
 
     pause_new_entries_manual: bool = False
     pause_on_regime_fail: bool = True

@@ -28,6 +28,7 @@ from app.products.stocks.bismel1.indicators import (
     shift_series,
 )
 from app.products.stocks.bismel1.models import (
+    PrimeStocksAiDecision,
     BismillahTrobotStocksV1Input,
     BismillahTrobotStocksV1State,
     PineSignalStateBar,
@@ -132,11 +133,22 @@ def compute_pine_series(
     htf_ema_fast_source = ema(htf_closes, config.ema_fast_len)
     htf_ema_slow_source = ema(htf_closes, config.ema_slow_len)
     htf_ema_slow_prev_source = shift_series(htf_ema_slow_source, config.ema_slow_slope_lookback)
+    htf_regime_exit_confirmed_source = _regime_exit_confirmed_source(
+        htf_bars=htf_bars,
+        htf_closes=htf_closes,
+        htf_ema_fast=htf_ema_fast_source,
+        htf_ema_slow=htf_ema_slow_source,
+        confirmation_bars=config.regime_exit_confirmation_bars,
+    )
 
     htf_close = merge_htf_series(execution_bars, htf_bars, htf_closes)
     htf_ema_fast = merge_htf_series(execution_bars, htf_bars, htf_ema_fast_source)
     htf_ema_slow = merge_htf_series(execution_bars, htf_bars, htf_ema_slow_source)
     htf_ema_slow_prev = merge_htf_series(execution_bars, htf_bars, htf_ema_slow_prev_source)
+    htf_regime_exit_confirmed = [
+        value is not None and value > 0.0
+        for value in merge_htf_series(execution_bars, htf_bars, htf_regime_exit_confirmed_source)
+    ]
 
     htf_ema_slow_slope_up: list[bool] = []
     trend_base_htf: list[bool] = []
@@ -217,6 +229,7 @@ def compute_pine_series(
         htf_ema_slow_slope_up=htf_ema_slow_slope_up,
         trend_base_htf=trend_base_htf,
         trend_ok=trend_ok,
+        regime_exit_confirmed=htf_regime_exit_confirmed,
         in_session=in_session,
         is_weekday=is_weekday,
         session_ok=session_ok,
@@ -322,18 +335,21 @@ def evaluate_signal_state_phase(
 def evaluate_strategy(
     strategy_input: StrategyInputSet,
     config: Bismel1StrategyConfig | None = None,
+    ai_decision: PrimeStocksAiDecision | None = None,
+    initial_state: BismillahTrobotStocksV1State | None = None,
 ) -> PrimeStocksStrategyResult:
     resolved_config = config or Bismel1StrategyConfig()
     series = compute_pine_series(strategy_input, resolved_config)
     evaluation = evaluate_signal_state_phase(
         strategy_input=strategy_input,
         config=resolved_config,
+        initial_state=initial_state,
         series=series,
     )
     signals = evaluation.bars[-1].signal if evaluation.bars else _empty_signal_snapshot()
     latest_bar = evaluation.bars[-1] if evaluation.bars else None
     status, message = _resolve_strategy_status(signals)
-    return PrimeStocksStrategyResult(
+    result = PrimeStocksStrategyResult(
         product_key=resolved_config.product_key,
         pine_strategy_title=resolved_config.pine_strategy_title,
         status=status,
@@ -342,10 +358,12 @@ def evaluate_strategy(
         latest_signal=signals,
         latest_bar=latest_bar,
         final_state=evaluation.final_state,
+        ai_decision=ai_decision,
         execution_allowed=_signal_is_actionable(signals),
         execution_timeframe=resolved_config.execution_timeframe,
         trend_timeframe=resolved_config.trend_timeframe,
     )
+    return _apply_ai_decision(result, ai_decision=ai_decision)
 
 
 def _empty_signal_snapshot() -> PineSignalSnapshot:
@@ -395,6 +413,46 @@ def _hhmm_to_minutes(value: str) -> int:
     if len(value) != 4 or not value.isdigit():
         raise ValueError("Expected HHMM session string.")
     return (int(value[:2]) * 60) + int(value[2:])
+
+
+def _regime_exit_confirmed_source(
+    *,
+    htf_bars: list,
+    htf_closes: list[float],
+    htf_ema_fast: list[float | None],
+    htf_ema_slow: list[float | None],
+    confirmation_bars: int,
+) -> list[float | None]:
+    if not htf_bars:
+        return []
+
+    resolved_confirmation_bars = max(2, confirmation_bars)
+    bearish_streak = 0
+    confirmed: list[float | None] = []
+
+    for index, close in enumerate(htf_closes):
+        ema_fast_value = htf_ema_fast[index]
+        ema_slow_value = htf_ema_slow[index]
+        bearish_structure = (
+            ema_fast_value is not None
+            and ema_slow_value is not None
+            and close < ema_slow_value
+            and ema_fast_value <= ema_slow_value
+        )
+        bearish_streak = bearish_streak + 1 if bearish_structure else 0
+
+        structure_break = False
+        if index >= 2:
+            structure_break = (
+                bearish_structure
+                and htf_bars[index].high < htf_bars[index - 1].high < htf_bars[index - 2].high
+                and htf_bars[index].low < htf_bars[index - 1].low < htf_bars[index - 2].low
+                and close < htf_bars[index - 1].low
+            )
+
+        confirmed.append(1.0 if (bearish_streak >= resolved_confirmation_bars or structure_break) else 0.0)
+
+    return confirmed
 
 
 def _spacing_atr(is_low_tier: bool, step: int) -> float:
@@ -583,7 +641,7 @@ def _snapshot_signals_at(
         )
         add_trigger = add_signal_raw and (not previous_add_signal_raw)
         hit_atr_trail = state.trail_stop is not None and current_bar.close <= state.trail_stop
-        hit_regime = config.exit_on_regime_fail and _bool_at(series.regime_fail, index)
+        hit_regime = config.exit_on_regime_fail and _bool_at(series.regime_exit_confirmed, index)
 
     return PineSignalSnapshot(
         base_entry_signal=base_entry_signal,
@@ -678,6 +736,50 @@ def _add_signal_raw_at(
 
 def run_prime_stocks_strategy(*args, **kwargs):
     return evaluate_strategy(*args, **kwargs)
+
+
+def _apply_ai_decision(
+    result: PrimeStocksStrategyResult,
+    *,
+    ai_decision: PrimeStocksAiDecision | None,
+) -> PrimeStocksStrategyResult:
+    if ai_decision is None:
+        return result
+    if result.latest_signal.hit_atr_trail or result.latest_signal.hit_regime:
+        return replace(result, ai_decision=ai_decision)
+    if result.latest_signal.base_entry_trigger and ai_decision.Ai_block_new_entries:
+        blocked_signal = replace(
+            result.latest_signal,
+            base_entry_signal=False,
+            base_entry_trigger=False,
+        )
+        return replace(
+            result,
+            status="blocked",
+            message=f"Prime Stocks blocked new basket entry because {ai_decision.Ai_blocked_reason or 'ai policy'} is active.",
+            latest_signal=blocked_signal,
+            execution_allowed=False,
+            ai_decision=ai_decision,
+        )
+    if result.latest_signal.add_trigger and ai_decision.Ai_block_adds:
+        blocked_signal = replace(
+            result.latest_signal,
+            add_signal_raw=False,
+            add_trigger=False,
+        )
+        return replace(
+            result,
+            status="blocked",
+            message=f"Prime Stocks blocked recovery add because {ai_decision.Ai_blocked_reason or 'ai policy'} is active.",
+            latest_signal=blocked_signal,
+            execution_allowed=False,
+            ai_decision=ai_decision,
+        )
+    return replace(
+        result,
+        execution_allowed=result.execution_allowed and ai_decision.Ai_execution_allowed,
+        ai_decision=ai_decision,
+    )
 
 
 def _resolve_strategy_status(signal: PineSignalSnapshot) -> tuple[str, str]:

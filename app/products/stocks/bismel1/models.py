@@ -78,6 +78,7 @@ class PineComputedSeries:
     htf_ema_slow_slope_up: list[bool] = field(default_factory=list)
     trend_base_htf: list[bool] = field(default_factory=list)
     trend_ok: list[bool] = field(default_factory=list)
+    regime_exit_confirmed: list[bool] = field(default_factory=list)
     in_session: list[bool] = field(default_factory=list)
     is_weekday: list[bool] = field(default_factory=list)
     session_ok: list[bool] = field(default_factory=list)
@@ -129,6 +130,44 @@ class PineSignalStateEvaluation:
 
 
 @dataclass(frozen=True)
+class AiCacheRecord:
+    scope: str
+    symbol: str | None
+    Ai_regime_label: str
+    Ai_sentiment_label: str
+    Ai_safety_label: str
+    Ai_confidence: float
+    Ai_reason: str
+    Ai_updated_at: str | None
+    Ai_source: str
+    Ai_execution_allowed: bool
+    Ai_block_new_entries: bool
+    Ai_block_adds: bool
+    Ai_blocked_reason: str | None
+    is_stale: bool = False
+    is_available: bool = True
+
+
+@dataclass(frozen=True)
+class PrimeStocksAiDecision:
+    Ai_regime_label: str
+    Ai_sentiment_label: str
+    Ai_safety_label: str
+    Ai_confidence: float
+    Ai_reason: str
+    Ai_updated_at: str | None
+    Ai_source: str
+    Ai_execution_allowed: bool
+    Ai_block_new_entries: bool
+    Ai_block_adds: bool
+    Ai_blocked_reason: str | None
+    market_record: AiCacheRecord | None = None
+    symbol_record: AiCacheRecord | None = None
+    is_stale: bool = False
+    is_available: bool = True
+
+
+@dataclass(frozen=True)
 class PrimeStocksStrategyResult:
     """Consolidated strategy output."""
 
@@ -140,6 +179,7 @@ class PrimeStocksStrategyResult:
     latest_signal: PineSignalSnapshot
     latest_bar: PineSignalStateBar | None
     final_state: BismillahTrobotStocksV1State
+    ai_decision: PrimeStocksAiDecision | None = None
     execution_allowed: bool = False
     execution_timeframe: str = "1H"
     trend_timeframe: str = "1D"

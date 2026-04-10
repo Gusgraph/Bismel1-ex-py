@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from typing import Protocol
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from app.services.alpaca_account_resolver import ResolvedAlpacaAccountContext
@@ -55,6 +56,53 @@ class UrllibRequestJsonClient:
         return json.loads(raw_payload) if raw_payload else {}
 
 
+class AlpacaPaperTradingError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        code: str,
+        message: str,
+        retryable: bool = False,
+        http_status: int | None = None,
+        raw_response: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.retryable = retryable
+        self.http_status = http_status
+        self.raw_response = raw_response
+
+
+@dataclass(frozen=True)
+class AlpacaPaperAccountState:
+    buying_power: float | None
+    open_positions_count: int
+    equity: float | None = None
+    total_exposure: float | None = None
+
+
+@dataclass(frozen=True)
+class AlpacaPaperAssetState:
+    symbol: str
+    tradable: bool
+    status: str | None = None
+
+
+@dataclass(frozen=True)
+class AlpacaPaperPositionState:
+    symbol: str
+    qty: float
+    market_value: float | None = None
+
+
+@dataclass(frozen=True)
+class AlpacaPaperSubmissionState:
+    account: AlpacaPaperAccountState
+    asset: AlpacaPaperAssetState
+    position: AlpacaPaperPositionState | None
+
+
 @dataclass(frozen=True)
 class AlpacaPaperExecutionResult:
     action: str
@@ -66,6 +114,9 @@ class AlpacaPaperExecutionResult:
     notional: float | None
     add_tier: int | None = None
     skipped_reason: str | None = None
+    retry_count: int = 0
+    broker_error_code: str | None = None
+    broker_error_message: str | None = None
     raw_response: dict[str, object] | None = None
 
 
@@ -131,7 +182,7 @@ class AlpacaPaperTradingAdapter:
     ) -> AlpacaPaperExecutionResult:
         self._ensure_stock_context(asset_type=asset_type, product_key=product_key)
         base_url = self._resolve_base_url(credential_context).rstrip("/")
-        payload = self._http_client.request_json(
+        payload = self._request_json(
             url=f"{base_url}/v2/positions/{symbol.upper()}",
             method="DELETE",
             headers=self._headers(client_order_id=client_order_id, credential_context=credential_context),
@@ -147,6 +198,60 @@ class AlpacaPaperTradingAdapter:
             raw_response=payload,
         )
 
+    def get_submission_state(
+        self,
+        *,
+        symbol: str,
+        credential_context: ResolvedAlpacaAccountContext | None = None,
+    ) -> AlpacaPaperSubmissionState:
+        base_url = self._resolve_base_url(credential_context).rstrip("/")
+        headers = self._headers(client_order_id="prime-state-probe", credential_context=credential_context)
+        account_payload = self._request_json(
+            url=f"{base_url}/v2/account",
+            method="GET",
+            headers=headers,
+        )
+        positions_payload = self._request_json(
+            url=f"{base_url}/v2/positions",
+            method="GET",
+            headers=headers,
+        )
+        asset_payload = self._request_json(
+            url=f"{base_url}/v2/assets/{symbol.upper()}",
+            method="GET",
+            headers=headers,
+        )
+        position_payload = None
+        try:
+            position_payload = self._request_json(
+                url=f"{base_url}/v2/positions/{symbol.upper()}",
+                method="GET",
+                headers=headers,
+            )
+        except AlpacaPaperTradingError as exc:
+            if exc.http_status != 404:
+                raise
+        return AlpacaPaperSubmissionState(
+            account=AlpacaPaperAccountState(
+                buying_power=_maybe_float(account_payload.get("buying_power")),
+                open_positions_count=len(positions_payload) if isinstance(positions_payload, list) else 0,
+                equity=_maybe_float(account_payload.get("equity")),
+                total_exposure=_sum_position_market_value(positions_payload),
+            ),
+            asset=AlpacaPaperAssetState(
+                symbol=symbol.upper(),
+                tradable=bool(asset_payload.get("tradable", False)),
+                status=_maybe_string(asset_payload.get("status")),
+            ),
+            position=None
+            if not position_payload
+            else AlpacaPaperPositionState(
+                symbol=symbol.upper(),
+                qty=_maybe_float(position_payload.get("qty")) or 0.0,
+                market_value=_maybe_float(position_payload.get("market_value")),
+            ),
+        )
+
     def _submit_notional_buy(
         self,
         *,
@@ -158,7 +263,7 @@ class AlpacaPaperTradingAdapter:
         credential_context: ResolvedAlpacaAccountContext | None = None,
     ) -> AlpacaPaperExecutionResult:
         base_url = self._resolve_base_url(credential_context).rstrip("/")
-        payload = self._http_client.request_json(
+        payload = self._request_json(
             url=f"{base_url}/v2/orders",
             method="POST",
             headers=self._headers(client_order_id=client_order_id, credential_context=credential_context),
@@ -200,6 +305,39 @@ class AlpacaPaperTradingAdapter:
             "APCA-API-SECRET-KEY": secret,
         }
 
+    def _request_json(
+        self,
+        *,
+        url: str,
+        method: str,
+        headers: dict[str, str],
+        payload: dict[str, object] | None = None,
+    ) -> dict[str, object] | list[object]:
+        try:
+            return self._http_client.request_json(url=url, method=method, headers=headers, payload=payload)
+        except AlpacaPaperTradingError:
+            raise
+        except HTTPError as exc:
+            raise _normalize_alpaca_http_error(exc) from exc
+        except TimeoutError as exc:
+            raise AlpacaPaperTradingError(
+                code="broker_api_timeout",
+                message="Alpaca request timed out during Prime Stocks execution.",
+                retryable=True,
+            ) from exc
+        except URLError as exc:
+            raise AlpacaPaperTradingError(
+                code="broker_api_timeout",
+                message="Alpaca request could not be reached during Prime Stocks execution.",
+                retryable=True,
+            ) from exc
+        except json.JSONDecodeError as exc:
+            raise AlpacaPaperTradingError(
+                code="broker_invalid_response",
+                message="Alpaca returned invalid JSON during Prime Stocks execution.",
+                retryable=False,
+            ) from exc
+
     def _resolve_base_url(self, credential_context: ResolvedAlpacaAccountContext | None) -> str:
         if credential_context is not None and credential_context.environment == "live":
             return self._settings.alpaca_live_trading_base_url
@@ -219,3 +357,97 @@ def _maybe_string(value: object) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _maybe_float(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    return float(value)
+
+
+def _sum_position_market_value(payload: dict[str, object] | list[object]) -> float | None:
+    if not isinstance(payload, list):
+        return None
+    total = 0.0
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        market_value = _maybe_float(item.get("market_value"))
+        if market_value is None:
+            continue
+        total += abs(market_value)
+    return total
+
+
+def _normalize_alpaca_http_error(exc: HTTPError) -> AlpacaPaperTradingError:
+    raw_text = ""
+    raw_payload: dict[str, object] | None = None
+    try:
+        raw_text = exc.read().decode("utf-8")
+        raw_payload = json.loads(raw_text) if raw_text else None
+    except Exception:
+        raw_payload = None
+    message = _extract_alpaca_error_message(raw_payload) or raw_text or f"Alpaca HTTP {exc.code}"
+    normalized_message = message.strip()
+    lowered = normalized_message.lower()
+    if exc.code == 429:
+        return AlpacaPaperTradingError(
+            code="broker_rate_limited",
+            message=normalized_message,
+            retryable=True,
+            http_status=exc.code,
+            raw_response=raw_payload,
+        )
+    if exc.code in {500, 502, 503, 504}:
+        return AlpacaPaperTradingError(
+            code="broker_api_error",
+            message=normalized_message,
+            retryable=True,
+            http_status=exc.code,
+            raw_response=raw_payload,
+        )
+    if "insufficient buying power" in lowered:
+        return AlpacaPaperTradingError(
+            code="broker_insufficient_buying_power",
+            message=normalized_message,
+            http_status=exc.code,
+            raw_response=raw_payload,
+        )
+    if "not tradable" in lowered:
+        return AlpacaPaperTradingError(
+            code="broker_asset_not_tradable",
+            message=normalized_message,
+            http_status=exc.code,
+            raw_response=raw_payload,
+        )
+    if "market is closed" in lowered or "market closed" in lowered:
+        return AlpacaPaperTradingError(
+            code="broker_market_closed",
+            message=normalized_message,
+            http_status=exc.code,
+            raw_response=raw_payload,
+        )
+    if "invalid" in lowered and "order" in lowered:
+        return AlpacaPaperTradingError(
+            code="broker_invalid_order",
+            message=normalized_message,
+            http_status=exc.code,
+            raw_response=raw_payload,
+        )
+    return AlpacaPaperTradingError(
+        code="broker_rejected",
+        message=normalized_message,
+        retryable=False,
+        http_status=exc.code,
+        raw_response=raw_payload,
+    )
+
+
+def _extract_alpaca_error_message(payload: dict[str, object] | None) -> str | None:
+    if not payload:
+        return None
+    for key in ("message", "error", "detail"):
+        value = payload.get(key)
+        if value is not None:
+            return str(value)
+    return None

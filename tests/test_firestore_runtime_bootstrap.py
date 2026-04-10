@@ -33,6 +33,15 @@ def test_build_prime_stocks_runtime_bootstrap_documents_matches_runtime_defaults
         "enabled": True,
         "dry_run": False,
         "paper_execution_enabled": True,
+        "live_execution_enabled": False,
+        "ping_enabled": False,
+        "ping_mode": "off",
+        "ping_daily_heartbeat_enabled": False,
+        "test_mode": False,
+        "test_trigger": None,
+        "test_symbol_override": None,
+        "force_candidate_action": None,
+        "ai_validation_bypass_enabled": False,
         "execution_timeframe": "1H",
         "trend_timeframe": "1D",
         "pullback_window": 5,
@@ -40,22 +49,40 @@ def test_build_prime_stocks_runtime_bootstrap_documents_matches_runtime_defaults
         "trend_bar_limit": 221,
         "first_lot_notional": 101.0,
         "multi_notional": 73.0,
+        "max_notional_per_order": 303.0,
+        "max_total_notional_per_symbol": 707.0,
+        "max_add_count": 2,
+        "daily_order_cap": None,
+        "max_open_positions": None,
+        "broker_retry_max_attempts": 1,
+        "uid": None,
         "account_id": None,
         "alpaca_account_id": None,
         "runtime_target": "cloud_run",
+        "entitlement": {},
     }
     assert documents["state/current"]["run_id"] == BOOTSTRAP_RUN_ID
+    assert documents["state/current"]["symbol"] == "AAPL"
+    assert documents["state/current"]["position_open"] is False
+    assert documents["state/current"]["position_size"] == 0.0
+    assert documents["state/current"]["add_tiers_filled"] == []
     assert documents["state/current"]["last_processed_bar_time"] is None
+    assert documents["state/current"]["latest_signal_time"] is None
     assert documents["state/current"]["latest_execution_decision"] == "not_started"
+    assert documents["state/current"]["test_mode"] is False
+    assert documents["state/current"]["validation_only"] is False
     assert documents["state/current"]["updated_at"] == now.isoformat()
     assert documents["snapshots/latest"]["status"] == "initialized"
+    assert documents["snapshots/latest"]["test_mode"] is False
     assert documents["snapshots/latest"]["execution_timeframe"] == "1H"
     assert documents["snapshots/latest"]["trend_timeframe"] == "1D"
     assert documents["snapshots/latest"]["pullback_window"] == 5
     assert documents["snapshots/latest"]["signal"]["base_entry_trigger"] is False
     assert documents["snapshots/latest"]["state"]["add_count"] == 0
     assert documents["signals/latest"]["candidate_action"] == "BOOTSTRAPPED"
+    assert documents["signals/latest"]["test_mode"] is False
     assert documents["execution/current"]["execution_mode"] == "bootstrapped"
+    assert documents["execution/current"]["validation_only"] is False
     assert documents["execution/current"]["order_status"] == "not_submitted"
     assert documents["actions/latest"]["execution"]["skipped_reason"] == "bootstrap_seeded"
 
@@ -173,20 +200,37 @@ def _settings() -> AppConfig:
         alpaca_api_key_id="key-123",
         alpaca_api_secret="secret-123",
         alpaca_data_feed="iex",
+        gemini_model="gemini-2.5-flash-lite",
+        ai_cache_max_age_minutes=360,
         prime_stocks_runtime_enabled=True,
         prime_stocks_dry_run=False,
         prime_stocks_paper_execution_enabled=True,
         prime_stocks_live_execution_enabled=False,
+        prime_stocks_ai_validation_bypass_enabled=False,
         prime_stocks_default_symbol="AAPL",
         prime_stocks_asset_type="stock",
+        prime_stocks_test_mode=False,
+        prime_stocks_test_trigger=None,
+        prime_stocks_test_symbol_override=None,
         prime_stocks_execution_bar_limit=351,
         prime_stocks_trend_bar_limit=221,
         prime_stocks_first_lot_notional=101.0,
         prime_stocks_multi_notional=73.0,
+        prime_stocks_max_notional_per_order=303.0,
+        prime_stocks_max_total_notional_per_symbol=707.0,
+        prime_stocks_max_add_count=2,
+        prime_stocks_daily_order_cap=None,
+        prime_stocks_max_open_positions=None,
+        prime_stocks_broker_retry_max_attempts=1,
+        prime_stocks_force_candidate_action=None,
         prime_stocks_scheduler_job_name="prime-stocks-scheduled",
         prime_stocks_scheduler_region="us-central1",
         prime_stocks_scheduler_schedule="5 * * * 1-5",
         prime_stocks_scheduler_timezone="Etc/UTC",
         prime_stocks_scheduler_header_name="X-Prime-Stocks-Scheduler",
         prime_stocks_scheduler_header_value="prime-stocks-hourly",
+        prime_stocks_ping_scheduler_job_name="prime-stocks-ping",
+        prime_stocks_ping_scheduler_schedule="*/1 * * * *",
+        prime_stocks_ping_scheduler_timezone="Etc/UTC",
+        prime_stocks_ping_scheduler_header_value="prime-stocks-ping",
     )

@@ -50,7 +50,7 @@ def test_normalize_alpaca_bars_maps_payload_to_internal_price_bars() -> None:
 def test_market_data_adapter_rejects_non_stock_context() -> None:
     adapter = AlpacaMarketDataAdapter(settings=_settings())
 
-    with pytest.raises(ValueError, match="stock/equity"):
+    with pytest.raises(ValueError, match="test symbol override 'SHIBUSD'"):
         adapter.fetch_prime_stocks_bars(
             symbol="BTCUSD",
             asset_type="crypto",
@@ -89,6 +89,40 @@ def test_market_data_adapter_maps_runtime_timeframes_to_native_alpaca_values() -
     assert "timeframe=1Day" in client.urls[1]
 
 
+def test_market_data_adapter_supports_shibusd_validation_crypto_override() -> None:
+    client = FakeHttpClient(
+        payload={
+            "bars": {
+                "SHIB/USD": [
+                    {
+                        "t": "2026-04-05T13:00:00Z",
+                        "o": 0.00002,
+                        "h": 0.00003,
+                        "l": 0.00001,
+                        "c": 0.000025,
+                        "v": 1500,
+                    }
+                ]
+            }
+        }
+    )
+    adapter = AlpacaMarketDataAdapter(settings=_settings(), http_client=client)
+
+    bar_set = adapter.fetch_prime_stocks_bars(
+        symbol="SHIBUSD",
+        asset_type="crypto",
+        product_key="stocks.bismel1",
+        execution_timeframe="1M",
+        trend_timeframe="1M",
+    )
+
+    assert bar_set.symbol == "SHIBUSD"
+    assert len(bar_set.execution_bars) == 1
+    assert "v1beta3/crypto/us/bars" in client.urls[0]
+    assert "symbols=SHIB%2FUSD" in client.urls[0]
+    assert "timeframe=1Min" in client.urls[0]
+
+
 class FakeHttpClient:
     def __init__(self, payload: dict[str, object]) -> None:
         self.payload = payload
@@ -121,20 +155,37 @@ def _settings() -> AppConfig:
         alpaca_api_key_id="key-123",
         alpaca_api_secret="secret-123",
         alpaca_data_feed="iex",
+        gemini_model="gemini-2.5-flash-lite",
+        ai_cache_max_age_minutes=360,
         prime_stocks_runtime_enabled=True,
         prime_stocks_dry_run=True,
         prime_stocks_paper_execution_enabled=False,
         prime_stocks_live_execution_enabled=False,
+        prime_stocks_ai_validation_bypass_enabled=False,
         prime_stocks_default_symbol="AAPL",
         prime_stocks_asset_type="stock",
+        prime_stocks_test_mode=False,
+        prime_stocks_test_trigger=None,
+        prime_stocks_test_symbol_override=None,
         prime_stocks_execution_bar_limit=351,
         prime_stocks_trend_bar_limit=221,
         prime_stocks_first_lot_notional=101.0,
         prime_stocks_multi_notional=73.0,
+        prime_stocks_max_notional_per_order=303.0,
+        prime_stocks_max_total_notional_per_symbol=707.0,
+        prime_stocks_max_add_count=2,
+        prime_stocks_daily_order_cap=None,
+        prime_stocks_max_open_positions=None,
+        prime_stocks_broker_retry_max_attempts=1,
+        prime_stocks_force_candidate_action=None,
         prime_stocks_scheduler_job_name="prime-stocks-scheduled",
         prime_stocks_scheduler_region="us-central1",
         prime_stocks_scheduler_schedule="5 * * * 1-5",
         prime_stocks_scheduler_timezone="Etc/UTC",
         prime_stocks_scheduler_header_name="X-Prime-Stocks-Scheduler",
         prime_stocks_scheduler_header_value="secret-value",
+        prime_stocks_ping_scheduler_job_name="prime-stocks-ping",
+        prime_stocks_ping_scheduler_schedule="*/1 * * * *",
+        prime_stocks_ping_scheduler_timezone="Etc/UTC",
+        prime_stocks_ping_scheduler_header_value="ping-secret-value",
     )
