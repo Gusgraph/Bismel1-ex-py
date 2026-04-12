@@ -868,6 +868,63 @@ def test_runtime_service_rejects_non_stock_runtime_config() -> None:
         raise AssertionError("Expected Prime Stocks runtime to reject non-stock runtime config.")
 
 
+def test_runtime_service_uses_first_active_configured_symbol_for_execution() -> None:
+    settings = _settings()
+    fake_client = FakeFirestoreClient()
+    default_config = asdict(build_default_runtime_config(settings))
+    default_config["symbol"] = "AAPL"
+    default_config["selected_symbols"] = ["AAPL", "NVDA"]
+    default_config["symbol_states"] = [
+        {"symbol": "AAPL", "mode": "paused"},
+        {"symbol": "NVDA", "mode": "active"},
+    ]
+    fake_client.collection("runtime_products").document("prime_stocks").collection("config").document("current").set(default_config)
+    _seed_ai_cache(fake_client)
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    market_data = FakeMarketData()
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=market_data,
+        runtime_store=runtime_store,
+        paper_trading=FakePaperTrading(),
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("HOLD"),
+    )
+
+    result = service.run_once(allow_execution=False)
+
+    assert result.symbol == "NVDA"
+    assert market_data.calls[0]["symbol"] == "NVDA"
+
+
+def test_runtime_service_skips_when_no_active_configured_symbols_exist() -> None:
+    settings = _settings()
+    fake_client = FakeFirestoreClient()
+    default_config = asdict(build_default_runtime_config(settings))
+    default_config["symbol"] = "AAPL"
+    default_config["selected_symbols"] = ["AAPL"]
+    default_config["symbol_states"] = [
+        {"symbol": "AAPL", "mode": "paused"},
+    ]
+    fake_client.collection("runtime_products").document("prime_stocks").collection("config").document("current").set(default_config)
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    market_data = FakeMarketData()
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=market_data,
+        runtime_store=runtime_store,
+        paper_trading=FakePaperTrading(),
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("HOLD"),
+    )
+
+    result = service.run_once(allow_execution=False)
+
+    assert result.execution_decision == "no_active_symbols_configured"
+    assert result.candidate_action == "BLOCKED"
+    assert market_data.calls == []
+
+
 def test_runtime_service_skips_when_no_new_closed_bar_is_available() -> None:
     settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
     fake_client = FakeFirestoreClient()

@@ -274,43 +274,72 @@ def _run_scheduled_fanout(
 
     results: list[dict[str, object]] = []
     for target in targets:
-        try:
-            result = service.run_once(
-                symbol=symbol,
-                uid=target.uid,
-                account_id=target.account_id,
-                alpaca_account_id=target.alpaca_account_id,
-                allow_execution=True,
-                trigger_type=trigger_type,
-                trigger_source=trigger_source,
-            )
-            results.append(
-                {
-                    "uid": target.uid,
-                    "account_id": target.account_id,
-                    "alpaca_account_id": target.alpaca_account_id,
-                    "slot_number": target.slot_number,
-                    "run_id": result.run_id,
-                    "candidate_action": result.candidate_action,
-                    "execution_decision": result.execution_decision,
-                    "skipped_reason": result.skipped_reason,
-                    "order_status": result.order_status,
-                }
-            )
-        except ValueError as exc:
-            results.append(
-                {
-                    "uid": target.uid,
-                    "account_id": target.account_id,
-                    "alpaca_account_id": target.alpaca_account_id,
-                    "slot_number": target.slot_number,
-                    "run_id": None,
-                    "candidate_action": "BLOCKED",
-                    "execution_decision": "scheduler_dispatch_failed",
-                    "skipped_reason": str(exc),
-                    "order_status": "not_submitted",
-                }
-            )
+        dispatch_symbols = [symbol] if symbol is not None and str(symbol).strip() != "" else [None]
+        if hasattr(service, "list_target_symbols"):
+            try:
+                dispatch_symbols = service.list_target_symbols(
+                    uid=target.uid,
+                    account_id=target.account_id,
+                    alpaca_account_id=target.alpaca_account_id,
+                    symbol=symbol,
+                ) or [None]
+            except Exception as exc:
+                results.append(
+                    {
+                        "uid": target.uid,
+                        "account_id": target.account_id,
+                        "alpaca_account_id": target.alpaca_account_id,
+                        "slot_number": target.slot_number,
+                        "symbol": None,
+                        "run_id": None,
+                        "candidate_action": "BLOCKED",
+                        "execution_decision": "scheduler_symbol_dispatch_failed",
+                        "skipped_reason": str(exc),
+                        "order_status": "not_submitted",
+                    }
+                )
+                continue
+
+        for dispatch_symbol in dispatch_symbols:
+            try:
+                result = service.run_once(
+                    symbol=dispatch_symbol,
+                    uid=target.uid,
+                    account_id=target.account_id,
+                    alpaca_account_id=target.alpaca_account_id,
+                    allow_execution=True,
+                    trigger_type=trigger_type,
+                    trigger_source=trigger_source,
+                )
+                results.append(
+                    {
+                        "uid": target.uid,
+                        "account_id": target.account_id,
+                        "alpaca_account_id": target.alpaca_account_id,
+                        "slot_number": target.slot_number,
+                        "symbol": result.symbol,
+                        "run_id": result.run_id,
+                        "candidate_action": result.candidate_action,
+                        "execution_decision": result.execution_decision,
+                        "skipped_reason": result.skipped_reason,
+                        "order_status": result.order_status,
+                    }
+                )
+            except ValueError as exc:
+                results.append(
+                    {
+                        "uid": target.uid,
+                        "account_id": target.account_id,
+                        "alpaca_account_id": target.alpaca_account_id,
+                        "slot_number": target.slot_number,
+                        "symbol": dispatch_symbol,
+                        "run_id": None,
+                        "candidate_action": "BLOCKED",
+                        "execution_decision": "scheduler_dispatch_failed",
+                        "skipped_reason": str(exc),
+                        "order_status": "not_submitted",
+                    }
+                )
 
     return {
         "status": "ok",

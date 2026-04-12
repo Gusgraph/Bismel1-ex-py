@@ -119,6 +119,35 @@ class PrimeStocksRuntimeService:
     def list_scheduler_targets(self) -> list[RuntimeAccountTarget]:
         return self._account_resolver.list_runtime_targets()
 
+    def list_target_symbols(
+        self,
+        *,
+        uid: str | None,
+        account_id: int | None,
+        alpaca_account_id: int | None,
+        symbol: str | None = None,
+    ) -> list[str]:
+        if symbol is not None and symbol.strip():
+            return [symbol.strip().upper()]
+
+        default_runtime_config = build_default_runtime_config(self._settings)
+        fallback_runtime_config = _override_symbol(
+            default_runtime_config,
+            None,
+            uid=uid,
+            account_id=account_id,
+            alpaca_account_id=alpaca_account_id,
+        )
+        runtime_config = self._runtime_store.load_runtime_config(fallback_runtime_config)
+        resolved_runtime_config = _override_runtime_selection(
+            runtime_config,
+            uid=uid,
+            account_id=account_id,
+            alpaca_account_id=alpaca_account_id,
+        )
+
+        return _resolve_schedulable_symbols(resolved_runtime_config)
+
     def _run_validation_ping(
         self,
         *,
@@ -579,6 +608,33 @@ class PrimeStocksRuntimeService:
                     trigger_type=trigger_type,
                     trigger_source=trigger_source,
                 )
+            resolved_symbol = _resolve_primary_runtime_symbol(
+                resolved_runtime_config,
+                explicit_symbol=symbol,
+            )
+            if resolved_symbol is None:
+                return self._persist_blocked_runtime_result(
+                    run_id=run_id,
+                    runtime_config=resolved_runtime_config,
+                    account_context=_build_fallback_account_context(resolved_runtime_config),
+                    execution_decision="no_active_symbols_configured",
+                    skipped_reason="no_active_symbols_configured",
+                    trigger_type=trigger_type,
+                    trigger_source=trigger_source,
+                    message=(
+                        "Prime Stocks runtime skipped because no active automation symbols are configured for the "
+                        "selected account."
+                    ),
+                    candidate_action="BLOCKED",
+                    status="blocked",
+                )
+            resolved_runtime_config = _override_runtime_selection(
+                resolved_runtime_config,
+                symbol=resolved_symbol,
+                uid=uid,
+                account_id=account_id,
+                alpaca_account_id=alpaca_account_id,
+            )
             _ensure_prime_stocks_runtime_context(resolved_runtime_config, allow_execution=allow_execution)
         except PrimeStocksRuntimeStoreError as exc:
             logger.exception(
@@ -2078,6 +2134,61 @@ def _override_runtime_selection(
         account_id=resolved_account_id,
         alpaca_account_id=resolved_alpaca_account_id,
     )
+
+
+def _normalize_configured_symbol(symbol: object) -> str | None:
+    resolved_symbol = str(symbol or "").strip().upper()
+    return resolved_symbol or None
+
+
+def _resolve_schedulable_symbols(runtime_config: PrimeStocksRuntimeConfigRecord) -> list[str]:
+    configured_modes: dict[str, str] = {}
+    configured_order: list[str] = []
+
+    for item in runtime_config.symbol_states:
+        item_symbol = _normalize_configured_symbol(item.get("symbol"))
+        if item_symbol is None:
+            continue
+        configured_modes[item_symbol] = str(item.get("mode", "active")).strip().lower()
+        if item_symbol not in configured_order:
+            configured_order.append(item_symbol)
+
+    for symbol in runtime_config.selected_symbols:
+        resolved_symbol = _normalize_configured_symbol(symbol)
+        if resolved_symbol is None:
+            continue
+        configured_modes.setdefault(resolved_symbol, "active")
+        if resolved_symbol not in configured_order:
+            configured_order.append(resolved_symbol)
+
+    if configured_order:
+        return [
+            symbol
+            for symbol in configured_order
+            if configured_modes.get(symbol, "active") not in {"paused", "standby"}
+        ]
+
+    runtime_symbol = _normalize_configured_symbol(runtime_config.symbol)
+    return [] if runtime_symbol is None else [runtime_symbol]
+
+
+def _resolve_primary_runtime_symbol(
+    runtime_config: PrimeStocksRuntimeConfigRecord,
+    *,
+    explicit_symbol: str | None = None,
+) -> str | None:
+    if explicit_symbol is not None and explicit_symbol.strip():
+        return explicit_symbol.strip().upper()
+
+    schedulable_symbols = _resolve_schedulable_symbols(runtime_config)
+    if schedulable_symbols:
+        return schedulable_symbols[0]
+
+    has_managed_symbols = bool(runtime_config.symbol_states) or bool(runtime_config.selected_symbols)
+    if has_managed_symbols:
+        return None
+
+    return _normalize_configured_symbol(runtime_config.symbol)
 
 
 def _resolve_latest_signal_time(execution_bars) -> datetime | None:

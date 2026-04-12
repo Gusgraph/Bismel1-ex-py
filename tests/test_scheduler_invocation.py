@@ -266,6 +266,68 @@ def test_scheduled_endpoint_passes_account_selector_overrides_to_runtime() -> No
         main.build_prime_stocks_runtime_service = original_builder
 
 
+def test_scheduler_fanout_dispatches_each_active_symbol_for_target() -> None:
+    class SymbolFanoutService:
+        def list_scheduler_targets(self):
+            return [
+                RuntimeAccountTarget(
+                    uid="u_1",
+                    account_id=8,
+                    alpaca_account_id=7,
+                    slot_number=1,
+                    environment="paper",
+                    entitlement={"runtime_allowed": True},
+                )
+            ]
+
+        def list_target_symbols(self, **kwargs):
+            del kwargs
+            return ["AAPL", "NVDA"]
+
+        def run_once(self, **kwargs):
+            return PrimeStocksRuntimeResult(
+                run_id=f"run-{kwargs['symbol'].lower()}",
+                mode="paper",
+                runtime_target="cloud_run",
+                product_key="stocks.bismel1",
+                strategy_key="prime_stocks",
+                strategy_title="Prime Stocks Bot Trader",
+                symbol=kwargs["symbol"],
+                asset_type="stock",
+                enabled=True,
+                trigger_type="scheduled",
+                trigger_source="cloud_scheduler",
+                candidate_action="HOLD",
+                execution_decision="no_op",
+                order_status="not_submitted",
+                order_submitted=False,
+                order_id=None,
+                client_order_id=None,
+                add_tier=None,
+                execution_allowed=False,
+                skipped_reason="no_action_candidate",
+                latest_signal_time=None,
+                ai=None,
+                status="no_signal",
+                message="no signal",
+                bars_processed_execution=0,
+                bars_processed_trend=0,
+                firestore_paths={},
+            )
+
+    payload = main._run_scheduled_fanout(
+        service=SymbolFanoutService(),
+        symbol=None,
+        trigger_type="scheduled",
+        trigger_source="cloud_scheduler",
+    )
+
+    assert payload["target_count"] == 1
+    assert payload["completed_count"] == 2
+    assert payload["results"][0]["symbol"] == "AAPL"
+    assert payload["results"][1]["symbol"] == "NVDA"
+
+
 def test_scheduled_endpoint_fans_out_across_runtime_targets() -> None:
     class FanoutService:
         def __init__(self) -> None:

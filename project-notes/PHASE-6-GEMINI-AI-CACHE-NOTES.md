@@ -109,3 +109,45 @@ version: 1
   - same guard path
   - same persistence path
   - only broker environment differs
+
+## Post-Phase Runtime Updates - 2026-04-12
+
+- Prime Stocks symbol flow was hardened so customer-managed symbols are now the real runtime source, not UI-only state.
+- Laravel Automation symbol writes now persist:
+  - `selected_symbols`
+  - `symbol_states`
+  - a deterministic primary runtime `symbol`
+- Python runtime now resolves schedulable symbols from account-scoped config:
+  - active symbols are eligible
+  - `paused` / `standby` symbols are excluded from scheduler dispatch
+  - removed symbols stop participating in runtime dispatch
+  - empty active symbol set returns `no_active_symbols_configured`
+- Hourly scheduler fan-out now supports per-account, per-symbol dispatch using the same saved account symbol list.
+- Prime Stocks runtime still stays stock-locked for the current product scope.
+- Focused Python validation passed for:
+  - active configured symbol dispatch
+  - paused symbol exclusion
+  - empty active-symbol skip
+  - scheduler symbol fan-out
+- Laravel/customer symbol flow was hardened so:
+  - non-entitled accounts are blocked from symbol add/search flow
+  - remove flow now warns that open positions stay open if the symbol is removed
+- Automation symbol search was moved off the tiny preset list and onto a real internal instrument master dataset.
+- Instrument master was added as a future-ready global dataset with current Prime Stocks filtering still locked to stocks plus the SHIBUSD validation exception.
+- Admin System now includes instrument master sync/bootstrap actions.
+- Live instrument master sync through Alpaca was validated and populated the master dataset with real symbols.
+- Automation chart/backend market data path was fixed:
+  - Alpaca market data now uses the Alpaca data host, not the trading host
+  - historical bars now include real `start/end` windows
+  - Automation symbol rows now show real latest price and day change when available
+  - chart modal now loads real provider-backed market data through backend endpoints only
+- Automation chart modal was upgraded to:
+  - real OHLC payloads
+  - candlestick series
+  - right-side price scale
+  - current price line
+  - OHLC legend strip
+  - range support for `4H`, `1D`, `1M`
+- Current chart constraint:
+  - the page uses TradingView `lightweight-charts`, not the full TradingView charting product
+  - so full TradingView toolbars/drawing systems are intentionally not present
