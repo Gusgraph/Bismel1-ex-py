@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import logging
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Callable, Protocol, TypeVar
@@ -30,6 +32,9 @@ from app.shared.config import AppConfig
 SUPPORTED_STOCK_ASSET_TYPES = frozenset({"stock", "stocks", "equity", "equities"})
 BOOTSTRAP_RUN_ID = "bootstrap-prime-stocks"
 T = TypeVar("T")
+logger = logging.getLogger(__name__)
+
+SUBMITTED_EXECUTION_DECISIONS = frozenset({"submitted_buy", "submitted_exit"})
 
 
 class PrimeStocksRuntimeStoreError(RuntimeError):
@@ -71,6 +76,7 @@ class PrimeStocksRuntimeConfigRecord:
     uid: str | None = None
     account_id: int | None = None
     alpaca_account_id: int | None = None
+    slot_number: int | None = None
     runtime_target: str = "cloud_run"
     entitlement: dict[str, Any] = field(default_factory=dict)
     safe_mode_enabled: bool = False
@@ -84,6 +90,7 @@ class PrimeStocksRuntimeConfigRecord:
     account_kill_switch_enabled: bool = False
     selected_symbols: list[str] = field(default_factory=list)
     symbol_states: list[dict[str, Any]] = field(default_factory=list)
+    strategy_mode: str = "scalper"
 
 
 @dataclass(frozen=True)
@@ -91,6 +98,7 @@ class PrimeStocksRuntimeStorePaths:
     config_document: str
     state_document: str
     heartbeat_document: str
+    cycle_document: str
     snapshot_document: str
     signal_document: str
     execution_document: str
@@ -103,6 +111,7 @@ class PrimeStocksRuntimeStorePaths:
     notification_state_document: str
     ai_market_document: str
     ai_symbols_collection: str
+    symbol_state_document: str | None = None
 
 
 @dataclass(frozen=True)
@@ -155,6 +164,133 @@ class PrimeStocksRuntimeStateRecord:
         )
 
 
+def _build_strategy_reasoning_payload(
+    *,
+    strategy_result: PrimeStocksStrategyResult,
+    candidate_action: str,
+    execution_decision: str,
+    ai_decision: PrimeStocksAiDecision | None,
+) -> dict[str, Any]:
+    latest_bar = strategy_result.latest_bar
+    latest_signal = strategy_result.latest_signal
+    series = strategy_result.series
+    latest_index = latest_bar.bar_index if latest_bar is not None else max(0, len(series.trend_ok) - 1)
+    trend_ok = bool(series.trend_ok[latest_index]) if latest_index < len(series.trend_ok) else False
+    regime_fail = bool(series.regime_fail[latest_index]) if latest_index < len(series.regime_fail) else False
+    trend_base = bool(series.trend_base_htf[latest_index]) if latest_index < len(series.trend_base_htf) else False
+    trend_slope = bool(series.htf_ema_slow_slope_up[latest_index]) if latest_index < len(series.htf_ema_slow_slope_up) else False
+    pullback = bool(series.in_pullback_zone[latest_index]) if latest_index < len(series.in_pullback_zone) else False
+    setup_ready = bool(series.setup_ready[latest_index]) if latest_index < len(series.setup_ready) else False
+    setup_age_bars = series.setup_age_bars[latest_index] if latest_index < len(series.setup_age_bars) else None
+    setup_invalidated = bool(series.setup_invalidated[latest_index]) if latest_index < len(series.setup_invalidated) else False
+    confirmation = bool(latest_signal.base_entry_trigger or latest_signal.add_trigger)
+    setup_valid = bool(latest_signal.base_entry_signal)
+    strategy_mode = str(getattr(strategy_result, "strategy_mode", "scalper")).strip().lower()
+    trend_weight = 1.0 if trend_ok else 0.7
+
+    if trend_ok:
+        trend_1d = "Up"
+    elif regime_fail or (not trend_base and not trend_slope):
+        trend_1d = "Down"
+    else:
+        trend_1d = "Neutral"
+
+    if trend_1d == "Up":
+        bias_state = "Long preferred"
+    elif trend_1d == "Down":
+        bias_state = "Against trend (scalper mode)" if strategy_mode == "scalper" else "Against bias"
+    else:
+        bias_state = "Neutral"
+
+    if candidate_action == "FirstLot":
+        trigger_state = "Buy" if latest_signal.base_entry_trigger else ("Waiting" if latest_signal.base_entry_signal else "No signal")
+    elif candidate_action.startswith("MULTI-"):
+        trigger_state = "Add" if latest_signal.add_trigger else "Waiting"
+    elif latest_signal.hit_atr_trail or latest_signal.hit_regime:
+        trigger_state = "Exit"
+    elif latest_signal.base_entry_signal:
+        trigger_state = "Waiting"
+    else:
+        trigger_state = "No signal"
+
+    if ai_decision is None:
+        ai_filter_state = "Neutral"
+    elif ai_decision.Ai_blocked_reason == "ai_safety_unsafe":
+        ai_filter_state = "Hard block"
+    elif ai_decision.is_stale or not ai_decision.is_available:
+        ai_filter_state = "Cautious"
+    elif ai_decision.Ai_safety_label == "safe" and ai_decision.Ai_regime_label == "risk_on" and ai_decision.Ai_sentiment_label == "bullish":
+        ai_filter_state = "Supportive"
+    elif ai_decision.Ai_safety_label in {"caution", "safe"}:
+        ai_filter_state = "Cautious"
+    else:
+        ai_filter_state = "Neutral"
+
+    if execution_decision in {"submitted_buy", "submitted_add_buy", "FirstLot"}:
+        final_decision = "Buy"
+    elif execution_decision in {"submitted_exit", "EXIT_ATR", "EXIT_REGIME"}:
+        final_decision = "Sell"
+    elif execution_decision in {"skipped_no_new_bar"}:
+        final_decision = "Wait"
+    elif execution_decision in {"no_op", "hold", "no_signal"}:
+        final_decision = "No action"
+    elif str(execution_decision).startswith("blocked") or "blocked" in str(execution_decision).lower():
+        final_decision = "Blocked"
+    else:
+        final_decision = "Wait"
+
+    if ai_decision is not None and ai_decision.Ai_blocked_reason == "ai_safety_unsafe":
+        primary_reason = f"AI {ai_decision.Ai_blocked_reason}"
+    elif execution_decision == "skipped_no_new_bar":
+        primary_reason = "Awaiting latest 15M close."
+    elif latest_signal.hit_regime:
+        primary_reason = "1D regime exit confirmed."
+    elif latest_signal.hit_atr_trail:
+        primary_reason = "ATR trail exit confirmed."
+    elif candidate_action == "FirstLot":
+        if strategy_mode == "trend" and not trend_ok:
+            primary_reason = "Against 1D bias."
+        elif strategy_mode == "scalper" and not trend_ok:
+            primary_reason = "Against trend (scalper mode)."
+        elif not pullback:
+            primary_reason = "Awaiting pullback into the setup zone."
+        elif not latest_signal.base_entry_trigger:
+            primary_reason = "Awaiting 15M confirmation."
+        else:
+            primary_reason = "15M trigger aligned with 1D bias."
+    elif candidate_action.startswith("MULTI-"):
+        if not latest_signal.add_trigger:
+            primary_reason = "Awaiting add confirmation."
+        else:
+            primary_reason = "Add gates aligned."
+    elif latest_signal.base_entry_signal:
+        primary_reason = "15M setup is developing on the latest closed bar."
+    else:
+        primary_reason = "No setup on the latest closed bar."
+
+    latest_signal_score = getattr(strategy_result, "signal_score", None)
+
+    return {
+        "execution_timeframe": strategy_result.execution_timeframe,
+        "trend_timeframe": strategy_result.trend_timeframe,
+        "strategy_context": f"{strategy_result.execution_timeframe} closed bars + {strategy_result.trend_timeframe} trend",
+        "trend_1d": trend_1d,
+        "bias_state": bias_state,
+        "trend_weight": trend_weight,
+        "pullback_state": "Yes" if pullback else "No",
+        "setup_ready": setup_ready,
+        "setup_age_bars": setup_age_bars,
+        "setup_invalidated": setup_invalidated,
+        "confirmation_state": "Yes" if confirmation else "No",
+        "trigger_state": trigger_state,
+        "ai_filter_state": ai_filter_state,
+        "setup_state": "Valid" if setup_valid else "Not valid",
+        "final_decision": final_decision,
+        "primary_reason": primary_reason,
+        "signal_score": latest_signal_score,
+    }
+
+
 class FirestoreClientProtocol(Protocol):
     def collection(self, name: str) -> Any:
         ...
@@ -169,16 +305,34 @@ class PrimeStocksFirestoreRuntimeStore:
         self._settings = settings
         self._client = client
 
-    def get_paths(self, *, uid: str | None = None, account_id: int | None = None) -> PrimeStocksRuntimeStorePaths:
+    def get_paths(
+        self,
+        *,
+        uid: str | None = None,
+        account_id: int | None = None,
+        slot_number: int | None = None,
+        symbol: str | None = None,
+    ) -> PrimeStocksRuntimeStorePaths:
+        product_id = "prime_stocks"
         resolved_uid = None if uid is None else uid.strip()
         if resolved_uid and account_id is not None:
-            root = f"users/{resolved_uid}/accounts/{account_id}/prime_stocks/current"
+            root = f"users/{resolved_uid}/accounts/{account_id}/{product_id}/current"
+            if slot_number is not None:
+                root = f"{root}/slots/slot_{max(1, slot_number)}"
         else:
             root = f"{self._settings.firestore_runtime_collection}/{self._settings.firestore_product_document}"
+        resolved_symbol = None if symbol is None else symbol.strip().upper()
+        symbol_root = None
+        if resolved_uid and account_id is not None and resolved_symbol:
+            symbol_root = f"users/{resolved_uid}/accounts/{account_id}/{product_id}/current"
+            if slot_number is not None:
+                symbol_root = f"{symbol_root}/slots/slot_{max(1, slot_number)}"
+            symbol_root = f"{symbol_root}/symbols/{resolved_symbol}"
         return PrimeStocksRuntimeStorePaths(
             config_document=f"{root}/config/current",
             state_document=f"{root}/state/current",
             heartbeat_document=f"{root}/heartbeat/current",
+            cycle_document=f"{root}/cycles/latest",
             snapshot_document=f"{root}/snapshots/latest",
             signal_document=f"{root}/signals/latest",
             execution_document=f"{root}/execution/current",
@@ -191,42 +345,230 @@ class PrimeStocksFirestoreRuntimeStore:
             notification_state_document=f"{root}/notification_state/current",
             ai_market_document=f"{root}/ai_market/current",
             ai_symbols_collection=f"{root}/ai_symbols",
+            symbol_state_document=None if symbol_root is None else f"{symbol_root}/state/current",
         )
 
-    def load_runtime_config(self, default_config: PrimeStocksRuntimeConfigRecord) -> PrimeStocksRuntimeConfigRecord:
-        global_paths = self.get_paths()
-        scoped_paths = self.get_paths(uid=default_config.uid, account_id=default_config.account_id)
-        global_payload = self._load_document_payload(
-            action="load global runtime config",
-            path=global_paths.config_document,
-            document_getter=lambda: self._config_document(global_paths).get(),
-        )
-        payload = dict(global_payload or {})
-        if scoped_paths.config_document != global_paths.config_document:
-            scoped_payload = self._load_document_payload(
-                action="load scoped runtime config",
-                path=scoped_paths.config_document,
-                document_getter=lambda: self._config_document(scoped_paths).get(),
+    def migrate_account_scoped_runtime_to_slot(
+        self,
+        *,
+        uid: str | None,
+        account_id: int | None,
+        slot_number: int | None,
+        symbols: list[str] | None = None,
+        expected_alpaca_account_id: int | None = None,
+    ) -> None:
+        if uid is None or not uid.strip() or account_id is None or slot_number is None:
+            return
+
+        account_paths = self.get_paths(uid=uid, account_id=account_id)
+        slot_paths = self.get_paths(uid=uid, account_id=account_id, slot_number=slot_number)
+
+        account_documents = {
+            "state": self._load_document_payload(
+                action="load account-scoped runtime state for migration",
+                path=account_paths.state_document,
+                document_getter=lambda: self._state_document(account_paths).get(),
+            ),
+            "heartbeat": self._load_document_payload(
+                action="load account-scoped runtime heartbeat for migration",
+                path=account_paths.heartbeat_document,
+                document_getter=lambda: self._heartbeat_document(account_paths).get(),
+            ),
+            "cycle": self._load_document_payload(
+                action="load account-scoped runtime cycle for migration",
+                path=account_paths.cycle_document,
+                document_getter=lambda: self._cycle_document(account_paths).get(),
+            ),
+            "snapshot": self._load_document_payload(
+                action="load account-scoped runtime snapshot for migration",
+                path=account_paths.snapshot_document,
+                document_getter=lambda: self._snapshot_document(account_paths).get(),
+            ),
+            "signal": self._load_document_payload(
+                action="load account-scoped runtime signal for migration",
+                path=account_paths.signal_document,
+                document_getter=lambda: self._signal_document(account_paths).get(),
+            ),
+            "execution": self._load_document_payload(
+                action="load account-scoped runtime execution for migration",
+                path=account_paths.execution_document,
+                document_getter=lambda: self._execution_document(account_paths).get(),
+            ),
+            "action": self._load_document_payload(
+                action="load account-scoped runtime action for migration",
+                path=account_paths.action_document,
+                document_getter=lambda: self._action_document(account_paths).get(),
+            ),
+        }
+        slot_documents = {
+            "state": self._load_document_payload(
+                action="load slot-scoped runtime state for migration",
+                path=slot_paths.state_document,
+                document_getter=lambda: self._state_document(slot_paths).get(),
+            ),
+            "heartbeat": self._load_document_payload(
+                action="load slot-scoped runtime heartbeat for migration",
+                path=slot_paths.heartbeat_document,
+                document_getter=lambda: self._heartbeat_document(slot_paths).get(),
+            ),
+            "cycle": self._load_document_payload(
+                action="load slot-scoped runtime cycle for migration",
+                path=slot_paths.cycle_document,
+                document_getter=lambda: self._cycle_document(slot_paths).get(),
+            ),
+            "snapshot": self._load_document_payload(
+                action="load slot-scoped runtime snapshot for migration",
+                path=slot_paths.snapshot_document,
+                document_getter=lambda: self._snapshot_document(slot_paths).get(),
+            ),
+            "signal": self._load_document_payload(
+                action="load slot-scoped runtime signal for migration",
+                path=slot_paths.signal_document,
+                document_getter=lambda: self._signal_document(slot_paths).get(),
+            ),
+            "execution": self._load_document_payload(
+                action="load slot-scoped runtime execution for migration",
+                path=slot_paths.execution_document,
+                document_getter=lambda: self._execution_document(slot_paths).get(),
+            ),
+            "action": self._load_document_payload(
+                action="load slot-scoped runtime action for migration",
+                path=slot_paths.action_document,
+                document_getter=lambda: self._action_document(slot_paths).get(),
+            ),
+        }
+
+        path_map = {
+            "state": slot_paths.state_document,
+            "heartbeat": slot_paths.heartbeat_document,
+            "cycle": slot_paths.cycle_document,
+            "snapshot": slot_paths.snapshot_document,
+            "signal": slot_paths.signal_document,
+            "execution": slot_paths.execution_document,
+            "action": slot_paths.action_document,
+        }
+
+        for key, source_payload in account_documents.items():
+            if not isinstance(source_payload, dict):
+                continue
+            if not _payload_matches_expected_linked_account(
+                source_payload,
+                expected_alpaca_account_id=expected_alpaca_account_id,
+            ):
+                continue
+            target_payload = slot_documents.get(key)
+            if not self._should_promote_runtime_payload(source_payload, target_payload):
+                continue
+            self._firestore_call(
+                action=f"migrate prime runtime {key} to slot scope",
+                path=path_map[key],
+                fn=lambda source_payload=source_payload, target_path=path_map[key]: self._document_ref(target_path).set(source_payload, merge=True),
             )
-            payload.update(scoped_payload or {})
-        if global_payload:
-            for field_name in [
-                "enabled",
-                "dry_run",
-                "paper_execution_enabled",
-                "live_execution_enabled",
-                "ping_enabled",
-                "ping_mode",
-                "ping_daily_heartbeat_enabled",
-                "test_mode",
-                "test_trigger",
-                "test_symbol_override",
-                "force_candidate_action",
-                "ai_validation_bypass_enabled",
-                "global_kill_switch_enabled",
-            ]:
-                if field_name in global_payload:
-                    payload[field_name] = global_payload[field_name]
+
+        known_symbols: set[str] = set()
+        if symbols:
+            known_symbols.update(str(symbol).strip().upper() for symbol in symbols if str(symbol).strip())
+
+        for symbol in sorted(known_symbols):
+            account_symbol_paths = self.get_paths(uid=uid, account_id=account_id, symbol=symbol)
+            slot_symbol_paths = self.get_paths(uid=uid, account_id=account_id, slot_number=slot_number, symbol=symbol)
+            if account_symbol_paths.symbol_state_document is None or slot_symbol_paths.symbol_state_document is None:
+                continue
+            account_symbol_payload = self._load_document_payload(
+                action="load account-scoped symbol runtime state for migration",
+                path=account_symbol_paths.symbol_state_document,
+                document_getter=lambda account_symbol_paths=account_symbol_paths: self._document_ref(account_symbol_paths.symbol_state_document).get(),
+            )
+            slot_symbol_payload = self._load_document_payload(
+                action="load slot-scoped symbol runtime state for migration",
+                path=slot_symbol_paths.symbol_state_document,
+                document_getter=lambda slot_symbol_paths=slot_symbol_paths: self._document_ref(slot_symbol_paths.symbol_state_document).get(),
+            )
+            if not isinstance(account_symbol_payload, dict):
+                continue
+            if not _payload_matches_expected_linked_account(
+                account_symbol_payload,
+                expected_alpaca_account_id=expected_alpaca_account_id,
+            ):
+                continue
+            if not self._should_promote_runtime_payload(account_symbol_payload, slot_symbol_payload):
+                continue
+            self._firestore_call(
+                action="migrate prime symbol runtime state to slot scope",
+                path=slot_symbol_paths.symbol_state_document,
+                fn=lambda account_symbol_payload=account_symbol_payload, slot_symbol_paths=slot_symbol_paths: self._document_ref(slot_symbol_paths.symbol_state_document).set(account_symbol_payload, merge=True),
+            )
+
+    def load_runtime_config(self, default_config: PrimeStocksRuntimeConfigRecord) -> PrimeStocksRuntimeConfigRecord:
+        if default_config.uid and default_config.account_id is not None and default_config.slot_number is not None:
+            self.migrate_account_scoped_runtime_to_slot(
+                uid=default_config.uid,
+                account_id=default_config.account_id,
+                slot_number=default_config.slot_number,
+                expected_alpaca_account_id=default_config.alpaca_account_id,
+            )
+        global_paths = self.get_paths()
+        scoped_paths = self.get_paths(
+            uid=default_config.uid,
+            account_id=default_config.account_id,
+            slot_number=default_config.slot_number,
+        )
+        scoped_payload: dict[str, Any] = {}
+        global_payload: dict[str, Any] = {}
+        use_scoped_runtime_config = default_config.slot_number is not None
+
+        if not use_scoped_runtime_config:
+            global_payload = self._load_document_payload(
+                action="load global runtime config",
+                path=global_paths.config_document,
+                document_getter=lambda: self._config_document(global_paths).get(),
+            )
+
+        payload: dict[str, Any] = {}
+        if use_scoped_runtime_config:
+            if scoped_paths.config_document != global_paths.config_document:
+                scoped_payload = self._load_document_payload(
+                    action="load scoped runtime config",
+                    path=scoped_paths.config_document,
+                    document_getter=lambda: self._config_document(scoped_paths).get(),
+                )
+            if scoped_payload and not _payload_matches_expected_linked_account(
+                scoped_payload,
+                expected_alpaca_account_id=default_config.alpaca_account_id,
+            ):
+                scoped_payload = {}
+            if not scoped_payload:
+                return default_config
+            payload.update(scoped_payload)
+        else:
+            payload.update(global_payload or {})
+            if scoped_paths.config_document != global_paths.config_document:
+                scoped_payload = self._load_document_payload(
+                    action="load scoped runtime config",
+                    path=scoped_paths.config_document,
+                    document_getter=lambda: self._config_document(scoped_paths).get(),
+                )
+                payload.update(scoped_payload or {})
+            if global_payload:
+                for field_name in [
+                    "enabled",
+                    "dry_run",
+                    "paper_execution_enabled",
+                    "live_execution_enabled",
+                    "ping_enabled",
+                    "ping_mode",
+                    "ping_daily_heartbeat_enabled",
+                    "test_mode",
+                    "test_trigger",
+                    "test_symbol_override",
+                    "force_candidate_action",
+                    "ai_validation_bypass_enabled",
+                    "strategy_mode",
+                    "global_kill_switch_enabled",
+                ]:
+                    if field_name in global_payload:
+                        payload[field_name] = global_payload[field_name]
+        symbol_source = scoped_payload if isinstance(scoped_payload, dict) and scoped_payload else {}
         if not payload:
             if scoped_paths.config_document == global_paths.config_document:
                 self._firestore_call(
@@ -235,8 +577,42 @@ class PrimeStocksFirestoreRuntimeStore:
                     fn=lambda: self._config_document(scoped_paths).set(asdict(default_config), merge=True),
                 )
             return default_config
+        execution_timeframe, normalized_from = _normalize_runtime_execution_timeframe(
+            payload.get("execution_timeframe", default_config.execution_timeframe)
+        )
+        if normalized_from is not None:
+            logger.warning(
+                "Prime Stocks runtime config normalized execution_timeframe from %s to 15M.",
+                normalized_from,
+            )
+
+        execution_bar_limit = _normalize_prime_bar_limit(
+            payload.get("execution_bar_limit", default_config.execution_bar_limit),
+            default=default_config.execution_bar_limit,
+            minimum=160,
+        )
+        trend_bar_limit = _normalize_prime_bar_limit(
+            payload.get("trend_bar_limit", default_config.trend_bar_limit),
+            default=default_config.trend_bar_limit,
+            minimum=120,
+        )
+        allow_scoped_symbols = _payload_matches_expected_linked_account(
+            symbol_source,
+            expected_alpaca_account_id=default_config.alpaca_account_id,
+        )
+        selected_symbols_source = (
+            symbol_source.get("selected_symbols", default_config.selected_symbols if default_config.slot_number is None else [])
+            if allow_scoped_symbols
+            else []
+        )
+        symbol_states_source = (
+            symbol_source.get("symbol_states", default_config.symbol_states if default_config.slot_number is None else [])
+            if allow_scoped_symbols
+            else []
+        )
+
         return PrimeStocksRuntimeConfigRecord(
-            uid=_maybe_string(payload.get("uid", default_config.uid)),
+            uid=_maybe_string(payload.get("uid")) or default_config.uid,
             product_key=str(payload.get("product_key", default_config.product_key)),
             strategy_key=str(payload.get("strategy_key", default_config.strategy_key)),
             strategy_title=str(payload.get("strategy_title", default_config.strategy_title)),
@@ -260,15 +636,14 @@ class PrimeStocksFirestoreRuntimeStore:
             ai_validation_bypass_enabled=bool(
                 payload.get("ai_validation_bypass_enabled", default_config.ai_validation_bypass_enabled)
             ),
-            execution_timeframe=_normalize_runtime_timeframe(
-                str(payload.get("execution_timeframe", default_config.execution_timeframe))
-            ),
+            strategy_mode=_normalize_strategy_mode(payload.get("strategy_mode", default_config.strategy_mode)),
+            execution_timeframe=execution_timeframe,
             trend_timeframe=_normalize_runtime_timeframe(
                 str(payload.get("trend_timeframe", default_config.trend_timeframe))
             ),
             pullback_window=max(5, int(payload.get("pullback_window", default_config.pullback_window))),
-            execution_bar_limit=int(payload.get("execution_bar_limit", default_config.execution_bar_limit)),
-            trend_bar_limit=int(payload.get("trend_bar_limit", default_config.trend_bar_limit)),
+            execution_bar_limit=execution_bar_limit,
+            trend_bar_limit=trend_bar_limit,
             first_lot_notional=float(payload.get("first_lot_notional", default_config.first_lot_notional)),
             multi_notional=float(payload.get("multi_notional", default_config.multi_notional)),
             max_notional_per_order=float(payload.get("max_notional_per_order", default_config.max_notional_per_order)),
@@ -282,8 +657,9 @@ class PrimeStocksFirestoreRuntimeStore:
                 0,
                 int(payload.get("broker_retry_max_attempts", default_config.broker_retry_max_attempts)),
             ),
-            account_id=_maybe_int(payload.get("account_id", default_config.account_id)),
-            alpaca_account_id=_maybe_int(payload.get("alpaca_account_id", default_config.alpaca_account_id)),
+            account_id=_maybe_int(payload.get("account_id")) if payload.get("account_id") is not None else default_config.account_id,
+            alpaca_account_id=_maybe_int(payload.get("alpaca_account_id")) if payload.get("alpaca_account_id") is not None else default_config.alpaca_account_id,
+            slot_number=_maybe_int(payload.get("slot_number")) if payload.get("slot_number") is not None else default_config.slot_number,
             runtime_target=str(payload.get("runtime_target", default_config.runtime_target)),
             entitlement=_normalize_entitlement_payload(payload.get("entitlement", default_config.entitlement)),
             safe_mode_enabled=bool(payload.get("safe_mode_enabled", default_config.safe_mode_enabled)),
@@ -322,18 +698,19 @@ class PrimeStocksFirestoreRuntimeStore:
             ),
             selected_symbols=[
                 str(symbol).strip().upper()
-                for symbol in payload.get("selected_symbols", default_config.selected_symbols)
+                for symbol in selected_symbols_source
                 if str(symbol).strip() != ""
             ],
             symbol_states=[
                 item
-                for item in payload.get("symbol_states", default_config.symbol_states)
+                for item in symbol_states_source
                 if isinstance(item, dict) and str(item.get("symbol", "")).strip() != ""
             ],
         )
 
-    def load_latest_execution_record(self, *, uid: str | None = None, account_id: int | None = None) -> PrimeStocksLatestExecutionRecord:
-        paths = self.get_paths(uid=uid, account_id=account_id)
+    def load_latest_execution_record(self, *, uid: str | None = None, account_id: int | None = None, slot_number: int | None = None) -> PrimeStocksLatestExecutionRecord:
+        self.migrate_account_scoped_runtime_to_slot(uid=uid, account_id=account_id, slot_number=slot_number)
+        paths = self.get_paths(uid=uid, account_id=account_id, slot_number=slot_number)
         snapshot = self._firestore_call(
             action="load latest execution record",
             path=paths.execution_document,
@@ -350,8 +727,9 @@ class PrimeStocksFirestoreRuntimeStore:
             latest_signal_time=_maybe_string(payload.get("latest_signal_time")),
         )
 
-    def load_runtime_state_record(self, *, uid: str | None = None, account_id: int | None = None) -> PrimeStocksRuntimeStateRecord:
-        paths = self.get_paths(uid=uid, account_id=account_id)
+    def load_runtime_state_record(self, *, uid: str | None = None, account_id: int | None = None, slot_number: int | None = None) -> PrimeStocksRuntimeStateRecord:
+        self.migrate_account_scoped_runtime_to_slot(uid=uid, account_id=account_id, slot_number=slot_number)
+        paths = self.get_paths(uid=uid, account_id=account_id, slot_number=slot_number)
         snapshot = self._firestore_call(
             action="load runtime state record",
             path=paths.state_document,
@@ -389,12 +767,77 @@ class PrimeStocksFirestoreRuntimeStore:
             current_total_exposure_pct=_maybe_float(payload.get("current_total_exposure_pct")),
         )
 
-    def load_heartbeat_record(self, *, uid: str | None = None, account_id: int | None = None) -> dict[str, Any] | None:
-        paths = self.get_paths(uid=uid, account_id=account_id)
+    def load_runtime_symbol_state_record(
+        self,
+        *,
+        uid: str | None = None,
+        account_id: int | None = None,
+        slot_number: int | None = None,
+        symbol: str,
+    ) -> PrimeStocksRuntimeStateRecord | None:
+        self.migrate_account_scoped_runtime_to_slot(uid=uid, account_id=account_id, slot_number=slot_number, symbols=[symbol])
+        paths = self.get_paths(uid=uid, account_id=account_id, slot_number=slot_number, symbol=symbol)
+        if paths.symbol_state_document is None:
+            return None
+        snapshot = self._firestore_call(
+            action="load runtime symbol state record",
+            path=paths.symbol_state_document,
+            fn=lambda: self._document_ref(paths.symbol_state_document).get(),
+        )
+        payload = snapshot.to_dict() if getattr(snapshot, "exists", False) else None
+        if not payload:
+            return None
+        return PrimeStocksRuntimeStateRecord(
+            run_id=_maybe_string(payload.get("run_id")),
+            uid=_maybe_string(payload.get("uid")),
+            account_id=_maybe_int(payload.get("account_id")),
+            alpaca_account_id=_maybe_int(payload.get("alpaca_account_id")),
+            broker_environment=_maybe_string(payload.get("broker_environment")),
+            symbol=_maybe_string(payload.get("symbol")),
+            position_open=bool(payload.get("position_open", False)),
+            position_size=_maybe_float(payload.get("position_size", 0.0)) or 0.0,
+            position_avg_price=_maybe_float(payload.get("position_avg_price")),
+            dollars_used=_maybe_float(payload.get("dollars_used", 0.0)) or 0.0,
+            add_count=max(0, int(payload.get("add_count", 0))),
+            add_tiers_filled=[
+                int(value)
+                for value in payload.get("add_tiers_filled", [])
+                if isinstance(value, int) or str(value).strip().isdigit()
+            ],
+            last_add_price=_maybe_float(payload.get("last_add_price")),
+            pos_high=_maybe_float(payload.get("pos_high")),
+            trail_stop=_maybe_float(payload.get("trail_stop")),
+            last_entry_time=_maybe_string(payload.get("last_entry_time")),
+            last_exit_time=_maybe_string(payload.get("last_exit_time")),
+            last_action=_maybe_string(payload.get("last_action")),
+            candidate_action=_maybe_string(payload.get("candidate_action")),
+            execution_key=_maybe_string(payload.get("execution_key")),
+            last_processed_bar_time=_maybe_string(payload.get("last_processed_bar_time")),
+            latest_signal_time=_maybe_string(payload.get("latest_signal_time")),
+            latest_candidate_action=_maybe_string(payload.get("latest_candidate_action")),
+            latest_status=_maybe_string(payload.get("latest_status")),
+            latest_execution_decision=_maybe_string(payload.get("latest_execution_decision")),
+            current_total_exposure_pct=_maybe_float(payload.get("current_total_exposure_pct")),
+        )
+
+    def load_heartbeat_record(self, *, uid: str | None = None, account_id: int | None = None, slot_number: int | None = None) -> dict[str, Any] | None:
+        self.migrate_account_scoped_runtime_to_slot(uid=uid, account_id=account_id, slot_number=slot_number)
+        paths = self.get_paths(uid=uid, account_id=account_id, slot_number=slot_number)
         snapshot = self._firestore_call(
             action="load runtime heartbeat record",
             path=paths.heartbeat_document,
             fn=lambda: self._heartbeat_document(paths).get(),
+        )
+        payload = snapshot.to_dict() if getattr(snapshot, "exists", False) else None
+        return payload if isinstance(payload, dict) else None
+
+    def load_cycle_summary_record(self, *, uid: str | None = None, account_id: int | None = None, slot_number: int | None = None) -> dict[str, Any] | None:
+        self.migrate_account_scoped_runtime_to_slot(uid=uid, account_id=account_id, slot_number=slot_number)
+        paths = self.get_paths(uid=uid, account_id=account_id, slot_number=slot_number)
+        snapshot = self._firestore_call(
+            action="load runtime cycle summary record",
+            path=paths.cycle_document,
+            fn=lambda: self._cycle_document(paths).get(),
         )
         payload = snapshot.to_dict() if getattr(snapshot, "exists", False) else None
         return payload if isinstance(payload, dict) else None
@@ -499,10 +942,22 @@ class PrimeStocksFirestoreRuntimeStore:
     ) -> None:
         now = datetime.now(tz=UTC)
         serialized_signal = _serialize_signal(strategy_result)
-        serialized_ai = serialize_ai_decision(ai_decision or strategy_result.ai_decision)
+        resolved_ai_decision = ai_decision or strategy_result.ai_decision
+        serialized_ai = serialize_ai_decision(resolved_ai_decision)
+        serialized_symbol_ai = (
+            _serialize_ai_cache_record(resolved_ai_decision.symbol_record)
+            if resolved_ai_decision is not None and resolved_ai_decision.symbol_record is not None
+            else serialized_ai
+        )
+        serialized_market_ai = (
+            _serialize_ai_cache_record(resolved_ai_decision.market_record)
+            if resolved_ai_decision is not None and resolved_ai_decision.market_record is not None
+            else serialized_ai
+        )
         serialized_execution = _serialize_execution(
             candidate_action=candidate_action,
             latest_signal_time=latest_signal_time,
+            symbol=runtime_config.symbol,
             execution_mode=execution_mode,
             execution_decision=execution_decision,
             execution_result=execution_result,
@@ -519,6 +974,12 @@ class PrimeStocksFirestoreRuntimeStore:
             broker_error_message=serialized_execution["broker_error_message"],
             runtime_message=runtime_message,
             now=now,
+        )
+        strategy_reasoning = _build_strategy_reasoning_payload(
+            strategy_result=strategy_result,
+            candidate_action=candidate_action,
+            execution_decision=execution_decision,
+            ai_decision=resolved_ai_decision,
         )
         persisted_state = state_record or PrimeStocksRuntimeStateRecord(
             run_id=run_id,
@@ -544,7 +1005,56 @@ class PrimeStocksFirestoreRuntimeStore:
             latest_candidate_action=candidate_action,
             latest_status=strategy_result.status,
             latest_execution_decision=execution_decision,
+            current_total_exposure_pct=state_record.current_total_exposure_pct if state_record is not None else None,
         )
+        symbol_state = {
+            "run_id": run_id,
+            "uid": account_context.uid,
+            "account_id": runtime_config.account_id,
+            "alpaca_account_id": runtime_config.alpaca_account_id,
+            "broker_environment": account_context.environment,
+            "symbol": runtime_config.symbol,
+            "last_checked_at": now.isoformat(),
+            "last_processed_bar_time": _isoformat_or_none(latest_signal_time),
+            "candidate_action": candidate_action,
+            "execution_decision": execution_decision,
+            "skipped_reason": serialized_execution["skipped_reason"],
+            "blocked_reason": serialized_execution["blocked_reason"],
+            "signal_state": strategy_result.status,
+            "included_in_last_cycle": True,
+            "execution_allowed": serialized_execution["execution_allowed"],
+            "execution_mode": execution_mode,
+            "execution_key": serialized_execution["execution_key"],
+            "order_status": serialized_execution["order_status"],
+            "order_id": serialized_execution["order_id"],
+            "client_order_id": serialized_execution["client_order_id"],
+            "latest_order_status": serialized_execution["order_status"],
+            "current_total_exposure_pct": persisted_state.current_total_exposure_pct,
+            "Ai_regime_label": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_regime_label"],
+            "Ai_sentiment_label": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_sentiment_label"],
+            "Ai_safety_label": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_safety_label"],
+            "Ai_confidence": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_confidence"],
+            "Ai_execution_allowed": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_execution_allowed"],
+            "Ai_blocked_reason": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_blocked_reason"],
+            "strategy_reasoning": strategy_reasoning,
+            "signal_score": strategy_reasoning["signal_score"],
+            "execution_timeframe": strategy_reasoning["execution_timeframe"],
+            "trend_timeframe": strategy_reasoning["trend_timeframe"],
+            "trend_1d": strategy_reasoning["trend_1d"],
+            "bias_state": strategy_reasoning["bias_state"],
+            "pullback_state": strategy_reasoning["pullback_state"],
+            "confirmation_state": strategy_reasoning["confirmation_state"],
+            "trigger_state": strategy_reasoning["trigger_state"],
+            "ai_filter_state": strategy_reasoning["ai_filter_state"],
+            "setup_state": strategy_reasoning["setup_state"],
+            "final_decision": strategy_reasoning["final_decision"],
+            "primary_reason": strategy_reasoning["primary_reason"],
+            "ai": serialized_ai,
+            "symbol_ai": serialized_symbol_ai,
+            "market_ai": serialized_market_ai,
+            "ai_scope": "symbol",
+            "updated_at": now.isoformat(),
+        }
         latest_snapshot = {
             "run_id": run_id,
             "uid": account_context.uid,
@@ -593,12 +1103,17 @@ class PrimeStocksFirestoreRuntimeStore:
             "recovery_action": failure_markers["recovery_action"],
             "failed_at": failure_markers["failed_at"],
             "recovered_at": failure_markers["recovered_at"],
-            "Ai_execution_allowed": None if serialized_ai is None else serialized_ai["Ai_execution_allowed"],
-            "Ai_blocked_reason": None if serialized_ai is None else serialized_ai["Ai_blocked_reason"],
+            "Ai_execution_allowed": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_execution_allowed"],
+            "Ai_blocked_reason": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_blocked_reason"],
+            "strategy_reasoning": strategy_reasoning,
+            "signal_score": strategy_reasoning["signal_score"],
             "state": _serialize_runtime_state(persisted_state),
             "signal": serialized_signal,
             "execution": serialized_execution,
             "ai": serialized_ai,
+            "symbol_ai": serialized_symbol_ai,
+            "market_ai": serialized_market_ai,
+            "symbol_state": symbol_state,
         }
         latest_signal = {
             "run_id": run_id,
@@ -623,9 +1138,12 @@ class PrimeStocksFirestoreRuntimeStore:
             "recovery_action": failure_markers["recovery_action"],
             "failed_at": failure_markers["failed_at"],
             "recovered_at": failure_markers["recovered_at"],
-            "Ai_execution_allowed": None if serialized_ai is None else serialized_ai["Ai_execution_allowed"],
-            "Ai_blocked_reason": None if serialized_ai is None else serialized_ai["Ai_blocked_reason"],
+            "Ai_execution_allowed": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_execution_allowed"],
+            "Ai_blocked_reason": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_blocked_reason"],
             "ai": serialized_ai,
+            "symbol_ai": serialized_symbol_ai,
+            "market_ai": serialized_market_ai,
+            "symbol_state": symbol_state,
         }
         current_state = {
             "run_id": run_id,
@@ -675,6 +1193,18 @@ class PrimeStocksFirestoreRuntimeStore:
             "latest_order_status": serialized_execution["order_status"],
             "execution_allowed": serialized_execution["execution_allowed"],
             "blocked_reason": serialized_execution["blocked_reason"],
+            "strategy_reasoning": strategy_reasoning,
+            "execution_timeframe": strategy_reasoning["execution_timeframe"],
+            "trend_timeframe": strategy_reasoning["trend_timeframe"],
+            "trend_1d": strategy_reasoning["trend_1d"],
+            "bias_state": strategy_reasoning["bias_state"],
+            "pullback_state": strategy_reasoning["pullback_state"],
+            "confirmation_state": strategy_reasoning["confirmation_state"],
+            "trigger_state": strategy_reasoning["trigger_state"],
+            "ai_filter_state": strategy_reasoning["ai_filter_state"],
+            "setup_state": strategy_reasoning["setup_state"],
+            "final_decision": strategy_reasoning["final_decision"],
+            "primary_reason": strategy_reasoning["primary_reason"],
             "safe_mode_enabled": runtime_config.safe_mode_enabled,
             "safe_mode_size_pct": runtime_config.safe_mode_size_pct,
             "live_cap_pct": runtime_config.live_cap_pct,
@@ -689,14 +1219,50 @@ class PrimeStocksFirestoreRuntimeStore:
             "recovery_action": failure_markers["recovery_action"],
             "failed_at": failure_markers["failed_at"],
             "recovered_at": failure_markers["recovered_at"],
-            "Ai_execution_allowed": None if serialized_ai is None else serialized_ai["Ai_execution_allowed"],
-            "Ai_blocked_reason": None if serialized_ai is None else serialized_ai["Ai_blocked_reason"],
+            "Ai_execution_allowed": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_execution_allowed"],
+            "Ai_blocked_reason": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_blocked_reason"],
             "trigger_type": trigger_type,
             "trigger_source": trigger_source,
             "service_name": self._settings.cloud_run_service_name,
             "service_revision": self._settings.cloud_run_revision,
             "updated_at": now.isoformat(),
             "ai": serialized_ai,
+        }
+        symbol_state = {
+            "run_id": run_id,
+            "uid": account_context.uid,
+            "account_id": runtime_config.account_id,
+            "alpaca_account_id": runtime_config.alpaca_account_id,
+            "broker_environment": account_context.environment,
+            "symbol": runtime_config.symbol,
+            "last_checked_at": now.isoformat(),
+            "last_processed_bar_time": _isoformat_or_none(latest_signal_time),
+            "candidate_action": candidate_action,
+            "execution_decision": execution_decision,
+            "skipped_reason": serialized_execution["skipped_reason"],
+            "blocked_reason": serialized_execution["blocked_reason"],
+            "signal_state": strategy_result.status,
+            "included_in_last_cycle": True,
+            "execution_allowed": serialized_execution["execution_allowed"],
+            "execution_mode": execution_mode,
+            "execution_key": serialized_execution["execution_key"],
+            "order_status": serialized_execution["order_status"],
+            "order_id": serialized_execution["order_id"],
+            "client_order_id": serialized_execution["client_order_id"],
+            "latest_order_status": serialized_execution["order_status"],
+            "current_total_exposure_pct": persisted_state.current_total_exposure_pct,
+            "Ai_regime_label": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_regime_label"],
+            "Ai_sentiment_label": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_sentiment_label"],
+            "Ai_safety_label": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_safety_label"],
+            "Ai_confidence": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_confidence"],
+            "Ai_execution_allowed": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_execution_allowed"],
+            "Ai_blocked_reason": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_blocked_reason"],
+            "ai": serialized_ai,
+            "symbol_ai": serialized_symbol_ai,
+            "market_ai": serialized_market_ai,
+            "ai_scope": "symbol",
+            "signal_score": strategy_reasoning["signal_score"],
+            "updated_at": now.isoformat(),
         }
         execution_current = {
             "run_id": run_id,
@@ -744,6 +1310,7 @@ class PrimeStocksFirestoreRuntimeStore:
             "service_name": self._settings.cloud_run_service_name,
             "service_revision": self._settings.cloud_run_revision,
             "ai": serialized_ai,
+            "symbol_state": symbol_state,
         }
         latest_action = {
             "run_id": run_id,
@@ -783,6 +1350,7 @@ class PrimeStocksFirestoreRuntimeStore:
             "service_name": self._settings.cloud_run_service_name,
             "service_revision": self._settings.cloud_run_revision,
             "ai": serialized_ai,
+            "symbol_state": symbol_state,
         }
         log_payload = {
             "run_id": run_id,
@@ -827,6 +1395,7 @@ class PrimeStocksFirestoreRuntimeStore:
             "service_revision": self._settings.cloud_run_revision,
             "created_at": now.isoformat(),
             "ai": serialized_ai,
+            "symbol_state": symbol_state,
         }
         signal_audit = {
             "run_id": run_id,
@@ -849,6 +1418,7 @@ class PrimeStocksFirestoreRuntimeStore:
             "signal": serialized_signal,
             "created_at": now.isoformat(),
             "broker_environment": account_context.environment,
+            "symbol_state": symbol_state,
         }
         action_audit = {
             "run_id": run_id,
@@ -874,6 +1444,7 @@ class PrimeStocksFirestoreRuntimeStore:
             "Ai_blocked_reason": None if serialized_ai is None else serialized_ai["Ai_blocked_reason"],
             "created_at": now.isoformat(),
             "broker_environment": account_context.environment,
+            "symbol_state": symbol_state,
         }
         order_audit = {
             "run_id": run_id,
@@ -905,6 +1476,7 @@ class PrimeStocksFirestoreRuntimeStore:
             "trigger_type": trigger_type,
             "trigger_source": trigger_source,
             "created_at": now.isoformat(),
+            "symbol_state": symbol_state,
         }
         notification_context = _build_notification_payload(
             enabled=self._settings.prime_stocks_notifications_enabled,
@@ -924,7 +1496,41 @@ class PrimeStocksFirestoreRuntimeStore:
             service_name=self._settings.cloud_run_service_name,
             service_revision=self._settings.cloud_run_revision,
         )
-        paths = self.get_paths(uid=account_context.uid, account_id=runtime_config.account_id)
+        paths = self.get_paths(
+            uid=account_context.uid,
+            account_id=runtime_config.account_id,
+            slot_number=runtime_config.slot_number,
+        )
+        symbol_paths = self.get_paths(
+            uid=account_context.uid,
+            account_id=runtime_config.account_id,
+            slot_number=runtime_config.slot_number,
+            symbol=runtime_config.symbol,
+        )
+        existing_symbol_state = None
+        if symbol_paths.symbol_state_document is not None:
+            existing_symbol_snapshot = self._firestore_call(
+                action="load existing runtime symbol state before write",
+                path=symbol_paths.symbol_state_document,
+                fn=lambda: self._document_ref(symbol_paths.symbol_state_document).get(),
+            )
+            existing_symbol_state = (
+                existing_symbol_snapshot.to_dict() if getattr(existing_symbol_snapshot, "exists", False) else None
+            )
+        preserve_submitted_execution = _should_preserve_submitted_execution_state(
+            existing_payload=existing_symbol_state,
+            symbol=runtime_config.symbol,
+            execution_decision=execution_decision,
+            execution_key=serialized_execution["execution_key"],
+            latest_signal_time=_isoformat_or_none(latest_signal_time),
+        )
+        if preserve_submitted_execution:
+            logger.info(
+                "Prime Stocks preserving submitted execution state against preview overwrite symbol=%s execution_key=%s run_id=%s",
+                runtime_config.symbol,
+                serialized_execution["execution_key"],
+                run_id,
+            )
         self._firestore_call(
             action="write runtime snapshot",
             path=paths.snapshot_document,
@@ -935,11 +1541,12 @@ class PrimeStocksFirestoreRuntimeStore:
             path=paths.signal_document,
             fn=lambda: self._signal_document(paths).set(latest_signal, merge=True),
         )
-        self._firestore_call(
-            action="write runtime state",
-            path=paths.state_document,
-            fn=lambda: self._state_document(paths).set(current_state, merge=True),
-        )
+        if not preserve_submitted_execution:
+            self._firestore_call(
+                action="write runtime state",
+                path=paths.state_document,
+                fn=lambda: self._state_document(paths).set(current_state, merge=True),
+            )
         if test_trigger == "ping":
             self.write_runtime_heartbeat(
                 run_id=run_id,
@@ -947,16 +1554,23 @@ class PrimeStocksFirestoreRuntimeStore:
                 uid=account_context.uid,
                 account_id=runtime_config.account_id,
             )
-        self._firestore_call(
-            action="write latest execution",
-            path=paths.execution_document,
-            fn=lambda: self._execution_document(paths).set(execution_current, merge=True),
-        )
-        self._firestore_call(
-            action="write latest action",
-            path=paths.action_document,
-            fn=lambda: self._action_document(paths).set(latest_action, merge=True),
-        )
+        if not preserve_submitted_execution:
+            self._firestore_call(
+                action="write latest execution",
+                path=paths.execution_document,
+                fn=lambda: self._execution_document(paths).set(execution_current, merge=True),
+            )
+            self._firestore_call(
+                action="write latest action",
+                path=paths.action_document,
+                fn=lambda: self._action_document(paths).set(latest_action, merge=True),
+            )
+            if symbol_paths.symbol_state_document is not None:
+                self._firestore_call(
+                    action="write runtime symbol state",
+                    path=symbol_paths.symbol_state_document,
+                    fn=lambda: self._document_ref(symbol_paths.symbol_state_document).set(symbol_state, merge=True),
+                )
         log_document_path = f"{paths.logs_collection}/{run_id}"
         self._firestore_call(
             action="write runtime log",
@@ -1025,30 +1639,272 @@ class PrimeStocksFirestoreRuntimeStore:
                     merge=True,
                 ),
             )
-            self._firestore_call(
-                action="write latest execution notification markers",
-                path=paths.execution_document,
-                fn=lambda: self._execution_document(paths).set(
+
+        should_write_single_result_cycle_summary = not (
+            trigger_type == "scheduled" and trigger_source == "cloud_scheduler"
+        )
+
+        if should_write_single_result_cycle_summary and account_context.uid and runtime_config.account_id is not None:
+            self.write_runtime_cycle_summary(
+                uid=account_context.uid,
+                account_id=runtime_config.account_id,
+                alpaca_account_id=runtime_config.alpaca_account_id,
+                slot_number=runtime_config.slot_number,
+                run_id=run_id,
+                trigger_type=trigger_type,
+                trigger_source=trigger_source,
+                target_count=1,
+                completed_count=1,
+                results=[
                     {
-                        "notification_delivery_result": notification_context["delivery"],
-                        "notification_event_type": notification_context["event_type"],
-                        "notification_key": notification_context["notification_key"],
-                    },
-                    merge=True,
-                ),
+                        "uid": account_context.uid,
+                        "account_id": runtime_config.account_id,
+                        "alpaca_account_id": runtime_config.alpaca_account_id,
+                        "slot_number": None,
+                        "symbol": runtime_config.symbol,
+                        "run_id": run_id,
+                        "candidate_action": candidate_action,
+                        "execution_decision": execution_decision,
+                        "skipped_reason": serialized_execution["skipped_reason"],
+                        "order_status": serialized_execution["order_status"],
+                        "execution_mode": execution_mode,
+                        "status": strategy_result.status,
+                        "execution_allowed": serialized_execution["execution_allowed"],
+                        "latest_signal_time": _isoformat_or_none(latest_signal_time),
+                        "last_checked_at": now.isoformat(),
+                        "last_processed_bar_at": _isoformat_or_none(latest_signal_time),
+                        "signal_state": strategy_result.status,
+                        "included_in_last_cycle": True,
+                        "Ai_regime_label": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_regime_label"],
+                        "Ai_sentiment_label": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_sentiment_label"],
+                        "Ai_safety_label": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_safety_label"],
+                        "Ai_confidence": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_confidence"],
+                        "Ai_execution_allowed": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_execution_allowed"],
+                        "Ai_blocked_reason": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_blocked_reason"],
+                        "symbol_ai": serialized_symbol_ai,
+                        "market_ai": serialized_market_ai,
+                        "ai_scope": "symbol",
+                    }
+                ],
+                service_revision=self._settings.cloud_run_revision,
+                service_name=self._settings.cloud_run_service_name,
             )
-            self._firestore_call(
-                action="write runtime state notification markers",
-                path=paths.state_document,
-                fn=lambda: self._state_document(paths).set(
-                    {
-                        "notification_delivery_result": notification_context["delivery"],
-                        "notification_event_type": notification_context["event_type"],
-                        "notification_key": notification_context["notification_key"],
-                    },
-                    merge=True,
-                ),
+
+    def write_runtime_cycle_summary(
+        self,
+        *,
+        uid: str,
+        account_id: int,
+        alpaca_account_id: int | None,
+        slot_number: int | None = None,
+        run_id: str,
+        trigger_type: str,
+        trigger_source: str,
+        target_count: int,
+        completed_count: int,
+        results: list[dict[str, Any]],
+        service_revision: str | None = None,
+        service_name: str | None = None,
+    ) -> None:
+        paths = self.get_paths(uid=uid, account_id=account_id, slot_number=slot_number)
+        now = datetime.now(tz=UTC).isoformat()
+        def _symbol_ai_value(item: dict[str, Any], key: str) -> Any:
+            symbol_ai = item.get("symbol_ai")
+            if isinstance(symbol_ai, dict) and key in symbol_ai:
+                return symbol_ai.get(key)
+            return item.get(key)
+        def _strategy_reasoning_value(item: dict[str, Any], key: str) -> Any:
+            strategy_reasoning = item.get("strategy_reasoning")
+            if isinstance(strategy_reasoning, dict) and key in strategy_reasoning:
+                return strategy_reasoning.get(key)
+            return item.get(key)
+
+        per_symbol_results = [
+            {
+                "uid": uid,
+                "account_id": account_id,
+                "alpaca_account_id": alpaca_account_id,
+                "slot_number": item.get("slot_number"),
+                "symbol": str(item.get("symbol", "")).strip().upper() if item.get("symbol") else None,
+                "run_id": item.get("run_id"),
+                "candidate_action": item.get("candidate_action"),
+                "execution_decision": item.get("execution_decision"),
+                "skipped_reason": item.get("skipped_reason"),
+                "order_status": item.get("order_status"),
+                "execution_mode": item.get("execution_mode"),
+                "status": item.get("status"),
+                "signal_state": item.get("signal_state"),
+                "included_in_last_cycle": bool(item.get("included_in_last_cycle", True)),
+                "last_checked_at": item.get("last_checked_at") or now,
+                "last_processed_bar_at": item.get("last_processed_bar_at"),
+                "Ai_regime_label": _symbol_ai_value(item, "Ai_regime_label"),
+                "Ai_sentiment_label": _symbol_ai_value(item, "Ai_sentiment_label"),
+                "Ai_safety_label": _symbol_ai_value(item, "Ai_safety_label"),
+                "Ai_confidence": _symbol_ai_value(item, "Ai_confidence"),
+                "Ai_execution_allowed": _symbol_ai_value(item, "Ai_execution_allowed"),
+                "Ai_blocked_reason": _symbol_ai_value(item, "Ai_blocked_reason"),
+                "symbol_ai": item.get("symbol_ai"),
+                "market_ai": item.get("market_ai"),
+                "ai_scope": item.get("ai_scope", "symbol"),
+                "strategy_reasoning": item.get("strategy_reasoning"),
+                "execution_timeframe": _strategy_reasoning_value(item, "execution_timeframe"),
+                "trend_timeframe": _strategy_reasoning_value(item, "trend_timeframe"),
+                "strategy_context": _strategy_reasoning_value(item, "strategy_context"),
+                "trend_1d": _strategy_reasoning_value(item, "trend_1d"),
+                "bias_state": _strategy_reasoning_value(item, "bias_state"),
+                "pullback_state": _strategy_reasoning_value(item, "pullback_state"),
+                "confirmation_state": _strategy_reasoning_value(item, "confirmation_state"),
+                "trigger_state": _strategy_reasoning_value(item, "trigger_state"),
+                "ai_filter_state": _strategy_reasoning_value(item, "ai_filter_state"),
+                "setup_state": _strategy_reasoning_value(item, "setup_state"),
+                "final_decision": _strategy_reasoning_value(item, "final_decision"),
+                "primary_reason": _strategy_reasoning_value(item, "primary_reason"),
+            }
+            for item in results
+            if isinstance(item, dict)
+            and not (
+                str(item.get("execution_decision") or "").strip().lower() == "no_active_symbols_configured"
+                or str(item.get("skipped_reason") or "").strip().lower() == "no_active_symbols_configured"
             )
+        ]
+        existing_cycle_payload = self._firestore_call(
+            action="load existing runtime cycle summary",
+            path=paths.cycle_document,
+            fn=lambda: self._cycle_document(paths).get(),
+        )
+        existing_cycle = existing_cycle_payload.to_dict() if getattr(existing_cycle_payload, "exists", False) else None
+        scanned_symbols = [
+            item["symbol"]
+            for item in per_symbol_results
+            if isinstance(item.get("symbol"), str) and item["symbol"].strip() != ""
+        ]
+        blocked_count = sum(
+            1
+            for item in per_symbol_results
+            if str(item.get("execution_decision") or "").startswith("blocked")
+            or str(item.get("skipped_reason") or "").startswith("blocked")
+        )
+        skipped_count = max(0, completed_count - len(scanned_symbols))
+        last_concrete_result = next(
+            (
+                item
+                for item in reversed(per_symbol_results)
+                if item.get("execution_decision") not in {None, "skipped_no_new_bar", "no_op"}
+            ),
+            per_symbol_results[-1] if per_symbol_results else None,
+        )
+        last_concrete_blocker = next(
+            (
+                item.get("skipped_reason") or item.get("execution_decision")
+                for item in reversed(per_symbol_results)
+                if item.get("skipped_reason") or str(item.get("execution_decision") or "").startswith("blocked")
+            ),
+            None,
+        )
+        symbol_states = {
+            item["symbol"]: {
+                "run_id": item.get("run_id"),
+                "uid": uid,
+                "account_id": account_id,
+                "alpaca_account_id": alpaca_account_id,
+                "slot_number": item.get("slot_number"),
+                "symbol": item.get("symbol"),
+                "last_checked_at": item.get("last_checked_at"),
+                "last_processed_bar_at": item.get("last_processed_bar_at"),
+                "candidate_action": item.get("candidate_action"),
+                "execution_decision": item.get("execution_decision"),
+                "skipped_reason": item.get("skipped_reason"),
+                "order_status": item.get("order_status"),
+                "signal_state": item.get("signal_state"),
+                "included_in_last_cycle": item.get("included_in_last_cycle"),
+                "execution_mode": item.get("execution_mode"),
+                "Ai_regime_label": item.get("Ai_regime_label"),
+                "Ai_sentiment_label": item.get("Ai_sentiment_label"),
+                "Ai_safety_label": item.get("Ai_safety_label"),
+                "Ai_confidence": item.get("Ai_confidence"),
+                "Ai_execution_allowed": item.get("Ai_execution_allowed"),
+                "Ai_blocked_reason": item.get("Ai_blocked_reason"),
+                "ai_scope": item.get("ai_scope"),
+                "strategy_reasoning": item.get("strategy_reasoning"),
+                "execution_timeframe": item.get("execution_timeframe"),
+                "trend_timeframe": item.get("trend_timeframe"),
+                "strategy_context": item.get("strategy_context"),
+                "trend_1d": item.get("trend_1d"),
+                "bias_state": item.get("bias_state"),
+                "pullback_state": item.get("pullback_state"),
+                "confirmation_state": item.get("confirmation_state"),
+                "trigger_state": item.get("trigger_state"),
+                "ai_filter_state": item.get("ai_filter_state"),
+                "setup_state": item.get("setup_state"),
+                "final_decision": item.get("final_decision"),
+                "primary_reason": item.get("primary_reason"),
+            }
+            for item in per_symbol_results
+            if item.get("symbol")
+        }
+        summary = {
+            "run_id": run_id,
+            "uid": uid,
+            "account_id": account_id,
+            "alpaca_account_id": alpaca_account_id,
+            "trigger_type": trigger_type,
+            "trigger_source": trigger_source,
+            "last_scheduler_hit_at": now,
+            "last_runtime_cycle_at": now,
+            "symbols_scanned_count": len(scanned_symbols),
+            "symbols_scanned": scanned_symbols,
+            "symbols_blocked_count": blocked_count,
+            "symbols_skipped_count": skipped_count,
+            "target_count": target_count,
+            "completed_count": completed_count,
+            "per_symbol_results": per_symbol_results,
+            "symbol_states": symbol_states,
+            "last_concrete_runtime_result": last_concrete_result,
+            "last_concrete_blocker": last_concrete_blocker,
+            "runtime_heartbeat_freshness": "fresh" if completed_count > 0 else "unknown",
+            "broker_account_status": "connected" if completed_count > 0 else "unknown",
+            "service_name": service_name,
+            "service_revision": service_revision,
+            "updated_at": now,
+        }
+        self._firestore_call(
+            action="write runtime cycle summary",
+            path=paths.cycle_document,
+            fn=lambda: self._cycle_document(paths).set(summary, merge=True),
+        )
+
+    def write_prime_stocks_trade_performance(
+        self,
+        *,
+        uid: str,
+        account_id: int,
+        trade_id: str,
+        trade_payload: dict[str, Any],
+    ) -> None:
+        trade_path = self.prime_stocks_performance_trade_path(uid=uid, account_id=account_id, trade_id=trade_id)
+        summary_path = self.prime_stocks_performance_summary_path(uid=uid, account_id=account_id)
+        now = datetime.now(tz=UTC).isoformat()
+
+        payload = dict(trade_payload)
+        payload.setdefault("trade_id", trade_id)
+        payload.setdefault("updated_at", now)
+
+        self._firestore_call(
+            action="write prime stocks trade performance",
+            path=trade_path,
+            fn=lambda: self._document_ref(trade_path).set(payload, merge=True),
+        )
+
+        summary = self._build_prime_stocks_trade_performance_summary(uid=uid, account_id=account_id)
+        summary_payload = {
+            **summary,
+            "updated_at": now,
+        }
+        self._firestore_call(
+            action="write prime stocks trade performance summary",
+            path=summary_path,
+            fn=lambda: self._document_ref(summary_path).set(summary_payload, merge=True),
+        )
 
     def write_runtime_heartbeat(
         self,
@@ -1058,6 +1914,7 @@ class PrimeStocksFirestoreRuntimeStore:
         test_mode: bool = True,
         uid: str | None = None,
         account_id: int | None = None,
+        slot_number: int | None = None,
     ) -> None:
         now = datetime.now(tz=UTC)
         heartbeat_payload = {
@@ -1066,7 +1923,7 @@ class PrimeStocksFirestoreRuntimeStore:
             "status": status,
             "test_mode": test_mode,
         }
-        paths = self.get_paths(uid=uid, account_id=account_id)
+        paths = self.get_paths(uid=uid, account_id=account_id, slot_number=slot_number)
         self._firestore_call(
             action="write runtime heartbeat",
             path=paths.heartbeat_document,
@@ -1081,6 +1938,9 @@ class PrimeStocksFirestoreRuntimeStore:
 
     def _state_document(self, paths: PrimeStocksRuntimeStorePaths) -> Any:
         return self._document_ref(paths.state_document)
+
+    def _cycle_document(self, paths: PrimeStocksRuntimeStorePaths) -> Any:
+        return self._document_ref(paths.cycle_document)
 
     def _snapshot_document(self, paths: PrimeStocksRuntimeStorePaths) -> Any:
         return self._document_ref(paths.snapshot_document)
@@ -1115,11 +1975,160 @@ class PrimeStocksFirestoreRuntimeStore:
     def _notification_state_document(self, paths: PrimeStocksRuntimeStorePaths) -> Any:
         return self._document_ref(paths.notification_state_document)
 
+    def _extract_runtime_symbols_from_config(self, payload: dict[str, Any]) -> list[str]:
+        selected_symbols = [
+            str(symbol).strip().upper()
+            for symbol in payload.get("selected_symbols", [])
+            if str(symbol).strip() != ""
+        ] if isinstance(payload.get("selected_symbols"), list) else []
+        symbol_states = [
+            str(item.get("symbol", "")).strip().upper()
+            for item in payload.get("symbol_states", [])
+            if isinstance(item, dict) and str(item.get("symbol", "")).strip() != ""
+        ] if isinstance(payload.get("symbol_states"), list) else []
+        return sorted({symbol for symbol in [*selected_symbols, *symbol_states] if symbol})
+
+    def _should_promote_runtime_payload(self, source_payload: dict[str, Any], target_payload: dict[str, Any] | None) -> bool:
+        if target_payload is None:
+            return True
+
+        source_timestamp = _runtime_payload_timestamp(source_payload)
+        target_timestamp = _runtime_payload_timestamp(target_payload)
+
+        if source_timestamp is None:
+            return False
+        if target_timestamp is None:
+            return True
+
+        return source_timestamp > target_timestamp
+
     def _ai_market_document(self) -> Any:
         return self._document_ref(self.get_paths().ai_market_document)
 
     def _ai_symbols_collection(self) -> Any:
         return self._collection_ref(self.get_paths().ai_symbols_collection)
+
+    def prime_stocks_performance_base_path(self, *, uid: str, account_id: int) -> str:
+        resolved_uid = uid.strip()
+        if resolved_uid == "":
+            raise PrimeStocksRuntimeStoreError("Prime Stocks performance tracking requires a non-empty uid.")
+
+        return f"users/{resolved_uid}/accounts/{account_id}/performance/current"
+
+    def prime_stocks_performance_trade_path(self, *, uid: str, account_id: int, trade_id: str) -> str:
+        resolved_trade_id = trade_id.strip()
+        if resolved_trade_id == "":
+            raise PrimeStocksRuntimeStoreError("Prime Stocks performance tracking requires a non-empty trade_id.")
+
+        return f"{self.prime_stocks_performance_base_path(uid=uid, account_id=account_id)}/trades/{resolved_trade_id}"
+
+    def prime_stocks_performance_summary_path(self, *, uid: str, account_id: int) -> str:
+        return f"{self.prime_stocks_performance_base_path(uid=uid, account_id=account_id)}/summary/current"
+
+    def _load_prime_stocks_trade_performance_documents(self, *, uid: str, account_id: int) -> list[dict[str, Any]]:
+        trade_collection_path = f"{self.prime_stocks_performance_base_path(uid=uid, account_id=account_id)}/trades"
+        client = self._client_or_default()
+
+        if hasattr(client, "storage"):
+            storage = getattr(client, "storage", {})
+            cursor = storage
+            for part in trade_collection_path.split("/"):
+                if part not in cursor:
+                    return []
+                cursor = cursor[part]
+            if not isinstance(cursor, dict):
+                return []
+            return [payload for payload in cursor.values() if isinstance(payload, dict)]
+
+        snapshots = self._firestore_call(
+            action="load prime stocks trade performance documents",
+            path=trade_collection_path,
+            fn=lambda: list(self._collection_ref(trade_collection_path).stream()),
+        )
+        documents: list[dict[str, Any]] = []
+        for snapshot in snapshots:
+            if getattr(snapshot, "exists", False):
+                payload = snapshot.to_dict()
+                if isinstance(payload, dict):
+                    documents.append(payload)
+        return documents
+
+    def _build_prime_stocks_trade_performance_summary(self, *, uid: str, account_id: int) -> dict[str, Any]:
+        trades = self._load_prime_stocks_trade_performance_documents(uid=uid, account_id=account_id)
+        if not trades:
+            return {
+                "total_trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "win_rate": 0.0,
+                "realized_pnl_dollars": 0.0,
+                "realized_pnl_percent": 0.0,
+                "avg_win_dollars": 0.0,
+                "avg_loss_dollars": 0.0,
+                "best_symbol": None,
+                "worst_symbol": None,
+            }
+
+        def _float_value(value: Any) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+
+        pnl_by_symbol: dict[str, float] = defaultdict(float)
+        wins: list[float] = []
+        losses: list[float] = []
+        gross_pnl = 0.0
+        total_entry_notional = 0.0
+        trade_count = 0
+
+        for payload in trades:
+            realized_pnl = _float_value(payload.get("realized_pnl_dollars"))
+            entry_notional = abs(_float_value(payload.get("entry_notional")))
+            symbol = str(payload.get("symbol", "")).strip().upper()
+            if symbol == "":
+                continue
+            trade_count += 1
+            gross_pnl += realized_pnl
+            total_entry_notional += entry_notional
+            pnl_by_symbol[symbol] += realized_pnl
+            if realized_pnl > 0:
+                wins.append(realized_pnl)
+            elif realized_pnl < 0:
+                losses.append(realized_pnl)
+
+        if trade_count == 0:
+            return {
+                "total_trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "win_rate": 0.0,
+                "realized_pnl_dollars": 0.0,
+                "realized_pnl_percent": 0.0,
+                "avg_win_dollars": 0.0,
+                "avg_loss_dollars": 0.0,
+                "best_symbol": None,
+                "worst_symbol": None,
+            }
+
+        best_symbol = None
+        worst_symbol = None
+        if pnl_by_symbol:
+            best_symbol = max(pnl_by_symbol.items(), key=lambda item: item[1])[0]
+            worst_symbol = min(pnl_by_symbol.items(), key=lambda item: item[1])[0]
+
+        return {
+            "total_trades": trade_count,
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": round((len(wins) / trade_count) * 100.0, 2) if trade_count > 0 else 0.0,
+            "realized_pnl_dollars": round(gross_pnl, 2),
+            "realized_pnl_percent": round((gross_pnl / total_entry_notional * 100.0), 2) if total_entry_notional > 0 else 0.0,
+            "avg_win_dollars": round(sum(wins) / len(wins), 2) if wins else 0.0,
+            "avg_loss_dollars": round(sum(losses) / len(losses), 2) if losses else 0.0,
+            "best_symbol": best_symbol,
+            "worst_symbol": worst_symbol,
+        }
 
     def _count_submitted_orders_from_fake_storage(
         self,
@@ -1249,7 +2258,8 @@ def build_default_runtime_config(settings: AppConfig) -> PrimeStocksRuntimeConfi
         test_symbol_override=None if settings.prime_stocks_test_symbol_override is None else settings.prime_stocks_test_symbol_override.upper(),
         force_candidate_action=settings.prime_stocks_force_candidate_action,
         ai_validation_bypass_enabled=settings.prime_stocks_ai_validation_bypass_enabled,
-        execution_timeframe="1H",
+        strategy_mode=settings.prime_stocks_strategy_mode,
+        execution_timeframe="15M",
         trend_timeframe="1D",
         pullback_window=5,
         execution_bar_limit=settings.prime_stocks_execution_bar_limit,
@@ -1264,6 +2274,7 @@ def build_default_runtime_config(settings: AppConfig) -> PrimeStocksRuntimeConfi
         broker_retry_max_attempts=settings.prime_stocks_broker_retry_max_attempts,
         account_id=None,
         alpaca_account_id=None,
+        slot_number=None,
         entitlement={},
         safe_mode_enabled=settings.prime_stocks_safe_mode_enabled,
         safe_mode_size_pct=settings.prime_stocks_safe_mode_size_pct,
@@ -1405,7 +2416,7 @@ def build_prime_stocks_runtime_bootstrap_documents(
             "recovery_action": None,
             "failed_at": None,
             "recovered_at": None,
-            "strategy_message": "Prime Stocks runtime is initialized and awaiting the first closed 1H bar.",
+            "strategy_message": "Prime Stocks runtime is initialized and awaiting the first closed 15M bar.",
             "state": state_payload,
             "signal": signal_payload,
             "execution": execution_payload,
@@ -1432,6 +2443,30 @@ def build_prime_stocks_runtime_bootstrap_documents(
             "recovery_action": None,
             "failed_at": None,
             "recovered_at": None,
+        },
+        "cycles/latest": {
+            "run_id": BOOTSTRAP_RUN_ID,
+            "uid": None,
+            "account_id": None,
+            "alpaca_account_id": None,
+            "trigger_type": "bootstrap",
+            "trigger_source": "firestore_seed",
+            "last_scheduler_hit_at": now.isoformat(),
+            "last_runtime_cycle_at": now.isoformat(),
+            "symbols_scanned_count": 0,
+            "symbols_scanned": [],
+            "symbols_blocked_count": 0,
+            "symbols_skipped_count": 0,
+            "target_count": 0,
+            "completed_count": 0,
+            "per_symbol_results": [],
+            "last_concrete_runtime_result": None,
+            "last_concrete_blocker": None,
+            "runtime_heartbeat_freshness": "unknown",
+            "broker_account_status": "unknown",
+            "service_name": settings.cloud_run_service_name,
+            "service_revision": settings.cloud_run_revision,
+            "updated_at": now.isoformat(),
         },
         "execution/current": {
             "run_id": BOOTSTRAP_RUN_ID,
@@ -1548,10 +2583,18 @@ def _isoformat_or_none(value: datetime | None) -> str | None:
     return None if value is None else value.astimezone(UTC).isoformat()
 
 
+def _build_execution_key(candidate_action: str, latest_signal_time: datetime | None, symbol: str | None = None) -> str:
+    latest_signal_time_value = _isoformat_or_none(latest_signal_time)
+    if candidate_action == "FirstLot" and symbol is not None and str(symbol).strip() != "":
+        return f"FirstLot:{str(symbol).strip().upper()}:{latest_signal_time_value}"
+    return f"{candidate_action}:{latest_signal_time_value}"
+
+
 def _serialize_execution(
     *,
     candidate_action: str,
     latest_signal_time: datetime | None,
+    symbol: str | None = None,
     execution_mode: str,
     execution_decision: str,
     execution_result: AlpacaPaperExecutionResult | None,
@@ -1561,7 +2604,7 @@ def _serialize_execution(
     broker_error_code: str | None = None,
     broker_error_message: str | None = None,
 ) -> dict[str, Any]:
-    execution_key = f"{candidate_action}:{_isoformat_or_none(latest_signal_time) or 'none'}"
+    execution_key = _build_execution_key(candidate_action, latest_signal_time, symbol=symbol)
     blocked_reason = (
         skipped_reason
         if execution_decision not in {
@@ -1777,15 +2820,43 @@ def _resolve_notification_event_type(
         "ai_cache_unavailable",
         "ai_cache_stale",
         "stale_data",
-        "live_cap_pct_exceeded",
-        "max_total_exposure_pct_exceeded",
-        "per_symbol_entry_cap_exceeded",
-        "total_entry_exposure_cap_exceeded",
-        "total_add_exposure_cap_exceeded",
-        "max_notional_per_order_exceeded",
+        "prime_symbol_entry_budget_exceeded",
+        "prime_total_entry_budget_reached",
+        "prime_total_add_budget_reached",
     }:
         return "critical_blocked"
     return None
+
+
+def _should_preserve_submitted_execution_state(
+    *,
+    existing_payload: dict[str, Any] | None,
+    symbol: str,
+    execution_decision: str,
+    execution_key: str | None,
+    latest_signal_time: str | None,
+) -> bool:
+    if execution_decision != "preview_only" or not existing_payload:
+        return False
+    existing_symbol = _maybe_string(existing_payload.get("symbol"))
+    if existing_symbol is not None and existing_symbol.strip().upper() != symbol.strip().upper():
+        return False
+    existing_decision = (
+        _maybe_string(existing_payload.get("execution_decision"))
+        or _maybe_string(existing_payload.get("latest_execution_decision"))
+    )
+    if existing_decision not in SUBMITTED_EXECUTION_DECISIONS:
+        return False
+    existing_execution_key = _maybe_string(existing_payload.get("execution_key"))
+    existing_signal_time = (
+        _maybe_string(existing_payload.get("latest_signal_time"))
+        or _maybe_string(existing_payload.get("last_processed_bar_time"))
+    )
+    if execution_key and existing_execution_key and execution_key == existing_execution_key:
+        return True
+    if latest_signal_time and existing_signal_time and latest_signal_time == existing_signal_time:
+        return True
+    return False
 
 
 def _deserialize_ai_cache_record(payload: dict[str, Any]) -> AiCacheRecord:
@@ -1823,6 +2894,48 @@ def _maybe_int(value: object) -> int | None:
     return int(value)
 
 
+def _normalize_prime_bar_limit(value: object, *, default: int, minimum: int) -> int:
+    resolved = _maybe_int(value)
+    if resolved is None:
+        resolved = int(default)
+    return max(int(minimum), int(resolved))
+
+
+def _runtime_payload_timestamp(payload: dict[str, Any]) -> datetime | None:
+    for field_name in (
+        "updated_at",
+        "last_checked_at",
+        "last_runtime_cycle_at",
+        "last_scheduler_hit_at",
+        "last_processed_bar_time",
+        "latest_signal_time",
+        "symbols_updated_at",
+        "entitlement_updated_at",
+        "Ai_updated_at",
+    ):
+        value = payload.get(field_name)
+        if not isinstance(value, str) or value.strip() == "":
+            continue
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+    return None
+
+
+def _payload_matches_expected_linked_account(
+    payload: dict[str, Any] | None,
+    *,
+    expected_alpaca_account_id: int | None,
+) -> bool:
+    if expected_alpaca_account_id is None:
+        return True
+    if not isinstance(payload, dict):
+        return False
+    payload_alpaca_account_id = _maybe_int(payload.get("alpaca_account_id"))
+    return payload_alpaca_account_id == expected_alpaca_account_id
+
+
 def _maybe_float(value: object) -> float | None:
     if value is None or value == "":
         return None
@@ -1851,6 +2964,8 @@ def _maybe_int_list(value: object) -> list[int]:
 def _normalize_runtime_timeframe(timeframe: str) -> str:
     normalized = timeframe.strip().upper()
     aliases = {
+        "15M": "15M",
+        "15MIN": "15M",
         "1H": "1H",
         "1HOUR": "1H",
         "4H": "4H",
@@ -1863,11 +2978,30 @@ def _normalize_runtime_timeframe(timeframe: str) -> str:
     return aliases.get(normalized, normalized)
 
 
+def _normalize_runtime_execution_timeframe(timeframe: object) -> tuple[str, str | None]:
+    raw_value = _maybe_string(timeframe)
+    if raw_value is None:
+        return "15M", None
+
+    normalized = _normalize_runtime_timeframe(raw_value)
+    if normalized == "15M":
+        return "15M", None
+
+    return "15M", normalized
+
+
 def _normalize_ping_mode(value: object) -> str:
     normalized = str(value or "off").strip().lower()
     if normalized in {"on", "gauge"}:
         return normalized
     return "off"
+
+
+def _normalize_strategy_mode(value: object) -> str:
+    normalized = str(value or "scalper").strip().lower()
+    if normalized in {"scalper", "trend"}:
+        return normalized
+    return "scalper"
 
 
 def _normalize_entitlement_payload(value: object) -> dict[str, Any]:

@@ -12,9 +12,13 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from math import ceil
+from socket import timeout as SocketTimeout
 from typing import Protocol
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -27,6 +31,8 @@ SUPPORTED_STOCK_ASSET_TYPES = frozenset({"stock", "stocks", "equity", "equities"
 SUPPORTED_VALIDATION_CRYPTO_ASSET_TYPES = frozenset({"crypto"})
 SUPPORTED_PRODUCT_KEYS = frozenset({"stocks.bismel1"})
 SUPPORTED_ALPACA_TIMEFRAMES = {
+    "15M": "15Min",
+    "15MIN": "15Min",
     "1M": "1Min",
     "1MIN": "1Min",
     "1H": "1Hour",
@@ -47,9 +53,29 @@ class HttpClientProtocol(Protocol):
 class UrllibJsonClient:
     def fetch_json(self, url: str, headers: dict[str, str]) -> dict[str, object]:
         request = Request(url=url, headers=headers, method="GET")
-        with urlopen(request, timeout=27) as response:
-            payload = response.read().decode("utf-8")
-        return json.loads(payload)
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                with urlopen(request, timeout=27) as response:
+                    payload = response.read().decode("utf-8")
+                return json.loads(payload)
+            except HTTPError as exc:
+                if attempt == 0 and exc.code in {408, 425, 429, 500, 502, 503, 504}:
+                    last_error = exc
+                    time.sleep(0.75)
+                    continue
+                raise
+            except (URLError, TimeoutError, SocketTimeout) as exc:
+                if attempt == 0 and _is_retryable_network_error(exc):
+                    last_error = exc
+                    time.sleep(0.75)
+                    continue
+                raise
+
+        if last_error is not None:
+            raise last_error
+
+        raise RuntimeError("Alpaca market-data fetch failed without a concrete error.")
 
 
 @dataclass(frozen=True)
@@ -103,7 +129,7 @@ class AlpacaMarketDataAdapter:
                 trend_bars=trend_bars,
             )
         self._ensure_stock_context(asset_type=asset_type, product_key=product_key)
-        resolved_execution_timeframe = _normalize_alpaca_timeframe(execution_timeframe or "1H")
+        resolved_execution_timeframe = _normalize_alpaca_timeframe(execution_timeframe or "15M")
         resolved_trend_timeframe = _normalize_alpaca_timeframe(trend_timeframe or "1D")
         execution_bars = self.fetch_stock_bars(
             symbol=symbol,
@@ -132,12 +158,15 @@ class AlpacaMarketDataAdapter:
         credential_context: ResolvedAlpacaAccountContext | None = None,
     ) -> list[PriceBar]:
         base_url = self._settings.alpaca_data_base_url.rstrip("/")
+        start_at, end_at = _stock_bar_time_window(timeframe=timeframe, limit=limit)
         query = urlencode(
             {
                 "symbols": symbol.upper(),
                 "timeframe": timeframe,
                 "limit": limit,
-                "sort": "asc",
+                "sort": "desc",
+                "start": start_at,
+                "end": end_at,
                 "feed": credential_context.data_feed if credential_context is not None else self._settings.alpaca_data_feed,
             }
         )
@@ -145,7 +174,10 @@ class AlpacaMarketDataAdapter:
             url=f"{base_url}/v2/stocks/bars?{query}",
             headers=self._headers(credential_context=credential_context),
         )
-        return normalize_alpaca_bars(payload=payload, symbol=symbol)
+        return sorted(
+            normalize_alpaca_bars(payload=payload, symbol=symbol),
+            key=lambda bar: bar.starts_at,
+        )
 
     def fetch_crypto_bars(
         self,
@@ -243,6 +275,39 @@ def _normalize_alpaca_timeframe(timeframe: str) -> str:
     if normalized not in SUPPORTED_ALPACA_TIMEFRAMES:
         raise ValueError(f"Unsupported Alpaca timeframe for Prime Stocks runtime: {timeframe!r}.")
     return SUPPORTED_ALPACA_TIMEFRAMES[normalized]
+
+
+def _stock_bar_time_window(*, timeframe: str, limit: int) -> tuple[str, str]:
+    resolved_limit = max(1, int(limit))
+    bar_minutes = _market_minutes_per_bar(timeframe)
+    trading_days_needed = max(1, ceil((resolved_limit * bar_minutes) / 390))
+    calendar_days = max(7, ceil(trading_days_needed * 1.8) + 3)
+    end_at = datetime.now(UTC).replace(microsecond=0)
+    start_at = end_at - timedelta(days=calendar_days)
+    return start_at.isoformat(), end_at.isoformat()
+
+
+def _market_minutes_per_bar(timeframe: str) -> int:
+    normalized = (timeframe or "").strip().lower()
+    mapping = {
+        "1min": 1,
+        "15min": 15,
+        "1hour": 60,
+        "4hour": 240,
+        "1day": 390,
+    }
+    return mapping.get(normalized, 15)
+
+
+def _is_retryable_network_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "timed out" in message
+        or "timeout" in message
+        or "temporarily unavailable" in message
+        or "connection reset" in message
+        or "connection aborted" in message
+    )
 
 
 def _normalize_crypto_symbol_for_query(symbol: str) -> str:

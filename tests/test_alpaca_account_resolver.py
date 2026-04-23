@@ -96,6 +96,45 @@ def test_resolver_returns_live_account_context() -> None:
     assert context.entitlement["runtime_allowed"] is True
 
 
+def test_resolver_can_resolve_runtime_account_by_slot_and_product() -> None:
+    resolver = LaravelAlpacaAccountResolver(
+        settings=_settings(),
+        http_client=SlotHttpClient(
+            payload={
+                "account_id": 101,
+                "uid": "user-a",
+                "product_id": "execution",
+                "alpaca_account_id": 777,
+                "broker_connection_id": 301,
+                "broker_credential_id": 401,
+                "slot_number": 3,
+                "environment": "paper",
+                "data_feed": "iex",
+                "access_mode": "trade",
+                "trade_enabled": True,
+                "broker_name": "alpaca",
+                "runtime_path": "users/user-a/accounts/101/execution/current/slots/slot_3",
+                "linkage_status": "connected",
+                "entitlement": {"runtime_allowed": True},
+                "key_id": "paper-key",
+                "secret": "paper-secret",
+            }
+        ),
+    )
+
+    context = resolver.resolve_runtime_account_for_slot(
+        account_id=101,
+        slot_number=3,
+        product_id="execution",
+    )
+
+    assert context.alpaca_account_id == 777
+    assert context.slot_number == 3
+    assert context.product_id == "execution"
+    assert context.runtime_path == "users/user-a/accounts/101/execution/current/slots/slot_3"
+    assert context.linkage_status == "connected"
+
+
 def test_resolver_rejects_missing_selector_fields() -> None:
     resolver = LaravelAlpacaAccountResolver(settings=_settings(), http_client=FakeHttpClient(payload={}))
 
@@ -138,6 +177,8 @@ def test_resolver_returns_scheduler_runtime_targets() -> None:
             environment="paper",
             account_label="Account 1",
             entitlement={"runtime_allowed": True},
+            product_id="prime_stocks",
+            runtime_path="users/user-a/accounts/101/prime_stocks/current/slots/slot_1",
         ),
         RuntimeAccountTarget(
             uid="user-b",
@@ -147,6 +188,31 @@ def test_resolver_returns_scheduler_runtime_targets() -> None:
             environment="paper",
             account_label="Account 2",
             entitlement={"runtime_allowed": True},
+            product_id="prime_stocks",
+            runtime_path="users/user-b/accounts/202/prime_stocks/current/slots/slot_2",
+        ),
+    ]
+
+
+def test_resolver_returns_execution_scheduler_runtime_targets() -> None:
+    resolver = LaravelAlpacaAccountResolver(
+        settings=_settings(),
+        http_client=ExecutionFanoutHttpClient(),
+    )
+
+    targets = resolver.list_runtime_targets(product_id="execution")
+
+    assert targets == [
+        RuntimeAccountTarget(
+            uid="user-c",
+            account_id=2,
+            alpaca_account_id=601,
+            slot_number=2,
+            environment="paper",
+            account_label="Execution Slot 2",
+            entitlement={"runtime_allowed": True, "product_id": "execution"},
+            product_id="execution",
+            runtime_path="users/user-3/accounts/2/execution/current/slots/slot_2",
         ),
     ]
 
@@ -168,10 +234,11 @@ class FakeHttpClient:
 
 class FanoutHttpClient:
     def request_json(self, *, url: str, headers: dict[str, str]) -> dict[str, object]:
-        assert url == "https://bismel1.test/runtime/prime-stocks/account-context?fanout=1"
+        assert url == "https://bismel1.test/runtime/prime-stocks/account-context?fanout=1&product=prime_stocks"
         assert headers["Authorization"] == "Bearer bridge-token"
         return {
             "count": 2,
+            "product_id": "prime_stocks",
             "targets": [
                 {
                     "uid": "user-a",
@@ -181,6 +248,8 @@ class FanoutHttpClient:
                     "environment": "paper",
                     "account_label": "Account 1",
                     "entitlement": {"runtime_allowed": True},
+                    "product_id": "prime_stocks",
+                    "runtime_path": "users/user-a/accounts/101/prime_stocks/current/slots/slot_1",
                 },
                 {
                     "uid": "user-b",
@@ -190,9 +259,46 @@ class FanoutHttpClient:
                     "environment": "paper",
                     "account_label": "Account 2",
                     "entitlement": {"runtime_allowed": True},
+                    "product_id": "prime_stocks",
+                    "runtime_path": "users/user-b/accounts/202/prime_stocks/current/slots/slot_2",
                 },
             ],
         }
+
+
+class ExecutionFanoutHttpClient:
+    def request_json(self, *, url: str, headers: dict[str, str]) -> dict[str, object]:
+        assert url == "https://bismel1.test/runtime/prime-stocks/account-context?fanout=1&product=execution"
+        assert headers["Authorization"] == "Bearer bridge-token"
+        return {
+            "count": 1,
+            "product_id": "execution",
+            "targets": [
+                {
+                    "uid": "user-c",
+                    "account_id": 2,
+                    "alpaca_account_id": 601,
+                    "slot_number": 2,
+                    "environment": "paper",
+                    "account_label": "Execution Slot 2",
+                    "entitlement": {"runtime_allowed": True, "product_id": "execution"},
+                    "product_id": "execution",
+                    "runtime_path": "users/user-3/accounts/2/execution/current/slots/slot_2",
+                }
+            ],
+        }
+
+
+class SlotHttpClient:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = payload
+
+    def request_json(self, *, url: str, headers: dict[str, str]) -> dict[str, object]:
+        assert "account_id=101" in url
+        assert "slot_number=3" in url
+        assert "product=execution" in url
+        assert headers["Authorization"].startswith("Bearer ")
+        return json.loads(json.dumps(self.payload))
 
 
 def _runtime_config(*, account_id: int | None = 101, alpaca_account_id: int | None = 501) -> PrimeStocksRuntimeConfigRecord:

@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 import logging
-from typing import Callable
+from typing import Any, Callable
 
 from app.brokers.alpaca_market_data import AlpacaMarketDataAdapter
 from app.brokers.alpaca_paper_trading import (
@@ -32,7 +32,7 @@ from app.products.stocks.bismel1.models import (
     PineSignalSnapshot,
     PrimeStocksStrategyResult,
 )
-from app.products.stocks.bismel1.strategy import run_prime_stocks_strategy
+from app.products.stocks.bismel1.strategy import _bool_at, run_prime_stocks_strategy
 from app.services.alpaca_account_resolver import (
     AlpacaAccountResolutionError,
     LaravelAlpacaAccountResolver,
@@ -54,6 +54,10 @@ from app.shared.config import AppConfig
 logger = logging.getLogger(__name__)
 
 ACTIVE_ORDER_STATUSES = {"accepted", "new", "partially_filled", "filled", "submitted"}
+
+
+def _is_active_order_status(order_status: str | None) -> bool:
+    return order_status in ACTIVE_ORDER_STATUSES
 
 
 @dataclass(frozen=True)
@@ -85,6 +89,8 @@ class PrimeStocksRuntimeResult:
     bars_processed_execution: int
     bars_processed_trend: int
     firestore_paths: dict[str, str]
+    strategy_reasoning: dict[str, Any] | None = None
+    signal_score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -125,6 +131,7 @@ class PrimeStocksRuntimeService:
         uid: str | None,
         account_id: int | None,
         alpaca_account_id: int | None,
+        slot_number: int | None = None,
         symbol: str | None = None,
     ) -> list[str]:
         if symbol is not None and symbol.strip():
@@ -137,16 +144,70 @@ class PrimeStocksRuntimeService:
             uid=uid,
             account_id=account_id,
             alpaca_account_id=alpaca_account_id,
+            slot_number=slot_number,
         )
+        fallback_runtime_config = self._hydrate_scoped_slot_context(fallback_runtime_config)
         runtime_config = self._runtime_store.load_runtime_config(fallback_runtime_config)
         resolved_runtime_config = _override_runtime_selection(
             runtime_config,
             uid=uid,
             account_id=account_id,
             alpaca_account_id=alpaca_account_id,
+            slot_number=slot_number,
         )
 
         return _resolve_schedulable_symbols(resolved_runtime_config)
+
+    def _hydrate_scoped_slot_context(
+        self,
+        runtime_config: PrimeStocksRuntimeConfigRecord,
+    ) -> PrimeStocksRuntimeConfigRecord:
+        if runtime_config.slot_number is not None:
+            return runtime_config
+        if runtime_config.account_id is None or runtime_config.alpaca_account_id is None:
+            return runtime_config
+
+        try:
+            account_context = self._account_resolver.resolve_runtime_account(runtime_config)
+        except AlpacaAccountResolutionError:
+            return runtime_config
+
+        return replace(
+            runtime_config,
+            uid=runtime_config.uid or account_context.uid,
+            account_id=runtime_config.account_id or account_context.account_id,
+            alpaca_account_id=runtime_config.alpaca_account_id or account_context.alpaca_account_id,
+            slot_number=account_context.slot_number,
+        )
+
+    def record_cycle_summary(
+        self,
+        *,
+        uid: str,
+        account_id: int,
+        alpaca_account_id: int | None,
+        slot_number: int | None = None,
+        run_id: str,
+        trigger_type: str,
+        trigger_source: str,
+        results: list[dict[str, object]],
+        target_count: int,
+        completed_count: int,
+    ) -> None:
+        self._runtime_store.write_runtime_cycle_summary(
+            uid=uid,
+            account_id=account_id,
+            alpaca_account_id=alpaca_account_id,
+            slot_number=slot_number,
+            run_id=run_id,
+            trigger_type=trigger_type,
+            trigger_source=trigger_source,
+            target_count=target_count,
+            completed_count=completed_count,
+            results=results,
+            service_revision=self._settings.cloud_run_revision,
+            service_name=self._settings.cloud_run_service_name,
+        )
 
     def _run_validation_ping(
         self,
@@ -253,29 +314,22 @@ class PrimeStocksRuntimeService:
                 Ai_execution_allowed=True,
                 Ai_block_new_entries=False,
                 Ai_block_adds=False,
-                Ai_blocked_reason="stale",
+                Ai_blocked_reason=None,
             )
         if not ai_decision.is_available:
-            return self._persist_validation_ping_result(
-                run_id=run_id,
-                runtime_config=runtime_config,
-                account_context=account_context,
-                execution_decision="validation_ping_ai_cache_unavailable",
-                skipped_reason="validation_ping_ai_cache_unavailable",
-                trigger_type=trigger_type,
-                trigger_source=trigger_source,
-                latest_signal_time=latest_signal_time,
-                bars_processed_execution=bars_processed_execution,
-                bars_processed_trend=bars_processed_trend,
-                ai_decision=ai_decision,
-                message="Prime Stocks validation ping blocked because cached AI data is unavailable.",
-                status="blocked",
+            ai_decision = replace(
+                ai_decision,
+                Ai_execution_allowed=True,
+                Ai_block_new_entries=False,
+                Ai_block_adds=False,
+                Ai_blocked_reason=None,
             )
 
         try:
             latest_execution = self._runtime_store.load_latest_execution_record(
                 uid=account_context.uid,
                 account_id=runtime_config.account_id,
+                slot_number=runtime_config.slot_number,
             )
         except PrimeStocksRuntimeStoreError as exc:
             return self._persist_validation_ping_result(
@@ -300,7 +354,7 @@ class PrimeStocksRuntimeService:
         execution_decision = "validation_ping_ok"
         skipped_reason = None
         status = "validation"
-        execution_key = _build_execution_key(candidate_action, latest_signal_time)
+        execution_key = _build_execution_key(candidate_action, latest_signal_time, symbol=runtime_config.symbol)
         if latest_execution.execution_key == execution_key:
             execution_decision = "validation_ping_duplicate"
             skipped_reason = "validation_ping_duplicate"
@@ -398,6 +452,7 @@ class PrimeStocksRuntimeService:
             firestore_paths=self._runtime_store.get_paths(
                 uid=runtime_config.uid,
                 account_id=runtime_config.account_id,
+                slot_number=runtime_config.slot_number,
             ).__dict__,
         )
 
@@ -508,6 +563,7 @@ class PrimeStocksRuntimeService:
                 firestore_paths=self._runtime_store.get_paths(
                     uid=runtime_config.uid,
                     account_id=runtime_config.account_id,
+                    slot_number=runtime_config.slot_number,
                 ).__dict__,
             )
 
@@ -541,6 +597,7 @@ class PrimeStocksRuntimeService:
             firestore_paths=self._runtime_store.get_paths(
                 uid=runtime_config.uid,
                 account_id=runtime_config.account_id,
+                slot_number=runtime_config.slot_number,
             ).__dict__,
         )
 
@@ -550,7 +607,9 @@ class PrimeStocksRuntimeService:
         uid: str | None = None,
         account_id: int | None = None,
         alpaca_account_id: int | None = None,
+        slot_number: int | None = None,
         allow_execution: bool | None = None,
+        preview_only: bool = False,
         trigger_type: str = "manual",
         trigger_source: str = "api",
         test_trigger: str | None = None,
@@ -563,7 +622,9 @@ class PrimeStocksRuntimeService:
             uid=uid,
             account_id=account_id,
             alpaca_account_id=alpaca_account_id,
+            slot_number=slot_number,
         )
+        fallback_runtime_config = self._hydrate_scoped_slot_context(fallback_runtime_config)
         try:
             runtime_config = self._runtime_store.load_runtime_config(fallback_runtime_config)
             resolved_runtime_config = _override_runtime_selection(
@@ -572,6 +633,7 @@ class PrimeStocksRuntimeService:
                 uid=uid,
                 account_id=account_id,
                 alpaca_account_id=alpaca_account_id,
+                slot_number=slot_number,
             )
             if _is_ping_short_circuit_request(
                 runtime_config=resolved_runtime_config,
@@ -582,6 +644,7 @@ class PrimeStocksRuntimeService:
                     self._runtime_store.load_heartbeat_record(
                         uid=resolved_runtime_config.uid,
                         account_id=resolved_runtime_config.account_id,
+                        slot_number=resolved_runtime_config.slot_number,
                     )
                 ):
                     self._runtime_store.write_runtime_heartbeat(
@@ -589,6 +652,7 @@ class PrimeStocksRuntimeService:
                         test_mode=True,
                         uid=resolved_runtime_config.uid,
                         account_id=resolved_runtime_config.account_id,
+                        slot_number=resolved_runtime_config.slot_number,
                     )
                 return _build_validation_ping_disabled_result(
                     run_id=run_id,
@@ -598,6 +662,7 @@ class PrimeStocksRuntimeService:
                     firestore_paths=self._runtime_store.get_paths(
                         uid=resolved_runtime_config.uid,
                         account_id=resolved_runtime_config.account_id,
+                        slot_number=resolved_runtime_config.slot_number,
                     ).__dict__,
                 )
             if _is_validation_ping_request(runtime_config=resolved_runtime_config, test_trigger=test_trigger):
@@ -697,11 +762,35 @@ class PrimeStocksRuntimeService:
                     f"{exc}"
                 ),
             )
+        selected_slot_number = resolved_runtime_config.slot_number or account_context.slot_number
+        if selected_slot_number != resolved_runtime_config.slot_number:
+            resolved_runtime_config = replace(resolved_runtime_config, slot_number=selected_slot_number)
+            runtime_config = self._runtime_store.load_runtime_config(resolved_runtime_config)
+            resolved_runtime_config = _override_runtime_selection(
+                runtime_config,
+                symbol=symbol,
+                uid=uid,
+                account_id=account_id,
+                alpaca_account_id=alpaca_account_id,
+                slot_number=selected_slot_number,
+            )
         try:
-            runtime_state = self._runtime_store.load_runtime_state_record(
+            account_runtime_state = self._runtime_store.load_runtime_state_record(
                 uid=account_context.uid,
                 account_id=resolved_runtime_config.account_id,
+                slot_number=resolved_runtime_config.slot_number,
             )
+            runtime_state = account_runtime_state
+            if resolved_runtime_config.uid is not None and resolved_runtime_config.account_id is not None:
+                symbol_runtime_state = self._runtime_store.load_runtime_symbol_state_record(
+                    uid=account_context.uid,
+                    account_id=resolved_runtime_config.account_id,
+                    slot_number=resolved_runtime_config.slot_number,
+                    symbol=resolved_runtime_config.symbol,
+                )
+                processed_bar_state = symbol_runtime_state or PrimeStocksRuntimeStateRecord()
+            else:
+                processed_bar_state = account_runtime_state
         except PrimeStocksRuntimeStoreError as exc:
             logger.exception(
                 "Prime Stocks runtime blocked after account resolution because Firestore state access failed "
@@ -719,12 +808,13 @@ class PrimeStocksRuntimeService:
                 firestore_paths=self._runtime_store.get_paths(
                     uid=resolved_runtime_config.uid,
                     account_id=resolved_runtime_config.account_id,
+                    slot_number=resolved_runtime_config.slot_number,
                 ).__dict__,
                 message=(
                     "Prime Stocks runtime blocked because Firestore runtime state could not be loaded after linked account "
                     f"resolution. {exc}"
                 ),
-            )
+                )
 
         entitlement_failure = _resolve_runtime_entitlement_failure(
             runtime_config=resolved_runtime_config,
@@ -807,6 +897,7 @@ class PrimeStocksRuntimeService:
                     firestore_paths=self._runtime_store.get_paths(
                         uid=resolved_runtime_config.uid,
                         account_id=resolved_runtime_config.account_id,
+                        slot_number=resolved_runtime_config.slot_number,
                     ).__dict__,
                 )
             return _build_blocked_runtime_result(
@@ -818,6 +909,7 @@ class PrimeStocksRuntimeService:
                 firestore_paths=self._runtime_store.get_paths(
                     uid=resolved_runtime_config.uid,
                     account_id=resolved_runtime_config.account_id,
+                    slot_number=resolved_runtime_config.slot_number,
                 ).__dict__,
                 message=runtime_message,
                 execution_decision=execution_decision,
@@ -939,6 +1031,7 @@ class PrimeStocksRuntimeService:
                     firestore_paths=self._runtime_store.get_paths(
                         uid=resolved_runtime_config.uid,
                         account_id=resolved_runtime_config.account_id,
+                        slot_number=resolved_runtime_config.slot_number,
                     ).__dict__,
                 )
             return _build_blocked_runtime_result(
@@ -950,6 +1043,7 @@ class PrimeStocksRuntimeService:
                 firestore_paths=self._runtime_store.get_paths(
                     uid=resolved_runtime_config.uid,
                     account_id=resolved_runtime_config.account_id,
+                    slot_number=resolved_runtime_config.slot_number,
                 ).__dict__,
                 message=runtime_message,
                 latest_signal_time=latest_signal_time,
@@ -980,6 +1074,7 @@ class PrimeStocksRuntimeService:
                 firestore_paths=self._runtime_store.get_paths(
                     uid=resolved_runtime_config.uid,
                     account_id=resolved_runtime_config.account_id,
+                    slot_number=resolved_runtime_config.slot_number,
                 ).__dict__,
                 message=(
                     "Prime Stocks runtime blocked because Firestore AI cache could not be loaded after market data "
@@ -999,7 +1094,11 @@ class PrimeStocksRuntimeService:
                 ),
                 config=_build_strategy_config(resolved_runtime_config),
                 ai_decision=ai_decision,
-                initial_state=runtime_state.to_strategy_state(),
+                initial_state=(
+                    processed_bar_state.to_strategy_state()
+                    if processed_bar_state is not runtime_state
+                    else runtime_state.to_strategy_state()
+                ),
             )
         except Exception as exc:
             logger.exception(
@@ -1027,6 +1126,19 @@ class PrimeStocksRuntimeService:
             runtime_config=resolved_runtime_config,
             settings=self._settings,
         )
+        signal_score = getattr(strategy_result, "signal_score", None)
+        logger.info(
+            "Prime Stocks trigger created symbol=%s candidate_action=%s signal_score=%s base_entry_signal=%s base_entry_trigger=%s strategy_status=%s strategy_message=%s latest_signal_time=%s run_id=%s",
+            resolved_runtime_config.symbol,
+            candidate_action,
+            signal_score,
+            getattr(strategy_result.latest_signal, "base_entry_signal", None),
+            getattr(strategy_result.latest_signal, "base_entry_trigger", None),
+            getattr(strategy_result, "status", None),
+            getattr(strategy_result, "message", None),
+            None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat(),
+            run_id,
+        )
         if candidate_action != original_candidate_action:
             logger.warning(
                 "Prime Stocks runtime force-candidate override applied original_candidate_action=%s forced_candidate_action=%s "
@@ -1037,8 +1149,19 @@ class PrimeStocksRuntimeService:
                 trigger_source,
                 run_id,
             )
-        if _has_no_new_closed_bar(runtime_state=runtime_state, latest_signal_time=latest_signal_time):
+        has_no_new_closed_bar = _has_no_new_closed_bar(
+            runtime_state=processed_bar_state,
+            latest_signal_time=latest_signal_time,
+        )
+        actionable_buy_candidate = candidate_action == "FirstLot" or candidate_action.startswith("MULTI-")
+        if has_no_new_closed_bar and not actionable_buy_candidate:
             skipped_decision = "skipped_no_new_bar"
+            strategy_reasoning = _build_strategy_reasoning(
+                strategy_result=strategy_result,
+                candidate_action=candidate_action,
+                execution_decision=skipped_decision,
+                ai_decision=ai_decision,
+            )
             runtime_message = _build_runtime_message(
                 execution_mode=_resolve_mode(
                     resolved_runtime_config,
@@ -1118,6 +1241,7 @@ class PrimeStocksRuntimeService:
                     skipped_reason="runtime_result_persistence_failed",
                     latest_signal_time=None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat(),
                     ai=serialize_ai_decision(ai_decision),
+                    strategy_reasoning=strategy_reasoning,
                     status="degraded",
                     message=(
                         "Prime Stocks runtime identified no new closed bar but Firestore result persistence failed. "
@@ -1128,6 +1252,7 @@ class PrimeStocksRuntimeService:
                     firestore_paths=self._runtime_store.get_paths(
                         uid=resolved_runtime_config.uid,
                         account_id=resolved_runtime_config.account_id,
+                        slot_number=resolved_runtime_config.slot_number,
                     ).__dict__,
                 )
             logger.info(
@@ -1165,6 +1290,7 @@ class PrimeStocksRuntimeService:
                 skipped_reason="no_new_closed_bar",
                 latest_signal_time=None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat(),
                 ai=serialize_ai_decision(ai_decision),
+                strategy_reasoning=strategy_reasoning,
                 status="no_op",
                 message=runtime_message,
                 bars_processed_execution=len(bar_set.execution_bars),
@@ -1172,7 +1298,16 @@ class PrimeStocksRuntimeService:
                 firestore_paths=self._runtime_store.get_paths(
                     uid=resolved_runtime_config.uid,
                     account_id=resolved_runtime_config.account_id,
+                    slot_number=resolved_runtime_config.slot_number,
                 ).__dict__,
+            )
+        if has_no_new_closed_bar and actionable_buy_candidate:
+            logger.info(
+                "Prime Stocks continuing past no_new_bar because candidate_action=%s is actionable trigger_type=%s trigger_source=%s run_id=%s",
+                candidate_action,
+                trigger_type,
+                trigger_source,
+                run_id,
             )
         ai_blocked_decision = _resolve_ai_blocked_candidate_action(candidate_action=candidate_action, ai_decision=ai_decision)
         if _ai_validation_bypass_enabled(resolved_runtime_config) and ai_blocked_decision is not None:
@@ -1197,6 +1332,12 @@ class PrimeStocksRuntimeService:
                     if strategy_result.ai_decision is None or strategy_result.ai_decision.Ai_blocked_reason is None
                     else strategy_result.ai_decision.Ai_blocked_reason
                 )
+            )
+            strategy_reasoning = _build_strategy_reasoning(
+                strategy_result=strategy_result,
+                candidate_action="AI_BLOCKED",
+                execution_decision=blocked_decision,
+                ai_decision=ai_decision,
             )
             runtime_message = _build_runtime_message(execution_mode="dry-run", execution_decision=blocked_decision)
             try:
@@ -1259,6 +1400,7 @@ class PrimeStocksRuntimeService:
                     skipped_reason="runtime_result_persistence_failed",
                     latest_signal_time=None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat(),
                     ai=serialize_ai_decision(ai_decision),
+                    strategy_reasoning=strategy_reasoning,
                     status="degraded",
                     message=(
                         "Prime Stocks runtime completed AI blocking but Firestore result persistence failed. "
@@ -1269,6 +1411,7 @@ class PrimeStocksRuntimeService:
                     firestore_paths=self._runtime_store.get_paths(
                         uid=resolved_runtime_config.uid,
                         account_id=resolved_runtime_config.account_id,
+                        slot_number=resolved_runtime_config.slot_number,
                     ).__dict__,
                 )
             return PrimeStocksRuntimeResult(
@@ -1294,6 +1437,7 @@ class PrimeStocksRuntimeService:
                 skipped_reason=blocked_decision,
                 latest_signal_time=None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat(),
                 ai=serialize_ai_decision(ai_decision),
+                strategy_reasoning=strategy_reasoning,
                 status="blocked",
                 message=runtime_message,
                 bars_processed_execution=len(bar_set.execution_bars),
@@ -1301,12 +1445,14 @@ class PrimeStocksRuntimeService:
                 firestore_paths=self._runtime_store.get_paths(
                     uid=resolved_runtime_config.uid,
                     account_id=resolved_runtime_config.account_id,
+                    slot_number=resolved_runtime_config.slot_number,
                 ).__dict__,
             )
         try:
             latest_execution = self._runtime_store.load_latest_execution_record(
                 uid=account_context.uid,
                 account_id=resolved_runtime_config.account_id,
+                slot_number=resolved_runtime_config.slot_number,
             )
         except PrimeStocksRuntimeStoreError as exc:
             logger.exception(
@@ -1325,6 +1471,7 @@ class PrimeStocksRuntimeService:
                 firestore_paths=self._runtime_store.get_paths(
                     uid=resolved_runtime_config.uid,
                     account_id=resolved_runtime_config.account_id,
+                    slot_number=resolved_runtime_config.slot_number,
                 ).__dict__,
                 message=(
                     "Prime Stocks runtime blocked because Firestore execution state could not be loaded after strategy "
@@ -1356,6 +1503,7 @@ class PrimeStocksRuntimeService:
                 latest_signal_time=latest_signal_time,
                 latest_execution=latest_execution,
                 allow_execution=allow_execution,
+                preview_only=preview_only,
             )
         except Exception as exc:
             logger.exception(
@@ -1462,6 +1610,13 @@ class PrimeStocksRuntimeService:
                 skipped_reason="runtime_result_persistence_failed",
                 latest_signal_time=None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat(),
                 ai=serialize_ai_decision(ai_decision),
+                strategy_reasoning=_build_strategy_reasoning(
+                    strategy_result=strategy_result,
+                    candidate_action=candidate_action,
+                    execution_decision=execution_decision,
+                    ai_decision=ai_decision,
+                ),
+                signal_score=signal_score,
                 status="degraded",
                 message=(
                     "Prime Stocks runtime reached execution but Firestore result persistence failed. "
@@ -1472,6 +1627,7 @@ class PrimeStocksRuntimeService:
                 firestore_paths=self._runtime_store.get_paths(
                     uid=resolved_runtime_config.uid,
                     account_id=resolved_runtime_config.account_id,
+                    slot_number=resolved_runtime_config.slot_number,
                 ).__dict__,
             )
         result = PrimeStocksRuntimeResult(
@@ -1502,6 +1658,13 @@ class PrimeStocksRuntimeService:
             skipped_reason=skipped_reason if execution_result is None else execution_result.skipped_reason,
             latest_signal_time=None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat(),
             ai=serialize_ai_decision(ai_decision),
+            strategy_reasoning=_build_strategy_reasoning(
+                strategy_result=strategy_result,
+                candidate_action=candidate_action,
+                execution_decision=execution_decision,
+                ai_decision=ai_decision,
+            ),
+            signal_score=signal_score,
             status=strategy_result.status,
             message=runtime_message,
             bars_processed_execution=len(bar_set.execution_bars),
@@ -1509,6 +1672,7 @@ class PrimeStocksRuntimeService:
             firestore_paths=self._runtime_store.get_paths(
                 uid=resolved_runtime_config.uid,
                 account_id=resolved_runtime_config.account_id,
+                slot_number=resolved_runtime_config.slot_number,
             ).__dict__,
         )
         logger.info(
@@ -1534,13 +1698,31 @@ class PrimeStocksRuntimeService:
         latest_signal_time: datetime | None,
         latest_execution: PrimeStocksLatestExecutionRecord,
         allow_execution: bool | None,
+        preview_only: bool = False,
     ) -> tuple[AlpacaPaperExecutionResult | None, str, str | None, bool, int, str | None, str | None, float | None]:
+        logger.info(
+            "Prime Stocks executor called symbol=%s candidate_action=%s execution_mode=%s latest_signal_time=%s",
+            runtime_config.symbol,
+            candidate_action,
+            _resolve_mode(
+                runtime_config,
+                allow_execution=allow_execution,
+                account_context=account_context,
+                settings=self._settings,
+            ),
+            None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat(),
+        )
         execution_mode = _resolve_mode(
             runtime_config,
             allow_execution=allow_execution,
             account_context=account_context,
             settings=self._settings,
         )
+        if preview_only and (
+            candidate_action in {"FirstLot", "EXIT_ATR", "EXIT_REGIME"}
+            or candidate_action.startswith("MULTI-")
+        ):
+            return None, "preview_only", "preview_only", False, 0, None, None, None
         if execution_mode == "dry-run":
             return None, "dry_run_only", "paper_execution_disabled", False, 0, None, None, None
         if candidate_action not in {"FirstLot", "EXIT_ATR", "EXIT_REGIME"} and not candidate_action.startswith("MULTI-"):
@@ -1552,7 +1734,7 @@ class PrimeStocksRuntimeService:
         if execution_mode == "live" and not runtime_config.live_execution_enabled:
             return None, "live_execution_disabled", "live_execution_disabled", False, 0, None, None, None
 
-        execution_key = _build_execution_key(candidate_action, latest_signal_time)
+        execution_key = _build_execution_key(candidate_action, latest_signal_time, symbol=runtime_config.symbol)
         if latest_execution.execution_key == execution_key and latest_execution.order_status in ACTIVE_ORDER_STATUSES:
             return None, "skipped_duplicate", "duplicate_candidate_action", False, 0, None, None, None
         latest_signal_time_value = (
@@ -1582,6 +1764,24 @@ class PrimeStocksRuntimeService:
 
         current_total_exposure_pct = _resolve_total_exposure_pct(broker_state=broker_state)
 
+        duplicate_failure = self._resolve_first_lot_duplicate_failure(
+            runtime_config=runtime_config,
+            latest_signal_time=latest_signal_time,
+            latest_execution=latest_execution,
+            account_context=account_context,
+        )
+        if duplicate_failure is not None:
+            return (
+                None,
+                duplicate_failure.execution_decision,
+                duplicate_failure.skipped_reason,
+                duplicate_failure.execution_allowed,
+                duplicate_failure.retry_count,
+                duplicate_failure.broker_error_code,
+                duplicate_failure.broker_error_message,
+                current_total_exposure_pct,
+            )
+
         guard_failure = self._evaluate_submission_guards(
             runtime_config=runtime_config,
             strategy_config=strategy_config,
@@ -1609,9 +1809,17 @@ class PrimeStocksRuntimeService:
             candidate_action=candidate_action,
             runtime_config=runtime_config,
             strategy_config=strategy_config,
+            account_equity=broker_state.account.equity,
         )
         if candidate_action == "FirstLot":
             try:
+                logger.info(
+                    "Prime Stocks broker submit attempted symbol=%s candidate_action=%s order_type=first_lot_buy notional=%s client_order_id=%s",
+                    runtime_config.symbol,
+                    candidate_action,
+                    requested_notional or runtime_config.first_lot_notional,
+                    client_order_id,
+                )
                 result, submit_retry_count = self._call_broker_with_retry(
                     operation=lambda: self._paper_trading.submit_first_lot_buy(
                         symbol=runtime_config.symbol,
@@ -1629,6 +1837,9 @@ class PrimeStocksRuntimeService:
                 return None, exc.code, exc.code, False, state_retry_count + int(getattr(exc, "retry_count", 0)), exc.code, exc.message, current_total_exposure_pct
             total_retry_count = state_retry_count + submit_retry_count
             result = replace(result, retry_count=total_retry_count)
+            invalid_execution_result = _validate_successful_execution_result(result=result, candidate_action=candidate_action)
+            if invalid_execution_result is not None:
+                return None, invalid_execution_result.code, invalid_execution_result.code, False, total_retry_count, invalid_execution_result.code, invalid_execution_result.message, current_total_exposure_pct
             return result, "submitted_buy", None, True, total_retry_count, None, None, _resolve_total_exposure_pct(
                 broker_state=broker_state,
                 additional_notional=result.notional,
@@ -1636,6 +1847,14 @@ class PrimeStocksRuntimeService:
         if candidate_action.startswith("MULTI-"):
             add_tier = _parse_add_tier(candidate_action)
             try:
+                logger.info(
+                    "Prime Stocks broker submit attempted symbol=%s candidate_action=%s order_type=multi_buy add_tier=%s notional=%s client_order_id=%s",
+                    runtime_config.symbol,
+                    candidate_action,
+                    add_tier,
+                    requested_notional or 0.0,
+                    client_order_id,
+                )
                 result, submit_retry_count = self._call_broker_with_retry(
                     operation=lambda: self._paper_trading.submit_multi_buy(
                         symbol=runtime_config.symbol,
@@ -1655,11 +1874,20 @@ class PrimeStocksRuntimeService:
                 return None, exc.code, exc.code, False, state_retry_count + int(getattr(exc, "retry_count", 0)), exc.code, exc.message, current_total_exposure_pct
             total_retry_count = state_retry_count + submit_retry_count
             result = replace(result, retry_count=total_retry_count)
+            invalid_execution_result = _validate_successful_execution_result(result=result, candidate_action=candidate_action)
+            if invalid_execution_result is not None:
+                return None, invalid_execution_result.code, invalid_execution_result.code, False, total_retry_count, invalid_execution_result.code, invalid_execution_result.message, current_total_exposure_pct
             return result, "submitted_buy", None, True, total_retry_count, None, None, _resolve_total_exposure_pct(
                 broker_state=broker_state,
                 additional_notional=result.notional,
             )
         try:
+            logger.info(
+                "Prime Stocks broker submit attempted symbol=%s candidate_action=%s order_type=close_position client_order_id=%s",
+                runtime_config.symbol,
+                candidate_action,
+                client_order_id,
+            )
             result, submit_retry_count = self._call_broker_with_retry(
                 operation=lambda: self._paper_trading.close_position(
                     symbol=runtime_config.symbol,
@@ -1677,6 +1905,19 @@ class PrimeStocksRuntimeService:
             return None, exc.code, exc.code, False, state_retry_count + int(getattr(exc, "retry_count", 0)), exc.code, exc.message, current_total_exposure_pct
         total_retry_count = state_retry_count + submit_retry_count
         result = replace(result, retry_count=total_retry_count)
+        invalid_execution_result = _validate_successful_execution_result(result=result, candidate_action=candidate_action)
+        if invalid_execution_result is not None:
+            return None, invalid_execution_result.code, invalid_execution_result.code, False, total_retry_count, invalid_execution_result.code, invalid_execution_result.message, current_total_exposure_pct
+        self._maybe_record_closed_trade_performance(
+            runtime_config=runtime_config,
+            account_context=account_context,
+            strategy_result=strategy_result,
+            broker_state=broker_state,
+            execution_result=result,
+            candidate_action=candidate_action,
+            latest_signal_time=latest_signal_time,
+            run_id=run_id,
+        )
         return result, "submitted_exit", None, True, total_retry_count, None, None, current_total_exposure_pct
 
     def _call_broker_with_retry(
@@ -1703,6 +1944,155 @@ class PrimeStocksRuntimeService:
                     exc.code,
                 )
 
+    def _maybe_record_closed_trade_performance(
+        self,
+        *,
+        runtime_config: PrimeStocksRuntimeConfigRecord,
+        account_context: ResolvedAlpacaAccountContext,
+        strategy_result: PrimeStocksStrategyResult,
+        broker_state: AlpacaPaperSubmissionState,
+        execution_result: AlpacaPaperExecutionResult,
+        candidate_action: str,
+        latest_signal_time: datetime | None,
+        run_id: str,
+    ) -> None:
+        if candidate_action not in {"EXIT_ATR", "EXIT_REGIME"}:
+            return
+
+        if execution_result is None or not execution_result.submitted:
+            return
+
+        if str(execution_result.order_status or "").strip().lower() not in {"accepted", "new", "partially_filled", "filled", "submitted"}:
+            return
+
+        exit_price = _extract_order_fill_price(execution_result.raw_response)
+        if exit_price is None or exit_price <= 0:
+            logger.info(
+                "Prime Stocks performance tracking skipped because no filled exit price was available symbol=%s order_status=%s",
+                runtime_config.symbol,
+                execution_result.order_status,
+            )
+            return
+
+        position = broker_state.position
+        if position is None or position.qty <= 0:
+            logger.info(
+                "Prime Stocks performance tracking skipped because no broker position was available symbol=%s",
+                runtime_config.symbol,
+            )
+            return
+
+        latest_bar = strategy_result.latest_bar
+        state_before = None if latest_bar is None else latest_bar.state_before
+        entry_price = _maybe_float(getattr(state_before, "position_avg_price", None))
+        if entry_price is None or entry_price <= 0:
+            entry_price = _maybe_float(getattr(strategy_result.final_state, "position_avg_price", None))
+        if entry_price is None or entry_price <= 0:
+            logger.info(
+                "Prime Stocks performance tracking skipped because the entry price could not be derived symbol=%s",
+                runtime_config.symbol,
+            )
+            return
+
+        qty = abs(float(position.qty))
+        entry_notional = qty * float(entry_price)
+        exit_notional = qty * float(exit_price)
+        pnl_dollars = (float(exit_price) - float(entry_price)) * qty
+        pnl_percent = (pnl_dollars / entry_notional * 100.0) if entry_notional > 0 else 0.0
+        if position.side is not None and str(position.side).strip().lower() == "short":
+            pnl_dollars *= -1.0
+            pnl_percent *= -1.0
+
+        trade_id = (
+            execution_result.order_id
+            or execution_result.client_order_id
+            or _build_execution_key(candidate_action, latest_signal_time, symbol=runtime_config.symbol)
+        )
+
+        trade_record = {
+            "uid": account_context.uid,
+            "account_id": runtime_config.account_id,
+            "alpaca_account_id": runtime_config.alpaca_account_id,
+            "product_key": runtime_config.product_key,
+            "strategy_key": runtime_config.strategy_key,
+            "symbol": runtime_config.symbol.upper(),
+            "trade_id": trade_id,
+            "direction": "long" if str(position.side or "long").strip().lower() != "short" else "short",
+            "side": "sell",
+            "qty": qty,
+            "entry_price": float(entry_price),
+            "exit_price": float(exit_price),
+            "entry_notional": round(entry_notional, 2),
+            "exit_notional": round(exit_notional, 2),
+            "realized_pnl_dollars": round(pnl_dollars, 2),
+            "realized_pnl_percent": round(pnl_percent, 2),
+            "trade_outcome": "win" if pnl_dollars > 0 else "loss" if pnl_dollars < 0 else "breakeven",
+            "entry_order_id": None,
+            "exit_order_id": execution_result.order_id,
+            "entry_client_order_id": None,
+            "exit_client_order_id": execution_result.client_order_id,
+            "entry_filled_at": None,
+            "exit_filled_at": _extract_order_time(execution_result.raw_response, "filled_at"),
+            "run_id": run_id,
+            "latest_signal_time": None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat(),
+            "candidate_action": candidate_action,
+            "execution_decision": "submitted_exit",
+            "execution_mode": "paper" if runtime_config.paper_execution_enabled else "dry-run",
+            "execution_key": execution_result.client_order_id,
+            "broker_environment": account_context.environment,
+            "account_equity": _maybe_float(getattr(broker_state.account, "equity", None)),
+            "raw_entry_position": {
+                "symbol": position.symbol,
+                "qty": position.qty,
+                "market_value": position.market_value,
+                "avg_entry_price": entry_price,
+                "asset_symbol": position.symbol,
+            },
+            "raw_exit_order": execution_result.raw_response or {},
+            "raw_broker_state": {
+                "account": {
+                    "equity": broker_state.account.equity,
+                    "buying_power": broker_state.account.buying_power,
+                    "total_exposure": broker_state.account.total_exposure,
+                    "open_positions_count": broker_state.account.open_positions_count,
+                },
+                "position": None
+                if broker_state.position is None
+                else {
+                    "symbol": broker_state.position.symbol,
+                    "qty": broker_state.position.qty,
+                    "market_value": broker_state.position.market_value,
+                },
+            },
+            "strategy_reasoning": _build_strategy_reasoning_payload(
+                strategy_result=strategy_result,
+                candidate_action=candidate_action,
+                execution_decision="submitted_exit",
+                ai_decision=strategy_result.ai_decision,
+            ),
+        }
+
+        try:
+            self._runtime_store.write_prime_stocks_trade_performance(
+                uid=account_context.uid,
+                account_id=runtime_config.account_id,
+                trade_id=str(trade_id),
+                trade_payload=trade_record,
+            )
+            logger.info(
+                "Prime Stocks trade performance recorded symbol=%s trade_id=%s realized_pnl_dollars=%s",
+                runtime_config.symbol,
+                trade_id,
+                trade_record["realized_pnl_dollars"],
+            )
+        except Exception as exc:  # pragma: no cover - performance tracking must not block execution flow
+            logger.warning(
+                "Prime Stocks trade performance write failed symbol=%s trade_id=%s error=%s",
+                runtime_config.symbol,
+                trade_id,
+                exc,
+            )
+
     def _evaluate_submission_guards(
         self,
         *,
@@ -1715,8 +2105,6 @@ class PrimeStocksRuntimeService:
         latest_execution: PrimeStocksLatestExecutionRecord,
         broker_state: AlpacaPaperSubmissionState,
     ) -> PrimeStocksExecutionFailure | None:
-        del latest_signal_time
-        del latest_execution
         if not broker_state.asset.tradable:
             return PrimeStocksExecutionFailure(
                 execution_decision="broker_asset_not_tradable",
@@ -1729,7 +2117,6 @@ class PrimeStocksRuntimeService:
         state_final = strategy_result.final_state
         has_runtime_position = bool(
             (latest_bar is not None and latest_bar.in_position_before)
-            or state_final.position_size > 0
             or (state_before is not None and state_before.position_size > 0)
         )
         has_broker_position = bool(broker_state.position is not None and abs(broker_state.position.qty) > 0)
@@ -1737,35 +2124,23 @@ class PrimeStocksRuntimeService:
             candidate_action=candidate_action,
             runtime_config=runtime_config,
             strategy_config=strategy_config,
+            account_equity=broker_state.account.equity,
         )
+        budget_failure = _resolve_prime_budget_failure(
+            runtime_config=runtime_config,
+            candidate_action=candidate_action,
+            broker_state=broker_state,
+            requested_notional=requested_notional,
+        )
+        if budget_failure is not None:
+            return budget_failure
         if candidate_action in {"FirstLot"} or candidate_action.startswith("MULTI-"):
             if _is_symbol_paused(runtime_config=runtime_config):
                 return PrimeStocksExecutionFailure("symbol_paused", "symbol_paused")
-            kill_switch_failure = _resolve_kill_switch_failure(
-                runtime_config=runtime_config,
-                candidate_action=candidate_action,
-            )
-            if kill_switch_failure is not None:
-                return kill_switch_failure
             if requested_notional is None or requested_notional <= 0:
                 return PrimeStocksExecutionFailure("invalid_order_notional", "invalid_order_notional")
-            if requested_notional > runtime_config.max_notional_per_order:
-                return PrimeStocksExecutionFailure("max_notional_per_order_exceeded", "max_notional_per_order_exceeded")
             if broker_state.account.equity is None or broker_state.account.equity <= 0:
                 return PrimeStocksExecutionFailure("broker_equity_unavailable", "broker_equity_unavailable")
-            per_symbol_entry_notional = broker_state.account.equity * (runtime_config.per_symbol_entry_pct / 100.0)
-            if requested_notional > per_symbol_entry_notional + 1e-9:
-                return PrimeStocksExecutionFailure(
-                    "per_symbol_entry_cap_exceeded",
-                    "per_symbol_entry_cap_exceeded",
-                )
-            current_symbol_notional = abs(broker_state.position.market_value or 0.0) if broker_state.position is not None else 0.0
-            if current_symbol_notional + requested_notional > runtime_config.max_total_notional_per_symbol:
-                return PrimeStocksExecutionFailure(
-                    "max_total_notional_per_symbol_exceeded",
-                    "max_total_notional_per_symbol_exceeded",
-                )
-            total_exposure = 0.0 if broker_state.account.total_exposure is None else broker_state.account.total_exposure
             if broker_state.account.buying_power is not None and broker_state.account.buying_power < requested_notional:
                 return PrimeStocksExecutionFailure(
                     "broker_insufficient_buying_power",
@@ -1773,31 +2148,21 @@ class PrimeStocksRuntimeService:
                     broker_error_code="broker_insufficient_buying_power",
                     broker_error_message="Alpaca buying power is below the requested Prime Stocks notional.",
                 )
-        if runtime_config.daily_order_cap is not None:
-            day_start = self._now_provider().astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-            day_end = day_start + timedelta(days=1)
-            submitted_today = self._runtime_store.count_submitted_orders_for_day(
-                day_start=day_start,
-                day_end=day_end,
-                uid=account_context.uid,
-                account_id=runtime_config.account_id,
-            )
-            if submitted_today >= runtime_config.daily_order_cap:
-                return PrimeStocksExecutionFailure("daily_order_cap_exceeded", "daily_order_cap_exceeded")
         if candidate_action == "FirstLot":
-            if has_runtime_position or has_broker_position:
-                return PrimeStocksExecutionFailure("base_position_exists", "base_position_exists")
-            total_entry_exposure_notional = broker_state.account.equity * (
-                runtime_config.total_entry_exposure_cap_pct / 100.0
+            duplicate_failure = self._resolve_first_lot_duplicate_failure(
+                runtime_config=runtime_config,
+                latest_signal_time=latest_signal_time,
+                latest_execution=latest_execution,
+                account_context=account_context,
             )
-            total_exposure = 0.0 if broker_state.account.total_exposure is None else broker_state.account.total_exposure
-            if total_exposure + requested_notional > total_entry_exposure_notional + 1e-9:
-                return PrimeStocksExecutionFailure(
-                    "total_entry_exposure_cap_exceeded",
-                    "total_entry_exposure_cap_exceeded",
-                )
-            if runtime_config.max_open_positions is not None and broker_state.account.open_positions_count >= runtime_config.max_open_positions:
-                return PrimeStocksExecutionFailure("max_open_positions_exceeded", "max_open_positions_exceeded")
+            if duplicate_failure is not None:
+                return duplicate_failure
+        if candidate_action == "FirstLot":
+            # Trust the live broker position for fresh FirstLot eligibility.
+            # Stale runtime position snapshots can lag behind Firestore repairs or broker syncs,
+            # which would otherwise suppress the first real trade even when Alpaca is flat.
+            if has_broker_position:
+                return PrimeStocksExecutionFailure("base_position_exists", "base_position_exists")
             return None
         if candidate_action.startswith("MULTI-"):
             add_tier = _parse_add_tier(candidate_action)
@@ -1809,18 +2174,97 @@ class PrimeStocksRuntimeService:
                 return PrimeStocksExecutionFailure("max_add_count_exceeded", "max_add_count_exceeded")
             if state_before is not None and add_tier != (state_before.add_count + 1):
                 return PrimeStocksExecutionFailure("invalid_add_tier", "invalid_add_tier")
-            total_add_exposure_notional = broker_state.account.equity * (
-                runtime_config.total_add_exposure_cap_pct / 100.0
-            )
-            total_exposure = 0.0 if broker_state.account.total_exposure is None else broker_state.account.total_exposure
-            if total_exposure + requested_notional > total_add_exposure_notional + 1e-9:
-                return PrimeStocksExecutionFailure(
-                    "total_add_exposure_cap_exceeded",
-                    "total_add_exposure_cap_exceeded",
-                )
             return None
         if candidate_action in {"EXIT_ATR", "EXIT_REGIME"} and not (has_runtime_position or has_broker_position):
             return PrimeStocksExecutionFailure("exit_requires_open_position", "exit_requires_open_position")
+        return None
+
+    def _resolve_first_lot_duplicate_failure(
+        self,
+        *,
+        runtime_config: PrimeStocksRuntimeConfigRecord,
+        latest_signal_time: datetime | None,
+        latest_execution: PrimeStocksLatestExecutionRecord,
+        account_context: ResolvedAlpacaAccountContext,
+    ) -> PrimeStocksExecutionFailure | None:
+        execution_key = _build_execution_key("FirstLot", latest_signal_time, symbol=runtime_config.symbol)
+        latest_signal_time_value = None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat()
+
+        if latest_execution.execution_key == execution_key and latest_execution.order_status in ACTIVE_ORDER_STATUSES:
+            logger.info(
+                "Prime Stocks duplicate suppressed via latest execution key symbol=%s execution_key=%s",
+                runtime_config.symbol,
+                execution_key,
+            )
+            return PrimeStocksExecutionFailure("skipped_duplicate", "duplicate_firstlot_order")
+
+        try:
+            symbol_state = self._runtime_store.load_runtime_symbol_state_record(
+                uid=account_context.uid,
+                account_id=runtime_config.account_id,
+                slot_number=runtime_config.slot_number,
+                symbol=runtime_config.symbol,
+            )
+        except PrimeStocksRuntimeStoreError as exc:
+            logger.warning(
+                "Prime Stocks duplicate guard could not load symbol state symbol=%s execution_key=%s error=%s",
+                runtime_config.symbol,
+                execution_key,
+                exc,
+            )
+            symbol_state = None
+        if symbol_state is not None:
+            if symbol_state.execution_key == execution_key and symbol_state.latest_execution_decision == "submitted_buy":
+                logger.info(
+                    "Prime Stocks duplicate suppressed via symbol state execution key symbol=%s execution_key=%s",
+                    runtime_config.symbol,
+                    execution_key,
+                )
+                return PrimeStocksExecutionFailure("skipped_duplicate", "duplicate_firstlot_order")
+            if (
+                symbol_state.last_processed_bar_time is not None
+                and latest_signal_time_value is not None
+                and symbol_state.last_processed_bar_time == latest_signal_time_value
+                and symbol_state.latest_candidate_action == "FirstLot"
+                and symbol_state.latest_execution_decision == "submitted_buy"
+            ):
+                logger.info(
+                    "Prime Stocks duplicate suppressed via symbol state last processed bar symbol=%s bar_time=%s",
+                    runtime_config.symbol,
+                    latest_signal_time_value,
+                )
+                return PrimeStocksExecutionFailure("skipped_duplicate", "duplicate_firstlot_order")
+
+        try:
+            recent_orders = self._paper_trading.list_recent_orders(credential_context=account_context)
+        except Exception as exc:  # pragma: no cover - network/runtime safety only
+            logger.warning(
+                "Prime Stocks duplicate guard could not load recent Alpaca orders symbol=%s error=%s",
+                runtime_config.symbol,
+                exc,
+            )
+            return None
+
+        if latest_signal_time is None:
+            return None
+        for order in recent_orders:
+            if str(order.get("symbol", "")).strip().upper() != runtime_config.symbol.upper():
+                continue
+            if str(order.get("side", "")).strip().lower() != "buy":
+                continue
+            if str(order.get("type", "")).strip().lower() not in {"market", "limit", "stop", "stop_limit"}:
+                continue
+            created_at_raw = order.get("created_at")
+            created_at = _parse_iso_utc(str(created_at_raw)) if created_at_raw is not None else None
+            if created_at is not None and created_at >= latest_signal_time.astimezone(UTC):
+                logger.info(
+                    "Prime Stocks duplicate suppressed via Alpaca recent order symbol=%s order_id=%s created_at=%s",
+                    runtime_config.symbol,
+                    order.get("id"),
+                    created_at.astimezone(UTC).isoformat(),
+                )
+                return PrimeStocksExecutionFailure("skipped_duplicate", "duplicate_firstlot_order")
+
         return None
 
 
@@ -1871,6 +2315,7 @@ def _build_runtime_state_record(
                 candidate_action=candidate_action,
                 runtime_config=runtime_config,
                 strategy_config=_build_strategy_config(runtime_config),
+                account_equity=broker_state.account.equity,
             ) or runtime_config.first_lot_notional
         )
         projected_qty = projected_notional / projected_price if projected_price > 0 else 0.0
@@ -1930,7 +2375,7 @@ def _build_runtime_state_record(
         last_exit_time=last_exit_time,
         last_action=candidate_action,
         candidate_action=candidate_action,
-        execution_key=_build_execution_key(candidate_action, latest_signal_time),
+        execution_key=_build_execution_key(candidate_action, latest_signal_time, symbol=runtime_config.symbol),
         last_processed_bar_time=(
             latest_signal_time_iso if advance_processed_bar and latest_signal_time_iso is not None else runtime_state.last_processed_bar_time
         ),
@@ -2092,6 +2537,7 @@ def _override_symbol(
     uid: str | None = None,
     account_id: int | None = None,
     alpaca_account_id: int | None = None,
+    slot_number: int | None = None,
 ) -> PrimeStocksRuntimeConfigRecord:
     return _override_runtime_selection(
         runtime_config,
@@ -2099,6 +2545,7 @@ def _override_symbol(
         uid=uid,
         account_id=account_id,
         alpaca_account_id=alpaca_account_id,
+        slot_number=slot_number,
     )
 
 
@@ -2109,6 +2556,7 @@ def _override_runtime_selection(
     uid: str | None = None,
     account_id: int | None = None,
     alpaca_account_id: int | None = None,
+    slot_number: int | None = None,
 ) -> PrimeStocksRuntimeConfigRecord:
     if symbol is None or not symbol.strip():
         resolved_symbol = runtime_config.symbol
@@ -2118,12 +2566,14 @@ def _override_runtime_selection(
     resolved_uid = runtime_config.uid if uid is None else uid.strip()
     resolved_account_id = runtime_config.account_id if account_id is None else account_id
     resolved_alpaca_account_id = runtime_config.alpaca_account_id if alpaca_account_id is None else alpaca_account_id
+    resolved_slot_number = runtime_config.slot_number if slot_number is None else max(1, slot_number)
 
     if (
         resolved_symbol == runtime_config.symbol
         and resolved_uid == runtime_config.uid
         and resolved_account_id == runtime_config.account_id
         and resolved_alpaca_account_id == runtime_config.alpaca_account_id
+        and resolved_slot_number == runtime_config.slot_number
     ):
         return runtime_config
 
@@ -2133,6 +2583,7 @@ def _override_runtime_selection(
         uid=resolved_uid,
         account_id=resolved_account_id,
         alpaca_account_id=resolved_alpaca_account_id,
+        slot_number=resolved_slot_number,
     )
 
 
@@ -2168,6 +2619,9 @@ def _resolve_schedulable_symbols(runtime_config: PrimeStocksRuntimeConfigRecord)
             if configured_modes.get(symbol, "active") not in {"paused", "standby"}
         ]
 
+    if runtime_config.slot_number is not None:
+        return []
+
     runtime_symbol = _normalize_configured_symbol(runtime_config.symbol)
     return [] if runtime_symbol is None else [runtime_symbol]
 
@@ -2184,8 +2638,7 @@ def _resolve_primary_runtime_symbol(
     if schedulable_symbols:
         return schedulable_symbols[0]
 
-    has_managed_symbols = bool(runtime_config.symbol_states) or bool(runtime_config.selected_symbols)
-    if has_managed_symbols:
+    if runtime_config.slot_number is not None:
         return None
 
     return _normalize_configured_symbol(runtime_config.symbol)
@@ -2235,6 +2688,143 @@ def _resolve_ai_blocked_candidate_action(*, candidate_action: str, ai_decision) 
     if candidate_action.startswith("MULTI-") and ai_decision.Ai_block_adds:
         return ai_decision.Ai_blocked_reason or "ai_blocked"
     return None
+
+
+def _build_strategy_reasoning(
+    *,
+    strategy_result: PrimeStocksStrategyResult,
+    candidate_action: str,
+    execution_decision: str,
+    ai_decision,
+) -> dict[str, object]:
+    latest_bar = strategy_result.latest_bar
+    latest_signal = strategy_result.latest_signal
+    series = strategy_result.series
+    latest_index = latest_bar.bar_index if latest_bar is not None else max(0, len(series.trend_ok) - 1)
+    trend_ok = _bool_at(series.trend_ok, latest_index)
+    trend_base = _bool_at(series.trend_base_htf, latest_index)
+    trend_slope = _bool_at(series.htf_ema_slow_slope_up, latest_index)
+    regime_fail = _bool_at(series.regime_fail, latest_index)
+    pullback = _bool_at(series.in_pullback_zone, latest_index)
+    setup_ready = _bool_at(series.setup_ready, latest_index)
+    setup_age_bars = (
+        series.setup_age_bars[latest_index]
+        if latest_index < len(series.setup_age_bars)
+        else None
+    )
+    setup_invalidated = _bool_at(series.setup_invalidated, latest_index)
+    reversal_context = _bool_at(series.reversal_context, latest_index)
+    continuation_context = _bool_at(series.continuation_context, latest_index)
+    confirmation = latest_signal.base_entry_trigger or latest_signal.add_trigger
+    trigger_active = latest_signal.base_entry_trigger or latest_signal.add_trigger or latest_signal.hit_atr_trail or latest_signal.hit_regime
+    setup_valid = bool(latest_signal.base_entry_signal)
+    strategy_mode = str(getattr(strategy_result, "strategy_mode", "scalper")).strip().lower()
+    trend_weight = 1.0 if trend_ok else 0.7 if strategy_mode == "scalper" else 0.7
+
+    if trend_ok:
+        trend_1d = "Up"
+    elif regime_fail or (not trend_base and trend_slope is False):
+        trend_1d = "Down"
+    else:
+        trend_1d = "Neutral"
+
+    if trend_1d == "Up":
+        bias_state = "Long preferred"
+    elif trend_1d == "Down":
+        bias_state = "Against trend (scalper mode)" if strategy_mode == "scalper" else "Against bias"
+    else:
+        bias_state = "Neutral"
+
+    if candidate_action == "FirstLot":
+        trigger_state = "Buy" if latest_signal.base_entry_trigger else ("Waiting" if latest_signal.base_entry_signal else "No signal")
+    elif candidate_action.startswith("MULTI-"):
+        trigger_state = "Add" if latest_signal.add_trigger else "Waiting"
+    elif latest_signal.hit_atr_trail or latest_signal.hit_regime:
+        trigger_state = "Exit"
+    elif candidate_action in {"HOLD", "no_op"}:
+        trigger_state = "Hold"
+    else:
+        trigger_state = "No signal"
+
+    if ai_decision is None:
+        ai_filter_state = "Neutral"
+    elif ai_decision.Ai_blocked_reason == "ai_safety_unsafe":
+        ai_filter_state = "Hard block"
+    elif ai_decision.is_stale or not ai_decision.is_available:
+        ai_filter_state = "Cautious"
+    elif ai_decision.Ai_safety_label == "safe" and ai_decision.Ai_regime_label == "risk_on" and ai_decision.Ai_sentiment_label == "bullish":
+        ai_filter_state = "Supportive"
+    elif ai_decision.Ai_safety_label in {"safe", "caution"}:
+        ai_filter_state = "Cautious"
+    else:
+        ai_filter_state = "Neutral"
+
+    if execution_decision in {"submitted_buy", "submitted_add_buy", "FirstLot"}:
+        final_decision = "Buy"
+    elif execution_decision in {"submitted_exit", "EXIT_ATR", "EXIT_REGIME"}:
+        final_decision = "Sell"
+    elif execution_decision in {"skipped_no_new_bar"}:
+        final_decision = "Wait"
+    elif execution_decision in {"no_op", "hold", "no_signal"}:
+        final_decision = "No action"
+    elif str(execution_decision).startswith("blocked") or "blocked" in str(execution_decision).lower():
+        final_decision = "Blocked"
+    else:
+        final_decision = "Wait"
+
+    if ai_decision is not None and ai_decision.Ai_blocked_reason == "ai_safety_unsafe":
+        primary_reason = f"AI {ai_decision.Ai_blocked_reason}"
+    elif execution_decision == "skipped_no_new_bar":
+        primary_reason = "Awaiting latest 15M close."
+    elif latest_signal.hit_regime:
+        primary_reason = "1D regime exit confirmed."
+    elif latest_signal.hit_atr_trail:
+        primary_reason = "ATR trail exit confirmed."
+    elif candidate_action == "FirstLot":
+        if strategy_mode == "trend" and not trend_ok:
+            primary_reason = "Against 1D bias."
+        elif strategy_mode == "scalper" and not trend_ok:
+            primary_reason = "Against trend (scalper mode)."
+        elif not pullback:
+            primary_reason = "Awaiting pullback into the setup zone."
+        elif not latest_signal.base_entry_trigger:
+            primary_reason = "Awaiting 15M confirmation."
+        else:
+            primary_reason = "15M trigger aligned with 1D bias."
+    elif candidate_action.startswith("MULTI-"):
+        if not latest_signal.add_trigger:
+            primary_reason = "Awaiting add confirmation."
+        else:
+            primary_reason = "Add gates aligned."
+    elif latest_signal.base_entry_signal:
+        primary_reason = "15M setup is developing on the latest closed bar."
+    else:
+        primary_reason = "No setup on the latest closed bar."
+
+    pullback_state_label = "Yes" if pullback else "No"
+    if strategy_mode == "scalper" and continuation_context:
+        pullback_state_label = "Not required"
+
+    return {
+        "execution_timeframe": strategy_result.execution_timeframe,
+        "trend_timeframe": strategy_result.trend_timeframe,
+        "strategy_context": f"{strategy_result.execution_timeframe} closed bars + {strategy_result.trend_timeframe} trend",
+        "setup_context": "Reversal" if reversal_context else ("Continuation" if continuation_context else "Neutral"),
+        "trend_1d": trend_1d,
+        "bias_state": bias_state,
+        "trend_weight": trend_weight,
+        "pullback_state": pullback_state_label,
+        "setup_ready": setup_ready,
+        "setup_age_bars": setup_age_bars,
+        "setup_invalidated": setup_invalidated,
+        "confirmation_state": "Yes" if confirmation else "No",
+        "trigger_state": trigger_state,
+        "ai_filter_state": ai_filter_state,
+        "setup_state": "Valid" if setup_valid else "Not valid",
+        "final_decision": final_decision,
+        "primary_reason": primary_reason,
+        "trigger_active": trigger_active,
+    }
 
 
 def _resolve_mode(
@@ -2319,9 +2909,9 @@ def _build_runtime_message(*, execution_mode: str, execution_decision: str) -> s
             "heartbeat without reprocessing."
         )
     if execution_decision == "validation_ping_ai_cache_unavailable":
-        return "Prime Stocks validation ping blocked because cached AI validation data is unavailable."
+        return "Prime Stocks validation ping continued with advisory AI validation cache unavailable."
     if execution_decision == "validation_ping_ai_cache_stale":
-        return "Prime Stocks validation ping blocked because cached AI validation data is stale."
+        return "Prime Stocks validation ping continued with advisory AI validation cache stale."
     if execution_decision == "validation_ping_stale_data":
         return "Prime Stocks validation ping blocked because SHIBUSD validation bars are stale."
     if execution_decision == "skipped_no_new_bar":
@@ -2334,10 +2924,15 @@ def _build_runtime_message(*, execution_mode: str, execution_decision: str) -> s
             "Prime Stocks Cloud Run runtime blocked because the fetched execution bars are stale for the configured "
             "timeframe."
         )
-    if execution_decision in {"ai_cache_stale", "ai_cache_unavailable", "ai_safety_unsafe", "ai_regime_risk_off", "ai_sentiment_bearish", "ai_blocked"}:
+    if execution_decision in {"ai_cache_stale", "ai_cache_unavailable"}:
         return (
-            "Prime Stocks Cloud Run runtime blocked buy-side execution because the cached AI regime or safety policy "
-            f"returned {execution_decision}."
+            "Prime Stocks Cloud Run runtime continued with advisory AI cache freshness state "
+            f"({execution_decision})."
+        )
+    if execution_decision in {"ai_safety_unsafe", "ai_blocked"}:
+        return (
+            "Prime Stocks Cloud Run runtime blocked buy-side execution because cached AI safety data is unsafe "
+            f"({execution_decision})."
         )
     if execution_mode == "paper":
         return (
@@ -2372,14 +2967,77 @@ def _build_validation_ping_message(
     return f"{message} Ping test mode notes: {', '.join(notes)}."
 
 
-def _build_execution_key(candidate_action: str, latest_signal_time: datetime | None) -> str:
-    return f"{candidate_action}:{None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat()}"
+def _build_execution_key(candidate_action: str, latest_signal_time: datetime | None, symbol: str | None = None) -> str:
+    latest_signal_time_value = None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat()
+    if candidate_action == "FirstLot" and symbol is not None and str(symbol).strip() != "":
+        return f"FirstLot:{str(symbol).strip().upper()}:{latest_signal_time_value}"
+    return f"{candidate_action}:{latest_signal_time_value}"
+
+
+def _extract_order_fill_price(raw_response: dict[str, Any] | None) -> float | None:
+    if not isinstance(raw_response, dict):
+        return None
+
+    for key in ("filled_avg_price", "avg_fill_price", "fill_price", "average_fill_price", "price"):
+        value = raw_response.get(key)
+        try:
+            if value is not None and str(value).strip() != "":
+                parsed = float(value)
+                if parsed > 0:
+                    return parsed
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _extract_order_time(raw_response: dict[str, Any] | None, key: str) -> str | None:
+    if not isinstance(raw_response, dict):
+        return None
+
+    value = raw_response.get(key)
+    if not isinstance(value, str) or value.strip() == "":
+        return None
+
+    try:
+        return _parse_iso_utc(value).isoformat()
+    except Exception:
+        return value
 
 
 def _build_client_order_id(*, run_id: str, candidate_action: str) -> str:
     action_slug = candidate_action.lower().replace("_", "-")
     run_slug = run_id.replace("dryrun-", "").replace("run-", "")
     return f"prime-{action_slug}-{run_slug}"[:47]
+
+
+def _validate_successful_execution_result(
+    *,
+    result: AlpacaPaperExecutionResult,
+    candidate_action: str,
+) -> AlpacaPaperTradingError | None:
+    order_id = str(result.order_id).strip() if result.order_id is not None else ""
+    client_order_id = str(result.client_order_id).strip() if result.client_order_id is not None else ""
+    if not result.submitted:
+        return AlpacaPaperTradingError(
+            code="broker_invalid_response",
+            message=(
+                "Prime Stocks broker submission did not return a submitted order state "
+                f"for candidate_action={candidate_action}."
+            ),
+            retryable=False,
+            raw_response=result.raw_response,
+        )
+    if order_id == "" and client_order_id == "":
+        return AlpacaPaperTradingError(
+            code="broker_invalid_response",
+            message=(
+                "Prime Stocks broker submission returned no order identifier "
+                f"for candidate_action={candidate_action}."
+            ),
+            retryable=False,
+            raw_response=result.raw_response,
+        )
+    return None
 
 
 def _build_runtime_store_failure_result(
@@ -2533,8 +3191,12 @@ def _resolve_requested_notional(
     candidate_action: str,
     runtime_config: PrimeStocksRuntimeConfigRecord,
     strategy_config: BismillahTrobotStocksV1Config,
+    account_equity: float | None = None,
 ) -> float | None:
     if candidate_action == "FirstLot":
+        if account_equity is not None and account_equity > 0:
+            per_symbol_entry_pct = max(0.0, float(runtime_config.per_symbol_entry_pct or 0.0))
+            return round(account_equity * (per_symbol_entry_pct / 100.0), 2)
         return runtime_config.first_lot_notional
     if candidate_action.startswith("MULTI-"):
         return _resolve_multi_notional(add_tier=_parse_add_tier(candidate_action), strategy_config=strategy_config)
@@ -2546,11 +3208,13 @@ def _resolve_effective_notional(
     candidate_action: str,
     runtime_config: PrimeStocksRuntimeConfigRecord,
     strategy_config: BismillahTrobotStocksV1Config,
+    account_equity: float | None = None,
 ) -> float | None:
     requested_notional = _resolve_requested_notional(
         candidate_action=candidate_action,
         runtime_config=runtime_config,
         strategy_config=strategy_config,
+        account_equity=account_equity,
     )
     if requested_notional is None:
         return None
@@ -2571,6 +3235,46 @@ def _resolve_kill_switch_failure(
         return PrimeStocksExecutionFailure("global_kill_switch_enabled", "global_kill_switch_enabled")
     if runtime_config.account_kill_switch_enabled:
         return PrimeStocksExecutionFailure("account_kill_switch_enabled", "account_kill_switch_enabled")
+    return None
+
+
+def _resolve_prime_budget_failure(
+    *,
+    runtime_config: PrimeStocksRuntimeConfigRecord,
+    candidate_action: str,
+    broker_state: AlpacaPaperSubmissionState,
+    requested_notional: float | None,
+) -> PrimeStocksExecutionFailure | None:
+    if requested_notional is None or requested_notional <= 0:
+        return None
+    account_equity = broker_state.account.equity
+    if account_equity is None or account_equity <= 0:
+        return None
+    current_exposure = max(0.0, float(broker_state.account.total_exposure or 0.0))
+
+    if candidate_action == "FirstLot":
+        per_symbol_entry_pct = max(0.0, float(runtime_config.per_symbol_entry_pct or 0.0))
+        per_symbol_entry_budget = round(account_equity * (per_symbol_entry_pct / 100.0), 2)
+        if per_symbol_entry_budget > 0 and requested_notional > (per_symbol_entry_budget + 0.01):
+            return PrimeStocksExecutionFailure(
+                execution_decision="prime_symbol_entry_budget_exceeded",
+                skipped_reason="prime_symbol_entry_budget_exceeded",
+            )
+        total_entry_budget = round(account_equity * (max(0.0, float(runtime_config.total_entry_exposure_cap_pct or 0.0)) / 100.0), 2)
+        if total_entry_budget > 0 and (current_exposure + requested_notional) > (total_entry_budget + 0.01):
+            return PrimeStocksExecutionFailure(
+                execution_decision="prime_total_entry_budget_reached",
+                skipped_reason="prime_total_entry_budget_reached",
+            )
+        return None
+
+    if candidate_action.startswith("MULTI-"):
+        total_add_budget = round(account_equity * (max(0.0, float(runtime_config.total_add_exposure_cap_pct or 0.0)) / 100.0), 2)
+        if total_add_budget > 0 and (current_exposure + requested_notional) > (total_add_budget + 0.01):
+            return PrimeStocksExecutionFailure(
+                execution_decision="prime_total_add_budget_reached",
+                skipped_reason="prime_total_add_budget_reached",
+            )
     return None
 
 
@@ -2625,6 +3329,8 @@ def _is_stale_market_data(
 
 def _timeframe_stale_threshold(execution_timeframe: str) -> timedelta:
     normalized = _normalize_runtime_timeframe(execution_timeframe)
+    if normalized == "15M":
+        return timedelta(hours=2, minutes=15)
     if normalized == "1H":
         return timedelta(hours=2, minutes=15)
     if normalized == "4H":
@@ -2636,10 +3342,12 @@ def _timeframe_stale_threshold(execution_timeframe: str) -> timedelta:
 
 def _build_strategy_config(runtime_config: PrimeStocksRuntimeConfigRecord) -> BismillahTrobotStocksV1Config:
     return BismillahTrobotStocksV1Config(
+        strategy_mode=str(runtime_config.strategy_mode).strip().lower(),
         execution_timeframe=_normalize_runtime_timeframe(runtime_config.execution_timeframe),
         trend_timeframe=_normalize_runtime_timeframe(runtime_config.trend_timeframe),
         exec_tf_note=f"Run Bismillah on {_normalize_runtime_timeframe(runtime_config.execution_timeframe)} chart",
         trend_tf=_normalize_trend_tf(runtime_config.trend_timeframe),
+        setup_window_bars=max(3, int(runtime_config.pullback_window)),
         swing_len=max(5, int(runtime_config.pullback_window)),
         first_lot_dollars=runtime_config.first_lot_notional,
         max_adds=runtime_config.max_add_count,
@@ -2692,6 +3400,8 @@ def _normalize_forced_candidate_action(value: str | None) -> str | None:
 def _normalize_runtime_timeframe(timeframe: str) -> str:
     normalized = timeframe.strip().upper()
     aliases = {
+        "15M": "15M",
+        "15MIN": "15M",
         "1HOUR": "1H",
         "1H": "1H",
         "4HOUR": "4H",

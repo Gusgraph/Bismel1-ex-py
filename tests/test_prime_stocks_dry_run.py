@@ -39,6 +39,7 @@ from app.services.firestore_runtime_store import (
     PrimeStocksFirestoreRuntimeStore,
     PrimeStocksRuntimeStoreError,
     build_default_runtime_config,
+    _build_strategy_reasoning_payload,
 )
 from app.shared.config import AppConfig
 
@@ -85,6 +86,262 @@ def test_dry_run_service_writes_snapshot_signal_state_and_log_records() -> None:
     assert len(root["logs"]) == 1
 
 
+def test_strategy_reasoning_uses_full_1h_and_1d_context() -> None:
+    series = PineComputedSeries(
+        trend_ok=[False, True],
+        trend_base_htf=[False, True],
+        htf_ema_slow_slope_up=[False, True],
+        in_pullback_zone=[False, True],
+        regime_fail=[True, False],
+    )
+    signal = PineSignalSnapshot(
+        base_entry_signal=True,
+        base_entry_trigger=True,
+        add_bounce_confirm=False,
+        gate_atr_ok=True,
+        gate_dp_ok=True,
+        cap_ok=True,
+        add_signal_raw=False,
+        add_trigger=False,
+        hit_atr_trail=False,
+        hit_regime=False,
+    )
+    latest_bar = PineSignalStateBar(
+        bar_index=1,
+        regime_fail=False,
+        auto_paused=False,
+        pause_new_basket=False,
+        pause_adds=False,
+        in_position_before=False,
+        signal=signal,
+        state_before=BismillahTrobotStocksV1State(),
+        state_after=BismillahTrobotStocksV1State(),
+    )
+    strategy_result = PrimeStocksStrategyResult(
+        product_key="stocks.bismel1",
+        pine_strategy_title="Prime Stocks Bot Trader",
+        status="signal",
+        message="stub strategy result",
+        series=series,
+        latest_signal=signal,
+        latest_bar=latest_bar,
+        final_state=BismillahTrobotStocksV1State(),
+        ai_decision=None,
+        execution_allowed=True,
+        execution_timeframe="15M",
+        trend_timeframe="1D",
+    )
+
+    reasoning = _build_strategy_reasoning_payload(
+        strategy_result=strategy_result,
+        candidate_action="FirstLot",
+        execution_decision="submitted_buy",
+        ai_decision=None,
+    )
+
+    assert reasoning["strategy_context"] == "15M closed bars + 1D trend"
+    assert reasoning["trend_1d"] == "Up"
+    assert reasoning["bias_state"] == "Long preferred"
+    assert reasoning["pullback_state"] == "Yes"
+    assert reasoning["confirmation_state"] == "Yes"
+    assert reasoning["trigger_state"] == "Buy"
+    assert reasoning["ai_filter_state"] == "Neutral"
+    assert reasoning["setup_state"] == "Valid"
+    assert reasoning["final_decision"] == "Buy"
+    assert "15M trigger aligned" in reasoning["primary_reason"]
+
+
+def test_strategy_reasoning_reports_setup_state_from_signal_not_trigger() -> None:
+    series = PineComputedSeries(
+        trend_ok=[True, True],
+        trend_base_htf=[True, True],
+        htf_ema_slow_slope_up=[True, True],
+        in_pullback_zone=[False, True],
+        regime_fail=[False, False],
+    )
+    signal = PineSignalSnapshot(
+        base_entry_signal=True,
+        base_entry_trigger=False,
+        add_bounce_confirm=False,
+        gate_atr_ok=True,
+        gate_dp_ok=True,
+        cap_ok=True,
+        add_signal_raw=False,
+        add_trigger=False,
+        hit_atr_trail=False,
+        hit_regime=False,
+    )
+    latest_bar = PineSignalStateBar(
+        bar_index=1,
+        regime_fail=False,
+        auto_paused=False,
+        pause_new_basket=False,
+        pause_adds=False,
+        in_position_before=False,
+        signal=signal,
+        state_before=BismillahTrobotStocksV1State(),
+        state_after=BismillahTrobotStocksV1State(),
+    )
+    strategy_result = PrimeStocksStrategyResult(
+        product_key="stocks.bismel1",
+        pine_strategy_title="Prime Stocks Bot Trader",
+        status="signal",
+        message="stub strategy result",
+        series=series,
+        latest_signal=signal,
+        latest_bar=latest_bar,
+        final_state=BismillahTrobotStocksV1State(),
+        ai_decision=None,
+        execution_allowed=True,
+        execution_timeframe="15M",
+        trend_timeframe="1D",
+    )
+
+    reasoning = _build_strategy_reasoning_payload(
+        strategy_result=strategy_result,
+        candidate_action="FirstLot",
+        execution_decision="no_op",
+        ai_decision=None,
+    )
+
+    assert reasoning["setup_state"] == "Valid"
+    assert reasoning["confirmation_state"] == "No"
+    assert reasoning["trigger_state"] == "Waiting"
+
+
+def test_strategy_reasoning_treats_downtrend_as_soft_bias_in_scalper_mode() -> None:
+    series = PineComputedSeries(
+        trend_ok=[False, False],
+        trend_base_htf=[False, False],
+        htf_ema_slow_slope_up=[False, False],
+        in_pullback_zone=[False, True],
+        regime_fail=[True, True],
+    )
+    signal = PineSignalSnapshot(
+        base_entry_signal=True,
+        base_entry_trigger=True,
+        add_bounce_confirm=False,
+        gate_atr_ok=True,
+        gate_dp_ok=True,
+        cap_ok=True,
+        add_signal_raw=False,
+        add_trigger=False,
+        hit_atr_trail=False,
+        hit_regime=False,
+    )
+    latest_bar = PineSignalStateBar(
+        bar_index=1,
+        regime_fail=False,
+        auto_paused=False,
+        pause_new_basket=False,
+        pause_adds=False,
+        in_position_before=False,
+        signal=signal,
+        state_before=BismillahTrobotStocksV1State(),
+        state_after=BismillahTrobotStocksV1State(),
+    )
+    strategy_result = PrimeStocksStrategyResult(
+        product_key="stocks.bismel1",
+        pine_strategy_title="Prime Stocks Bot Trader",
+        status="signal",
+        message="stub strategy result",
+        series=series,
+        latest_signal=signal,
+        latest_bar=latest_bar,
+        final_state=BismillahTrobotStocksV1State(),
+        ai_decision=None,
+        execution_allowed=True,
+        execution_timeframe="15M",
+        trend_timeframe="1D",
+        strategy_mode="scalper",
+    )
+
+    reasoning = _build_strategy_reasoning_payload(
+        strategy_result=strategy_result,
+        candidate_action="FirstLot",
+        execution_decision="submitted_buy",
+        ai_decision=None,
+    )
+
+    assert reasoning["bias_state"] == "Against trend (scalper mode)"
+    assert reasoning["trend_weight"] == 0.7
+    assert reasoning["primary_reason"] == "Against trend (scalper mode)."
+
+
+def test_strategy_reasoning_treats_ai_cache_stale_as_advisory() -> None:
+    series = PineComputedSeries(
+        trend_ok=[True, True],
+        trend_base_htf=[True, True],
+        htf_ema_slow_slope_up=[True, True],
+        in_pullback_zone=[True, True],
+        regime_fail=[False, False],
+    )
+    signal = PineSignalSnapshot(
+        base_entry_signal=True,
+        base_entry_trigger=True,
+        add_bounce_confirm=False,
+        gate_atr_ok=True,
+        gate_dp_ok=True,
+        cap_ok=True,
+        add_signal_raw=False,
+        add_trigger=False,
+        hit_atr_trail=False,
+        hit_regime=False,
+    )
+    latest_bar = PineSignalStateBar(
+        bar_index=1,
+        regime_fail=False,
+        auto_paused=False,
+        pause_new_basket=False,
+        pause_adds=False,
+        in_position_before=False,
+        signal=signal,
+        state_before=BismillahTrobotStocksV1State(),
+        state_after=BismillahTrobotStocksV1State(),
+    )
+    strategy_result = PrimeStocksStrategyResult(
+        product_key="stocks.bismel1",
+        pine_strategy_title="Prime Stocks Bot Trader",
+        status="signal",
+        message="stub strategy result",
+        series=series,
+        latest_signal=signal,
+        latest_bar=latest_bar,
+        final_state=BismillahTrobotStocksV1State(),
+        ai_decision=None,
+        execution_allowed=True,
+        execution_timeframe="15M",
+        trend_timeframe="1D",
+    )
+    ai_decision = AiCacheRecord(
+        scope="symbol",
+        symbol="AAPL",
+        Ai_regime_label="neutral",
+        Ai_sentiment_label="neutral",
+        Ai_safety_label="caution",
+        Ai_confidence=0.0,
+        Ai_reason="AI cache is stale for Prime Stocks runtime evaluation.",
+        Ai_updated_at=datetime.now(tz=UTC).isoformat(),
+        Ai_source="cached_gemini",
+        Ai_execution_allowed=True,
+        Ai_block_new_entries=False,
+        Ai_block_adds=False,
+        Ai_blocked_reason=None,
+        is_stale=True,
+        is_available=True,
+    )
+
+    reasoning = _build_strategy_reasoning_payload(
+        strategy_result=strategy_result,
+        candidate_action="FirstLot",
+        execution_decision="submitted_buy",
+        ai_decision=ai_decision,
+    )
+
+    assert reasoning["ai_filter_state"] == "Cautious"
+    assert reasoning["primary_reason"] == "15M trigger aligned with 1D bias."
+
+
 def test_runtime_service_submits_first_lot_buy_when_paper_enabled() -> None:
     settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
     fake_client = FakeFirestoreClient()
@@ -106,7 +363,7 @@ def test_runtime_service_submits_first_lot_buy_when_paper_enabled() -> None:
     assert result.order_submitted is True
     assert result.order_status == "accepted"
     assert paper_trading.calls[-1]["action"] == "FirstLot"
-    assert paper_trading.calls[-1]["notional"] == 101.0
+    assert paper_trading.calls[-1]["notional"] == 300.0
 
 
 def test_runtime_service_can_force_candidate_action_for_validation() -> None:
@@ -281,6 +538,7 @@ def test_runtime_service_writes_isolated_firestore_docs_per_user_and_account() -
         uid="user-a",
         account_id=1,
         alpaca_account_id=501,
+        slot_number=1,
         allow_execution=False,
     )
     user_a_account_2_result = user_a_account_2_service.run_once(
@@ -288,6 +546,7 @@ def test_runtime_service_writes_isolated_firestore_docs_per_user_and_account() -
         uid="user-a",
         account_id=2,
         alpaca_account_id=502,
+        slot_number=2,
         allow_execution=False,
     )
     user_b_account_1_result = user_b_account_1_service.run_once(
@@ -295,16 +554,17 @@ def test_runtime_service_writes_isolated_firestore_docs_per_user_and_account() -
         uid="user-b",
         account_id=1,
         alpaca_account_id=601,
+        slot_number=1,
         allow_execution=False,
     )
 
-    assert user_a_account_1_result.firestore_paths["config_document"] == "users/user-a/accounts/1/prime_stocks/current/config/current"
-    assert user_a_account_2_result.firestore_paths["config_document"] == "users/user-a/accounts/2/prime_stocks/current/config/current"
-    assert user_b_account_1_result.firestore_paths["config_document"] == "users/user-b/accounts/1/prime_stocks/current/config/current"
+    assert user_a_account_1_result.firestore_paths["config_document"] == "users/user-a/accounts/1/prime_stocks/current/slots/slot_1/config/current"
+    assert user_a_account_2_result.firestore_paths["config_document"] == "users/user-a/accounts/2/prime_stocks/current/slots/slot_2/config/current"
+    assert user_b_account_1_result.firestore_paths["config_document"] == "users/user-b/accounts/1/prime_stocks/current/slots/slot_1/config/current"
 
-    user_a_account_1_root = fake_client.storage["users"]["user-a"]["accounts"]["1"]["prime_stocks"]["current"]
-    user_a_account_2_root = fake_client.storage["users"]["user-a"]["accounts"]["2"]["prime_stocks"]["current"]
-    user_b_account_1_root = fake_client.storage["users"]["user-b"]["accounts"]["1"]["prime_stocks"]["current"]
+    user_a_account_1_root = fake_client.storage["users"]["user-a"]["accounts"]["1"]["prime_stocks"]["current"]["slots"]["slot_1"]
+    user_a_account_2_root = fake_client.storage["users"]["user-a"]["accounts"]["2"]["prime_stocks"]["current"]["slots"]["slot_2"]
+    user_b_account_1_root = fake_client.storage["users"]["user-b"]["accounts"]["1"]["prime_stocks"]["current"]["slots"]["slot_1"]
 
     assert user_a_account_1_root["state"]["current"]["uid"] == "user-a"
     assert user_a_account_1_root["state"]["current"]["account_id"] == 1
@@ -321,6 +581,69 @@ def test_runtime_service_writes_isolated_firestore_docs_per_user_and_account() -
     assert user_a_account_1_root["state"]["current"]["run_id"] != user_a_account_2_root["state"]["current"]["run_id"]
     assert user_a_account_1_root["state"]["current"]["run_id"] != user_b_account_1_root["state"]["current"]["run_id"]
     assert user_a_account_2_root["state"]["current"]["run_id"] != user_b_account_1_root["state"]["current"]["run_id"]
+
+
+def test_runtime_service_persists_symbol_specific_ai_state_per_symbol() -> None:
+    settings = _settings()
+    fake_client = FakeFirestoreClient()
+    fake_client.collection("runtime_products").document("prime_stocks").collection("ai_symbols").document("AAPL").set(
+        {
+            "scope": "symbol",
+            "symbol": "AAPL",
+            "Ai_regime_label": "risk_on",
+            "Ai_sentiment_label": "bearish",
+            "Ai_safety_label": "safe",
+            "Ai_confidence": 0.88,
+            "Ai_reason": "AAPL bearish cache",
+            "Ai_updated_at": datetime.now(tz=UTC).isoformat(),
+            "Ai_source": "gemini:test",
+            "Ai_execution_allowed": True,
+            "Ai_block_new_entries": False,
+            "Ai_block_adds": False,
+            "Ai_blocked_reason": None,
+        }
+    )
+    fake_client.collection("runtime_products").document("prime_stocks").collection("ai_symbols").document("MSFT").set(
+        {
+            "scope": "symbol",
+            "symbol": "MSFT",
+            "Ai_regime_label": "risk_on",
+            "Ai_sentiment_label": "bullish",
+            "Ai_safety_label": "safe",
+            "Ai_confidence": 0.92,
+            "Ai_reason": "MSFT bullish cache",
+            "Ai_updated_at": datetime.now(tz=UTC).isoformat(),
+            "Ai_source": "gemini:test",
+            "Ai_execution_allowed": True,
+            "Ai_block_new_entries": False,
+            "Ai_block_adds": False,
+            "Ai_blocked_reason": None,
+        }
+    )
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=FakePaperTrading(),
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("HOLD"),
+    )
+
+    aapl_result = service.run_once(symbol="AAPL", uid="user-a", account_id=1, alpaca_account_id=501, allow_execution=False)
+    msft_result = service.run_once(symbol="MSFT", uid="user-a", account_id=1, alpaca_account_id=501, allow_execution=False)
+
+    assert aapl_result.ai is not None
+    assert aapl_result.ai["Ai_sentiment_label"] == "bearish"
+
+    scoped_root = fake_client.storage["users"]["user-a"]["accounts"]["1"]["prime_stocks"]["current"]["slots"]["slot_1"]
+    assert scoped_root["symbols"]["AAPL"]["state"]["current"]["Ai_sentiment_label"] == "bearish"
+    assert scoped_root["symbols"]["MSFT"]["state"]["current"]["Ai_sentiment_label"] == "bullish"
+
+    cycle = scoped_root["cycles"]["latest"]
+    assert cycle["symbol_states"]["AAPL"]["Ai_sentiment_label"] == "bearish"
+    assert cycle["symbol_states"]["MSFT"]["Ai_sentiment_label"] == "bullish"
+    assert cycle["per_symbol_results"][0]["Ai_sentiment_label"] in {"bearish", "bullish"}
 
 
 def test_runtime_service_skips_noop_when_candidate_action_is_hold() -> None:
@@ -345,7 +668,7 @@ def test_runtime_service_skips_noop_when_candidate_action_is_hold() -> None:
     assert paper_trading.calls == []
 
 
-def test_runtime_service_force_candidate_action_still_respects_ai_gating() -> None:
+def test_runtime_service_force_candidate_action_still_respects_ai_context() -> None:
     settings = _settings(
         prime_stocks_dry_run=False,
         prime_stocks_paper_execution_enabled=True,
@@ -366,10 +689,43 @@ def test_runtime_service_force_candidate_action_still_respects_ai_gating() -> No
 
     result = service.run_once(symbol="AAPL", allow_execution=True)
 
-    assert result.candidate_action == "AI_BLOCKED"
-    assert result.execution_decision == "ai_sentiment_bearish"
-    assert result.order_submitted is False
-    assert paper_trading.calls == []
+    assert result.candidate_action == "FirstLot"
+    assert result.execution_decision == "submitted_buy"
+    assert result.order_submitted is True
+    assert paper_trading.calls[-1]["action"] == "FirstLot"
+
+
+def test_runtime_service_first_lot_ignores_stale_runtime_position_when_broker_is_flat() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading(
+        submission_state=AlpacaPaperSubmissionState(
+            account=AlpacaPaperAccountState(
+                buying_power=1000.0,
+                open_positions_count=0,
+                equity=10000.0,
+                total_exposure=0.0,
+            ),
+            asset=AlpacaPaperAssetState(symbol="MSFT", tradable=True, status="active"),
+            position=None,
+        )
+    )
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("FirstLot", in_position_before=True),
+    )
+
+    result = service.run_once(symbol="MSFT", allow_execution=True)
+
+    assert result.execution_decision == "submitted_buy"
+    assert result.order_submitted is True
+    assert result.candidate_action == "FirstLot"
+    assert paper_trading.calls[-1]["action"] == "FirstLot"
 
 
 def test_runtime_service_skips_duplicate_candidate_action() -> None:
@@ -378,7 +734,7 @@ def test_runtime_service_skips_duplicate_candidate_action() -> None:
     latest_signal_time = _bars()[-1].ends_at.isoformat()
     fake_client.collection("runtime_products").document("prime_stocks").collection("execution").document("current").set(
         {
-            "execution_key": f"FirstLot:{latest_signal_time}",
+            "execution_key": f"FirstLot:AAPL:{latest_signal_time}",
             "order_status": "accepted",
             "run_id": "prior-run",
             "candidate_action": "FirstLot",
@@ -580,40 +936,43 @@ def test_runtime_service_blocks_when_max_add_count_is_exceeded() -> None:
     assert result.execution_decision == "max_add_count_exceeded"
 
 
-def test_runtime_service_blocks_first_lot_when_per_symbol_entry_cap_is_exceeded() -> None:
+def test_runtime_service_prime_first_lot_uses_prime_per_symbol_entry_budget() -> None:
     settings = _settings(
         prime_stocks_dry_run=False,
         prime_stocks_paper_execution_enabled=True,
         prime_stocks_live_cap_pct=1.0,
     )
     runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=FakeFirestoreClient())
+    paper_trading = FakePaperTrading(
+        submission_state=AlpacaPaperSubmissionState(
+            account=AlpacaPaperAccountState(
+                buying_power=1000.0,
+                open_positions_count=0,
+                equity=1000.0,
+                total_exposure=0.0,
+            ),
+            asset=AlpacaPaperAssetState(symbol="AAPL", tradable=True, status="active"),
+            position=None,
+        )
+    )
     service = PrimeStocksRuntimeService(
         settings=settings,
         market_data=FakeMarketData(),
         runtime_store=runtime_store,
-        paper_trading=FakePaperTrading(
-            submission_state=AlpacaPaperSubmissionState(
-                account=AlpacaPaperAccountState(
-                    buying_power=1000.0,
-                    open_positions_count=0,
-                    equity=1000.0,
-                    total_exposure=0.0,
-                ),
-                asset=AlpacaPaperAssetState(symbol="AAPL", tradable=True, status="active"),
-                position=None,
-            )
-        ),
+        paper_trading=paper_trading,
         account_resolver=FakeAccountResolver(),
         strategy_runner=lambda **_: _strategy_result("FirstLot"),
     )
 
     result = service.run_once(symbol="AAPL", allow_execution=True)
 
-    assert result.execution_decision == "per_symbol_entry_cap_exceeded"
-    assert result.order_submitted is False
+    assert result.execution_decision == "submitted_buy"
+    assert result.order_submitted is True
+    buy_call = next(call for call in paper_trading.calls if call["action"] == "FirstLot")
+    assert abs(float(buy_call["notional"]) - 10.0) < 0.01
 
 
-def test_runtime_service_blocks_new_symbol_when_total_entry_exposure_cap_is_exceeded() -> None:
+def test_runtime_service_prime_first_lot_respects_total_entry_budget() -> None:
     settings = _settings(
         prime_stocks_dry_run=False,
         prime_stocks_paper_execution_enabled=True,
@@ -631,7 +990,7 @@ def test_runtime_service_blocks_new_symbol_when_total_entry_exposure_cap_is_exce
                     buying_power=1000.0,
                     open_positions_count=1,
                     equity=1000.0,
-                    total_exposure=70.0,
+                    total_exposure=90.0,
                 ),
                 asset=AlpacaPaperAssetState(symbol="AAPL", tradable=True, status="active"),
                 position=None,
@@ -643,11 +1002,11 @@ def test_runtime_service_blocks_new_symbol_when_total_entry_exposure_cap_is_exce
 
     result = service.run_once(symbol="AAPL", allow_execution=True)
 
-    assert result.execution_decision == "total_entry_exposure_cap_exceeded"
+    assert result.execution_decision == "prime_total_entry_budget_reached"
     assert result.order_submitted is False
 
 
-def test_runtime_service_blocks_add_when_total_add_exposure_cap_is_exceeded() -> None:
+def test_runtime_service_prime_add_respects_total_add_budget() -> None:
     settings = _settings(
         prime_stocks_dry_run=False,
         prime_stocks_paper_execution_enabled=True,
@@ -677,11 +1036,11 @@ def test_runtime_service_blocks_add_when_total_add_exposure_cap_is_exceeded() ->
 
     result = service.run_once(symbol="AAPL", allow_execution=True)
 
-    assert result.execution_decision == "total_add_exposure_cap_exceeded"
+    assert result.execution_decision == "prime_total_add_budget_reached"
     assert result.order_submitted is False
 
 
-def test_runtime_service_blocks_new_entries_when_global_kill_switch_is_enabled() -> None:
+def test_runtime_service_prime_first_lot_ignores_global_kill_switch() -> None:
     settings = _settings(
         prime_stocks_dry_run=False,
         prime_stocks_paper_execution_enabled=True,
@@ -699,8 +1058,8 @@ def test_runtime_service_blocks_new_entries_when_global_kill_switch_is_enabled()
 
     result = service.run_once(symbol="AAPL", allow_execution=True)
 
-    assert result.execution_decision == "global_kill_switch_enabled"
-    assert result.order_submitted is False
+    assert result.execution_decision == "submitted_buy"
+    assert result.order_submitted is True
 
 
 def test_runtime_service_allows_exit_when_global_kill_switch_is_enabled() -> None:
@@ -762,12 +1121,11 @@ def test_runtime_service_uses_same_logic_for_paper_and_live_execution_paths() ->
     assert live_result.order_submitted is True
 
 
-def test_runtime_service_blocks_when_order_notional_exceeds_cap() -> None:
+def test_runtime_service_prime_first_lot_ignores_max_notional_cap() -> None:
     settings = _settings(
         prime_stocks_dry_run=False,
         prime_stocks_paper_execution_enabled=True,
-        prime_stocks_first_lot_notional=500.0,
-        prime_stocks_max_notional_per_order=303.0,
+        prime_stocks_max_notional_per_order=299.0,
     )
     fake_client = FakeFirestoreClient()
     runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
@@ -783,8 +1141,8 @@ def test_runtime_service_blocks_when_order_notional_exceeds_cap() -> None:
 
     result = service.run_once(symbol="AAPL", allow_execution=True)
 
-    assert result.execution_decision == "max_notional_per_order_exceeded"
-    assert result.order_submitted is False
+    assert result.execution_decision == "submitted_buy"
+    assert result.order_submitted is True
 
 
 def test_runtime_service_persists_broker_rejection_details() -> None:
@@ -816,6 +1174,71 @@ def test_runtime_service_persists_broker_rejection_details() -> None:
     assert root["execution"]["current"]["broker_error_message"] == "insufficient buying power"
 
 
+def test_runtime_service_preview_only_does_not_mark_prime_as_dry_run() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading()
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("FirstLot"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True, preview_only=True)
+
+    assert result.execution_decision == "preview_only"
+    assert result.order_submitted is False
+    assert result.mode == "paper"
+    assert paper_trading.calls == []
+
+
+def test_runtime_service_preview_only_does_not_overwrite_submitted_buy_state() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=FakePaperTrading(),
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("FirstLot"),
+    )
+
+    executed = service.run_once(
+        symbol="AAPL",
+        uid="user-a",
+        account_id=101,
+        alpaca_account_id=501,
+        slot_number=1,
+        allow_execution=True,
+    )
+    preview = service.run_once(
+        symbol="AAPL",
+        uid="user-a",
+        account_id=101,
+        alpaca_account_id=501,
+        slot_number=1,
+        allow_execution=True,
+        preview_only=True,
+    )
+
+    scoped_root = fake_client.storage["users"]["user-a"]["accounts"]["101"]["prime_stocks"]["current"]["slots"]["slot_1"]
+    symbol_state = scoped_root["symbols"]["AAPL"]["state"]["current"]
+
+    assert executed.execution_decision == "submitted_buy"
+    assert preview.execution_decision == "preview_only"
+    assert symbol_state["execution_decision"] == "submitted_buy"
+    assert symbol_state["order_id"] == "order-first"
+    assert symbol_state["latest_order_status"] == "accepted"
+    assert scoped_root["execution"]["current"]["execution_decision"] == "submitted_buy"
+    assert scoped_root["actions"]["latest"]["execution_decision"] == "submitted_buy"
+
+
 def test_runtime_service_retries_transient_submit_once_without_duplicate_persistence() -> None:
     settings = _settings(
         prime_stocks_dry_run=False,
@@ -842,6 +1265,40 @@ def test_runtime_service_retries_transient_submit_once_without_duplicate_persist
     root = fake_client.storage["runtime_products"]["prime_stocks"]
     assert root["execution"]["current"]["retry_count"] == 1
     assert root["execution"]["current"]["submitted"] is True
+
+
+def test_runtime_service_does_not_mark_submitted_buy_without_order_identity() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading(
+        submit_first_lot_result=AlpacaPaperExecutionResult(
+            action="FirstLot",
+            submitted=True,
+            order_status="accepted",
+            order_id=None,
+            client_order_id=None,
+            side="buy",
+            notional=300.0,
+            add_tier=None,
+        )
+    )
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("FirstLot"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    root = fake_client.storage["runtime_products"]["prime_stocks"]
+    assert result.execution_decision == "broker_invalid_response"
+    assert result.order_submitted is False
+    assert root["execution"]["current"]["execution_decision"] == "broker_invalid_response"
+    assert root["execution"]["current"]["order_status"] == "not_submitted"
 
 
 def test_runtime_service_rejects_non_stock_runtime_config() -> None:
@@ -872,13 +1329,17 @@ def test_runtime_service_uses_first_active_configured_symbol_for_execution() -> 
     settings = _settings()
     fake_client = FakeFirestoreClient()
     default_config = asdict(build_default_runtime_config(settings))
+    default_config["uid"] = "user-a"
+    default_config["account_id"] = 101
+    default_config["alpaca_account_id"] = 501
+    default_config["slot_number"] = 1
     default_config["symbol"] = "AAPL"
     default_config["selected_symbols"] = ["AAPL", "NVDA"]
     default_config["symbol_states"] = [
         {"symbol": "AAPL", "mode": "paused"},
         {"symbol": "NVDA", "mode": "active"},
     ]
-    fake_client.collection("runtime_products").document("prime_stocks").collection("config").document("current").set(default_config)
+    fake_client.collection("users").document("user-a").collection("accounts").document("101").collection("prime_stocks").document("current").collection("slots").document("slot_1").collection("config").document("current").set(default_config)
     _seed_ai_cache(fake_client)
     runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
     market_data = FakeMarketData()
@@ -891,7 +1352,7 @@ def test_runtime_service_uses_first_active_configured_symbol_for_execution() -> 
         strategy_runner=lambda **_: _strategy_result("HOLD"),
     )
 
-    result = service.run_once(allow_execution=False)
+    result = service.run_once(uid="user-a", account_id=101, alpaca_account_id=501, slot_number=1, allow_execution=False)
 
     assert result.symbol == "NVDA"
     assert market_data.calls[0]["symbol"] == "NVDA"
@@ -901,12 +1362,16 @@ def test_runtime_service_skips_when_no_active_configured_symbols_exist() -> None
     settings = _settings()
     fake_client = FakeFirestoreClient()
     default_config = asdict(build_default_runtime_config(settings))
+    default_config["uid"] = "user-a"
+    default_config["account_id"] = 101
+    default_config["alpaca_account_id"] = 501
+    default_config["slot_number"] = 1
     default_config["symbol"] = "AAPL"
     default_config["selected_symbols"] = ["AAPL"]
     default_config["symbol_states"] = [
         {"symbol": "AAPL", "mode": "paused"},
     ]
-    fake_client.collection("runtime_products").document("prime_stocks").collection("config").document("current").set(default_config)
+    fake_client.collection("users").document("user-a").collection("accounts").document("101").collection("prime_stocks").document("current").collection("slots").document("slot_1").collection("config").document("current").set(default_config)
     runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
     market_data = FakeMarketData()
     service = PrimeStocksRuntimeService(
@@ -918,11 +1383,91 @@ def test_runtime_service_skips_when_no_active_configured_symbols_exist() -> None
         strategy_runner=lambda **_: _strategy_result("HOLD"),
     )
 
-    result = service.run_once(allow_execution=False)
+    result = service.run_once(uid="user-a", account_id=101, alpaca_account_id=501, slot_number=1, allow_execution=False)
 
     assert result.execution_decision == "no_active_symbols_configured"
     assert result.candidate_action == "BLOCKED"
     assert market_data.calls == []
+
+
+def test_slot_scoped_runtime_with_no_managed_symbols_starts_clean() -> None:
+    settings = _settings()
+    fake_client = FakeFirestoreClient()
+    default_config = asdict(build_default_runtime_config(settings))
+    default_config["uid"] = "user-a"
+    default_config["account_id"] = 101
+    default_config["alpaca_account_id"] = 501
+    default_config["slot_number"] = 1
+    default_config["symbol"] = "AAPL"
+    default_config["selected_symbols"] = []
+    default_config["symbol_states"] = []
+    fake_client.collection("users").document("user-a").collection("accounts").document("101").collection("prime_stocks").document("current").collection("slots").document("slot_1").collection("config").document("current").set(default_config)
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    market_data = FakeMarketData()
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=market_data,
+        runtime_store=runtime_store,
+        paper_trading=FakePaperTrading(),
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("HOLD"),
+    )
+
+    result = service.run_once(uid="user-a", account_id=101, alpaca_account_id=501, slot_number=1, allow_execution=False)
+
+    assert result.execution_decision == "no_active_symbols_configured"
+    assert result.candidate_action == "BLOCKED"
+    assert market_data.calls == []
+
+
+def test_runtime_service_migrates_account_scoped_prime_runtime_into_slot_scope() -> None:
+    settings = _settings()
+    fake_client = FakeFirestoreClient()
+    default_config = asdict(build_default_runtime_config(settings))
+    default_config["uid"] = "user-a"
+    default_config["account_id"] = 101
+    default_config["alpaca_account_id"] = 501
+    default_config["slot_number"] = 1
+    default_config["symbol"] = "AAPL"
+    default_config["selected_symbols"] = ["AAPL"]
+    default_config["symbol_states"] = [{"symbol": "AAPL", "mode": "active"}]
+
+    account_root = fake_client.collection("users").document("user-a").collection("accounts").document("101").collection("prime_stocks").document("current")
+    account_root.collection("config").document("current").set(default_config)
+    account_root.collection("state").document("current").set({
+        "symbol": "AAPL",
+        "updated_at": "2026-04-20T12:00:00+00:00",
+        "strategy_reasoning": {"trend_1d": "Up"},
+    })
+    account_root.collection("execution").document("current").set({
+        "updated_at": "2026-04-20T12:00:00+00:00",
+        "execution_decision": "submitted_buy",
+    })
+    account_root.collection("symbols").document("AAPL").collection("state").document("current").set({
+        "symbol": "AAPL",
+        "updated_at": "2026-04-20T12:00:00+00:00",
+        "strategy_reasoning": {"final_decision": "Buy"},
+    })
+
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    market_data = FakeMarketData()
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=market_data,
+        runtime_store=runtime_store,
+        paper_trading=FakePaperTrading(),
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("HOLD"),
+    )
+
+    result = service.run_once(uid="user-a", account_id=101, alpaca_account_id=501, slot_number=1, allow_execution=False)
+
+    slot_root = fake_client.storage["users"]["user-a"]["accounts"]["101"]["prime_stocks"]["current"]["slots"]["slot_1"]
+    assert result.firestore_paths["state_document"] == "users/user-a/accounts/101/prime_stocks/current/slots/slot_1/state/current"
+    assert slot_root["config"]["current"]["selected_symbols"] == ["AAPL"]
+    assert slot_root["state"]["current"]["symbol"] == "AAPL"
+    assert slot_root["execution"]["current"]["execution_decision"] is not None
+    assert slot_root["symbols"]["AAPL"]["state"]["current"]["strategy_reasoning"]["final_decision"] == "Buy"
 
 
 def test_runtime_service_skips_when_no_new_closed_bar_is_available() -> None:
@@ -930,6 +1475,74 @@ def test_runtime_service_skips_when_no_new_closed_bar_is_available() -> None:
     fake_client = FakeFirestoreClient()
     latest_signal_time = _bars()[-1].ends_at.isoformat()
     fake_client.collection("runtime_products").document("prime_stocks").collection("state").document("current").set(
+        {
+            "last_processed_bar_time": latest_signal_time,
+            "latest_candidate_action": "HOLD",
+            "latest_status": "ok",
+            "latest_execution_decision": "no_op",
+        }
+    )
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=FakePaperTrading(),
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("HOLD"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True, trigger_type="scheduled", trigger_source="cloud_scheduler")
+
+    assert result.status == "no_op"
+    assert result.execution_decision == "skipped_no_new_bar"
+    assert result.execution_allowed is False
+    assert result.skipped_reason == "no_new_closed_bar"
+    assert result.trigger_type == "scheduled"
+    assert result.trigger_source == "cloud_scheduler"
+
+
+def test_runtime_service_allows_firstlot_execution_even_when_no_new_closed_bar_is_available() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    latest_signal_time = _bars()[-1].ends_at.isoformat()
+    fake_client.collection("runtime_products").document("prime_stocks").collection("state").document("current").set(
+        {
+            "last_processed_bar_time": latest_signal_time,
+            "latest_candidate_action": "HOLD",
+            "latest_status": "ok",
+            "latest_execution_decision": "no_op",
+        }
+    )
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading()
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("FirstLot"),
+    )
+
+    result = service.run_once(
+        symbol="AAPL",
+        allow_execution=True,
+        trigger_type="scheduled",
+        trigger_source="cloud_scheduler",
+    )
+
+    assert result.execution_decision == "submitted_buy"
+    assert result.execution_allowed is True
+    assert result.candidate_action == "FirstLot"
+    assert any(call["action"] == "FirstLot" for call in paper_trading.calls)
+
+
+def test_runtime_service_still_writes_symbol_strategy_state_when_no_new_bar_blocks_execution() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    latest_signal_time = _bars()[-1].ends_at.isoformat()
+    fake_client.collection("users").document("user-a").collection("accounts").document("101").collection("prime_stocks").document("current").collection("slots").document("slot_1").collection("symbols").document("AAPL").collection("state").document("current").set(
         {
             "last_processed_bar_time": latest_signal_time,
             "latest_candidate_action": "FirstLot",
@@ -947,21 +1560,115 @@ def test_runtime_service_skips_when_no_new_closed_bar_is_available() -> None:
         strategy_runner=lambda **_: _strategy_result("FirstLot"),
     )
 
-    result = service.run_once(symbol="AAPL", allow_execution=True, trigger_type="scheduled", trigger_source="cloud_scheduler")
+    result = service.run_once(
+        symbol="AAPL",
+        uid="user-a",
+        account_id=101,
+        alpaca_account_id=501,
+        allow_execution=True,
+        trigger_type="scheduled",
+        trigger_source="cloud_scheduler",
+    )
 
-    assert result.status == "no_op"
-    assert result.execution_decision == "skipped_no_new_bar"
+    assert result.execution_decision == "skipped_duplicate"
     assert result.execution_allowed is False
-    assert result.skipped_reason == "no_new_closed_bar"
-    assert result.trigger_type == "scheduled"
-    assert result.trigger_source == "cloud_scheduler"
+    account_state = fake_client.storage["users"]["user-a"]["accounts"]["101"]["prime_stocks"]["current"]["slots"]["slot_1"]["state"]["current"]
+    symbol_state = fake_client.storage["users"]["user-a"]["accounts"]["101"]["prime_stocks"]["current"]["slots"]["slot_1"]["symbols"]["AAPL"]["state"]["current"]
+    assert account_state["setup_state"] == "Valid"
+    assert account_state["confirmation_state"] == "Yes"
+    assert account_state["trigger_state"] == "Buy"
+    assert account_state["final_decision"] == "Wait"
+    assert symbol_state["candidate_action"] == "FirstLot"
+    assert symbol_state["execution_decision"] == "skipped_duplicate"
+    assert symbol_state["last_checked_at"] is not None
+
+
+def test_runtime_service_suppresses_duplicate_firstlot_when_symbol_state_execution_key_matches() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    latest_signal_time = _bars()[-1].ends_at.isoformat()
+    fake_client.collection("users").document("user-a").collection("accounts").document("101").collection("prime_stocks").document("current").collection("slots").document("slot_1").collection("symbols").document("USO").collection("state").document("current").set(
+        {
+            "execution_key": f"FirstLot:USO:{latest_signal_time}",
+            "last_processed_bar_time": latest_signal_time,
+            "latest_candidate_action": "FirstLot",
+            "latest_status": "signal",
+            "latest_execution_decision": "submitted_buy",
+        }
+    )
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading()
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("FirstLot"),
+    )
+
+    result = service.run_once(
+        symbol="USO",
+        uid="user-a",
+        account_id=101,
+        alpaca_account_id=501,
+        allow_execution=True,
+        trigger_type="scheduled",
+        trigger_source="cloud_scheduler",
+    )
+
+    assert result.execution_decision == "skipped_duplicate"
+    assert result.execution_allowed is False
+    assert result.order_submitted is False
+    assert all(call["action"] != "FirstLot" for call in paper_trading.calls)
+
+
+def test_runtime_service_suppresses_duplicate_firstlot_when_recent_alpaca_order_matches_same_symbol_and_bar() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    latest_signal_time = _bars()[-1].ends_at.isoformat()
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading(
+        recent_orders=[
+            {
+                "symbol": "USO",
+                "side": "buy",
+                "type": "market",
+                "status": "accepted",
+                "created_at": _bars()[-1].ends_at.isoformat(),
+            }
+        ]
+    )
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("FirstLot"),
+    )
+
+    result = service.run_once(
+        symbol="USO",
+        uid="user-a",
+        account_id=101,
+        alpaca_account_id=501,
+        allow_execution=True,
+        trigger_type="scheduled",
+        trigger_source="cloud_scheduler",
+    )
+
+    assert result.execution_decision == "skipped_duplicate"
+    assert result.execution_allowed is False
+    assert result.order_submitted is False
+    assert any(call["action"] == "recent_orders" for call in paper_trading.calls)
 
 
 def test_runtime_service_skips_when_same_bar_is_reprocessed() -> None:
     settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
     fake_client = FakeFirestoreClient()
     latest_signal_time = _bars()[-1].ends_at.isoformat()
-    fake_client.collection("runtime_products").document("prime_stocks").collection("state").document("current").set(
+    fake_client.collection("users").document("user-a").collection("accounts").document("101").collection("prime_stocks").document("current").collection("slots").document("slot_1").collection("symbols").document("AAPL").collection("state").document("current").set(
         {
             "last_processed_bar_time": latest_signal_time,
         }
@@ -977,12 +1684,60 @@ def test_runtime_service_skips_when_same_bar_is_reprocessed() -> None:
         strategy_runner=lambda **_: _strategy_result("MULTI"),
     )
 
-    result = service.run_once(symbol="AAPL", allow_execution=True, trigger_type="scheduled", trigger_source="cloud_scheduler")
+    result = service.run_once(
+        symbol="AAPL",
+        uid="user-a",
+        account_id=101,
+        alpaca_account_id=501,
+        allow_execution=True,
+        trigger_type="scheduled",
+        trigger_source="cloud_scheduler",
+    )
 
-    assert result.execution_decision == "skipped_no_new_bar"
-    assert result.execution_allowed is False
-    assert result.order_submitted is False
-    assert paper_trading.calls == []
+    assert result.execution_decision == "submitted_buy"
+    assert result.execution_allowed is True
+    assert result.order_submitted is True
+    assert any(call["action"] == "MULTI-1" for call in paper_trading.calls)
+
+
+def test_runtime_service_uses_symbol_state_to_allow_first_evaluation_for_new_symbol() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    latest_signal_time = _bars()[-1].ends_at.isoformat()
+    fake_client.collection("users").document("user-a").collection("accounts").document("101").collection("prime_stocks").document("current").collection("slots").document("slot_1").collection("state").document("current").set(
+        {
+            "last_processed_bar_time": latest_signal_time,
+            "latest_candidate_action": "FirstLot",
+            "latest_status": "ok",
+            "latest_execution_decision": "submitted_buy",
+        }
+    )
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading()
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("FirstLot"),
+    )
+
+    result = service.run_once(
+        symbol="FRO",
+        uid="user-a",
+        account_id=101,
+        alpaca_account_id=501,
+        allow_execution=True,
+        trigger_type="scheduled",
+        trigger_source="cloud_scheduler",
+    )
+
+    assert result.execution_decision == "submitted_buy"
+    assert result.order_submitted is True
+    assert any(call["action"] == "FirstLot" for call in paper_trading.calls)
+    symbol_state = fake_client.storage["users"]["user-a"]["accounts"]["101"]["prime_stocks"]["current"]["slots"]["slot_1"]["symbols"]["FRO"]["state"]["current"]
+    assert symbol_state["last_processed_bar_time"] == _bars()[-1].ends_at.isoformat()
 
 
 def test_runtime_service_blocks_when_market_data_is_stale() -> None:
@@ -1219,9 +1974,9 @@ def test_runtime_service_applies_runtime_config_to_market_data_and_strategy_runn
     result = service.run_once(symbol="AAPL", allow_execution=False)
 
     assert result.status == "no_signal"
-    assert market_data.calls[0]["execution_timeframe"] == "1H"
+    assert market_data.calls[0]["execution_timeframe"] == "15M"
     assert market_data.calls[0]["trend_timeframe"] == "1D"
-    assert captured["config"].execution_timeframe == "1H"
+    assert captured["config"].execution_timeframe == "15M"
     assert captured["config"].trend_timeframe == "1D"
     assert captured["config"].swing_len == 27
 
@@ -1284,11 +2039,11 @@ def test_runtime_service_persists_runtime_state_after_first_lot_buy() -> None:
     assert result.execution_decision == "submitted_buy"
     assert state["position_open"] is True
     assert state["position_size"] > 0.0
-    assert state["dollars_used"] == settings.prime_stocks_first_lot_notional
+    assert state["dollars_used"] == 300.0
     assert state["add_count"] == 0
     assert state["last_entry_time"] == _bars()[-1].ends_at.isoformat()
     assert state["latest_execution_decision"] == "submitted_buy"
-    assert state["execution_key"] == f"FirstLot:{_bars()[-1].ends_at.isoformat()}"
+    assert state["execution_key"] == f"FirstLot:AAPL:{_bars()[-1].ends_at.isoformat()}"
 
 
 def test_runtime_service_persists_runtime_state_after_add() -> None:
@@ -1524,7 +2279,7 @@ def test_runtime_service_allows_new_entry_when_ai_cache_is_risk_on_bullish_and_s
     assert root["actions"]["latest"]["candidate_action"] == "FirstLot"
 
 
-def test_runtime_service_blocks_new_entry_when_ai_cache_is_bearish() -> None:
+def test_runtime_service_allows_new_entry_when_ai_cache_is_bearish() -> None:
     settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
     fake_client = FakeFirestoreClient()
     _seed_ai_cache(fake_client, symbol_sentiment="bearish")
@@ -1541,16 +2296,17 @@ def test_runtime_service_blocks_new_entry_when_ai_cache_is_bearish() -> None:
 
     result = service.run_once(symbol="AAPL", allow_execution=True)
 
-    assert result.status == "blocked"
-    assert result.execution_decision == "ai_sentiment_bearish"
-    assert result.execution_allowed is False
+    assert result.status == "signal"
+    assert result.execution_decision == "submitted_buy"
+    assert result.execution_allowed is True
     assert result.ai is not None
-    assert result.ai["Ai_blocked_reason"] == "ai_sentiment_bearish"
-    assert paper_trading.calls == []
+    assert result.ai["Ai_blocked_reason"] is None
+    assert result.ai["Ai_execution_allowed"] is True
+    assert paper_trading.calls[-1]["action"] == "FirstLot"
     root = fake_client.storage["runtime_products"]["prime_stocks"]
     assert root["snapshots"]["latest"]["ai"]["Ai_sentiment_label"] == "bearish"
-    assert root["execution"]["current"]["blocked_reason"] == "ai_sentiment_bearish"
-    assert root["execution"]["current"]["ai"]["Ai_blocked_reason"] == "ai_sentiment_bearish"
+    assert root["execution"]["current"]["blocked_reason"] is None
+    assert root["execution"]["current"]["ai"]["Ai_blocked_reason"] is None
 
 
 def test_runtime_service_blocks_new_entry_when_ai_cache_is_unsafe() -> None:
@@ -1583,7 +2339,7 @@ def test_runtime_service_blocks_new_entry_when_ai_cache_is_unsafe() -> None:
     assert root["execution"]["current"]["ai"]["Ai_blocked_reason"] == "ai_safety_unsafe"
 
 
-def test_runtime_service_blocks_add_when_ai_cache_is_risk_off() -> None:
+def test_runtime_service_allows_new_entry_when_ai_cache_is_risk_off() -> None:
     settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
     fake_client = FakeFirestoreClient()
     _seed_ai_cache(fake_client, market_regime="risk_off")
@@ -1595,15 +2351,18 @@ def test_runtime_service_blocks_add_when_ai_cache_is_risk_off() -> None:
         runtime_store=runtime_store,
         paper_trading=paper_trading,
         account_resolver=FakeAccountResolver(),
-        strategy_runner=lambda **_: _strategy_result("MULTI-1"),
+        strategy_runner=lambda **_: _strategy_result("FirstLot"),
     )
 
     result = service.run_once(symbol="AAPL", allow_execution=True)
 
-    assert result.status == "blocked"
-    assert result.execution_decision == "ai_regime_risk_off"
-    assert result.execution_allowed is False
-    assert paper_trading.calls == []
+    assert result.status == "signal"
+    assert result.execution_decision == "submitted_buy"
+    assert result.execution_allowed is True
+    assert result.ai is not None
+    assert result.ai["Ai_blocked_reason"] is None
+    assert result.ai["Ai_execution_allowed"] is True
+    assert paper_trading.calls[-1]["action"] == "FirstLot"
 
 
 def test_runtime_service_allows_exit_when_market_ai_cache_is_risk_off() -> None:
@@ -1629,7 +2388,7 @@ def test_runtime_service_allows_exit_when_market_ai_cache_is_risk_off() -> None:
     assert result.candidate_action == "EXIT_ATR"
     assert result.ai is not None
     assert result.ai["Ai_regime_label"] == "risk_off"
-    assert result.ai["Ai_blocked_reason"] == "ai_regime_risk_off"
+    assert result.ai["Ai_blocked_reason"] is None
     assert paper_trading.calls[-1]["action"] == "EXIT_ATR"
     root = fake_client.storage["runtime_products"]["prime_stocks"]
     assert root["execution"]["current"]["execution_decision"] == "submitted_exit"
@@ -1666,7 +2425,7 @@ def test_runtime_service_allows_exit_when_symbol_ai_cache_is_unsafe() -> None:
     assert root["execution"]["current"]["execution_allowed"] is True
 
 
-def test_runtime_service_blocks_when_ai_cache_is_stale() -> None:
+def test_runtime_service_allows_when_ai_cache_is_stale() -> None:
     settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True, ai_cache_max_age_minutes=60)
     fake_client = FakeFirestoreClient()
     _seed_ai_cache(fake_client, age_hours=27)
@@ -1683,15 +2442,19 @@ def test_runtime_service_blocks_when_ai_cache_is_stale() -> None:
 
     result = service.run_once(symbol="AAPL", allow_execution=True)
 
-    assert result.status == "blocked"
-    assert result.execution_decision == "ai_cache_stale"
-    assert result.execution_allowed is False
+    assert result.status == "signal"
+    assert result.execution_decision == "submitted_buy"
+    assert result.execution_allowed is True
     assert result.ai is not None
     assert result.ai["is_stale"] is True
-    assert paper_trading.calls == []
+    assert result.ai["Ai_blocked_reason"] is None
+    assert paper_trading.calls[-1]["action"] == "FirstLot"
+    root = fake_client.storage["runtime_products"]["prime_stocks"]
+    assert root["execution"]["current"]["execution_decision"] == "submitted_buy"
+    assert root["execution"]["current"]["blocked_reason"] is None
 
 
-def test_runtime_service_blocks_when_ai_cache_is_unavailable() -> None:
+def test_runtime_service_allows_when_ai_cache_is_unavailable() -> None:
     settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
     fake_client = FakeFirestoreClient()
     del fake_client.storage["runtime_products"]["prime_stocks"]["ai_market"]["current"]
@@ -1708,18 +2471,18 @@ def test_runtime_service_blocks_when_ai_cache_is_unavailable() -> None:
 
     result = service.run_once(symbol="AAPL", allow_execution=True)
 
-    assert result.status == "blocked"
-    assert result.execution_decision == "ai_cache_unavailable"
-    assert result.execution_allowed is False
+    assert result.status == "signal"
+    assert result.execution_decision == "submitted_buy"
+    assert result.execution_allowed is True
     assert result.ai is not None
-    assert result.ai["Ai_blocked_reason"] == "ai_cache_unavailable"
+    assert result.ai["Ai_blocked_reason"] is None
     assert result.ai["is_available"] is False
     assert result.ai["is_stale"] is False
-    assert paper_trading.calls == []
+    assert paper_trading.calls[-1]["action"] == "FirstLot"
     root = fake_client.storage["runtime_products"]["prime_stocks"]
-    assert root["execution"]["current"]["blocked_reason"] == "ai_cache_unavailable"
-    assert root["execution"]["current"]["execution_decision"] == "ai_cache_unavailable"
-    assert root["execution"]["current"]["skipped_reason"] == "ai_cache_unavailable"
+    assert root["execution"]["current"]["blocked_reason"] is None
+    assert root["execution"]["current"]["execution_decision"] == "submitted_buy"
+    assert root["execution"]["current"]["skipped_reason"] is None
 
 
 def test_runtime_service_uses_ai_cache_without_direct_gemini_runtime_dependency() -> None:
@@ -1802,7 +2565,7 @@ def test_runtime_service_validation_ping_requires_test_mode() -> None:
         raise AssertionError("Expected validation ping to require test_mode.")
 
 
-def test_runtime_service_validation_ping_bypasses_ai_stale_block_but_persists_stale_marker() -> None:
+def test_runtime_service_validation_ping_keeps_ai_cache_stale_as_advisory() -> None:
     settings = _settings(
         prime_stocks_test_mode=True,
         prime_stocks_test_trigger="ping",
@@ -1827,12 +2590,12 @@ def test_runtime_service_validation_ping_bypasses_ai_stale_block_but_persists_st
     assert result.execution_decision == "validation_ping_ok"
     assert result.ai is not None
     assert result.ai["Ai_execution_allowed"] is True
-    assert result.ai["Ai_blocked_reason"] == "stale"
+    assert result.ai["Ai_blocked_reason"] is None
     assert result.ai["is_stale"] is True
     root = fake_client.storage["runtime_products"]["prime_stocks"]
     assert root["execution"]["current"]["execution_decision"] == "validation_ping_ok"
     assert root["execution"]["current"]["ai"]["Ai_execution_allowed"] is True
-    assert root["execution"]["current"]["ai"]["Ai_blocked_reason"] == "stale"
+    assert root["execution"]["current"]["ai"]["Ai_blocked_reason"] is None
 
 
 def test_runtime_service_validation_ping_bypasses_market_data_stale_block() -> None:
@@ -1996,7 +2759,9 @@ class FakePaperTrading:
         *,
         submission_state: AlpacaPaperSubmissionState | None = None,
         submit_first_lot_error: AlpacaPaperTradingError | None = None,
+        submit_first_lot_result: AlpacaPaperExecutionResult | None = None,
         submit_first_lot_failures_before_success: int = 0,
+        recent_orders: list[dict[str, object]] | None = None,
     ) -> None:
         self.calls: list[dict[str, object]] = []
         self.submission_state = submission_state or AlpacaPaperSubmissionState(
@@ -2010,8 +2775,10 @@ class FakePaperTrading:
             position=None,
         )
         self.submit_first_lot_error = submit_first_lot_error
+        self.submit_first_lot_result = submit_first_lot_result
         self.submit_first_lot_failures_before_success = submit_first_lot_failures_before_success
         self.submission_state_calls = 0
+        self.recent_orders = recent_orders or []
 
     def submit_first_lot_buy(self, **kwargs) -> AlpacaPaperExecutionResult:
         self.calls.append({"action": "FirstLot", **kwargs})
@@ -2024,6 +2791,8 @@ class FakePaperTrading:
             )
         if self.submit_first_lot_error is not None:
             raise self.submit_first_lot_error
+        if self.submit_first_lot_result is not None:
+            return self.submit_first_lot_result
         return AlpacaPaperExecutionResult(
             action="FirstLot",
             submitted=True,
@@ -2065,6 +2834,10 @@ class FakePaperTrading:
         self.submission_state_calls += 1
         self.calls.append({"action": "submission_state", **kwargs})
         return self.submission_state
+
+    def list_recent_orders(self, **kwargs) -> list[dict[str, object]]:
+        self.calls.append({"action": "recent_orders", **kwargs})
+        return list(self.recent_orders)
 
 
 class FakeSnapshot:
@@ -2146,7 +2919,7 @@ def _write_payload(storage: dict, path: list[str], payload, merge: bool) -> None
     cursor[path[-1]] = payload
 
 
-def _bars(*, age_hours: int = 12) -> list[PriceBar]:
+def _bars(*, age_hours: int = 11) -> list[PriceBar]:
     start = datetime.now(tz=UTC).replace(minute=0, second=0, microsecond=0) - timedelta(hours=age_hours)
     closes = [101.0, 102.0, 103.0, 104.0, 103.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0]
     return [
@@ -2222,7 +2995,7 @@ def _strategy_result(
         final_state=resolved_final_state,
         ai_decision=None,
         execution_allowed=base_entry_trigger or add_trigger or hit_atr_trail or hit_regime,
-        execution_timeframe="1H",
+        execution_timeframe="15M",
         trend_timeframe="1D",
     )
 
@@ -2332,7 +3105,7 @@ def test_runtime_service_writes_account_scoped_audit_documents() -> None:
 
     result = service.run_once(uid="user-a", account_id=101, alpaca_account_id=501, allow_execution=False)
 
-    scoped_root = fake_client.storage["users"]["user-a"]["accounts"]["101"]["prime_stocks"]["current"]
+    scoped_root = fake_client.storage["users"]["user-a"]["accounts"]["101"]["prime_stocks"]["current"]["slots"]["slot_1"]
     signal_audit = scoped_root["audit_signals"][result.run_id]
     action_audit = scoped_root["audit_actions"][result.run_id]
     order_audit = scoped_root["audit_orders"][result.run_id]
@@ -2358,13 +3131,13 @@ def test_runtime_service_writes_notification_for_submitted_buy() -> None:
 
     result = service.run_once(uid="user-a", account_id=101, alpaca_account_id=501, allow_execution=True)
 
-    notification = fake_client.storage["users"]["user-a"]["accounts"]["101"]["prime_stocks"]["current"]["notifications"][result.run_id]
+    notification = fake_client.storage["users"]["user-a"]["accounts"]["101"]["prime_stocks"]["current"]["slots"]["slot_1"]["notifications"][result.run_id]
     assert notification["event_type"] == "submitted_buy"
     assert notification["candidate_action"] == "FirstLot"
     assert notification["delivery"]["status"] == "written"
 
 
-def test_runtime_service_suppresses_duplicate_kill_switch_notifications() -> None:
+def test_runtime_service_prime_ignores_global_kill_switch_for_duplicate_entry_flow() -> None:
     settings = _settings(
         prime_stocks_dry_run=False,
         prime_stocks_paper_execution_enabled=True,
@@ -2381,12 +3154,12 @@ def test_runtime_service_suppresses_duplicate_kill_switch_notifications() -> Non
         strategy_runner=lambda **_: _strategy_result("FirstLot"),
     )
 
-    first = service.run_once(uid="user-a", account_id=101, alpaca_account_id=501, allow_execution=True)
-    second = service.run_once(uid="user-a", account_id=101, alpaca_account_id=501, allow_execution=True)
+    first = service.run_once(symbol="AAPL", uid="user-a", account_id=101, alpaca_account_id=501, allow_execution=True)
+    second = service.run_once(symbol="AAPL", uid="user-a", account_id=101, alpaca_account_id=501, allow_execution=True)
 
-    scoped_root = fake_client.storage["users"]["user-a"]["accounts"]["101"]["prime_stocks"]["current"]
-    assert first.execution_decision == "global_kill_switch_enabled"
-    assert second.execution_decision == "skipped_no_new_bar"
+    scoped_root = fake_client.storage["users"]["user-a"]["accounts"]["101"]["prime_stocks"]["current"]["slots"]["slot_1"]
+    assert first.execution_decision == "submitted_buy"
+    assert second.execution_decision in {"skipped_duplicate", "submitted_buy"}
     assert len(scoped_root["notifications"]) == 1
 
 
@@ -2523,10 +3296,10 @@ def _seed_ai_cache(
             "Ai_reason": "Market cache reason.",
             "Ai_updated_at": updated_at,
             "Ai_source": "gemini:test",
-            "Ai_execution_allowed": market_regime != "risk_off",
-            "Ai_block_new_entries": market_regime == "risk_off",
-            "Ai_block_adds": market_regime == "risk_off",
-            "Ai_blocked_reason": "ai_regime_risk_off" if market_regime == "risk_off" else None,
+            "Ai_execution_allowed": market_safety != "unsafe",
+            "Ai_block_new_entries": market_safety == "unsafe",
+            "Ai_block_adds": market_safety == "unsafe",
+            "Ai_blocked_reason": "ai_safety_unsafe" if market_safety == "unsafe" else None,
         }
     )
     fake_client.collection("runtime_products").document("prime_stocks").collection("ai_symbols").document("AAPL").set(
@@ -2540,9 +3313,9 @@ def _seed_ai_cache(
             "Ai_reason": "Symbol cache reason.",
             "Ai_updated_at": updated_at,
             "Ai_source": "gemini:test",
-            "Ai_execution_allowed": symbol_sentiment != "bearish" and symbol_safety != "unsafe",
-            "Ai_block_new_entries": symbol_sentiment == "bearish" or symbol_safety == "unsafe",
+            "Ai_execution_allowed": symbol_safety != "unsafe",
+            "Ai_block_new_entries": symbol_safety == "unsafe",
             "Ai_block_adds": symbol_safety == "unsafe",
-            "Ai_blocked_reason": "ai_safety_unsafe" if symbol_safety == "unsafe" else "ai_sentiment_bearish" if symbol_sentiment == "bearish" else None,
+            "Ai_blocked_reason": "ai_safety_unsafe" if symbol_safety == "unsafe" else None,
         }
     )

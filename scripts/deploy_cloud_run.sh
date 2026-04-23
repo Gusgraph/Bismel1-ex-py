@@ -12,10 +12,11 @@
 
 set -euo pipefail
 
-SERVICE_NAME="${SERVICE_NAME:-bismel1-prime-stocks}"
-REGION="${REGION:-us-central1}"
+SERVICE_NAME="${SERVICE_NAME:?Set SERVICE_NAME before deploying.}"
+REGION="${REGION:-us-east1}"
 PROJECT_ID="${PROJECT_ID:?Set PROJECT_ID before deploying.}"
-IMAGE_URI="${IMAGE_URI:?Set IMAGE_URI to the built container image.}"
+IMAGE_URI="${IMAGE_URI:-}"
+SOURCE_DIR="${SOURCE_DIR:-}"
 SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-}"
 SECRET_ENV_VARS="${SECRET_ENV_VARS:-}"
 
@@ -23,10 +24,23 @@ DEPLOY_CMD=(
   gcloud run deploy "${SERVICE_NAME}"
   --project "${PROJECT_ID}"
   --region "${REGION}"
-  --image "${IMAGE_URI}"
   --platform managed
   --no-allow-unauthenticated
 )
+
+if [[ -n "${IMAGE_URI}" && -n "${SOURCE_DIR}" ]]; then
+  printf 'Set only one of IMAGE_URI or SOURCE_DIR.\n' >&2
+  exit 1
+fi
+
+if [[ -n "${IMAGE_URI}" ]]; then
+  DEPLOY_CMD+=(--image "${IMAGE_URI}")
+elif [[ -n "${SOURCE_DIR}" ]]; then
+  DEPLOY_CMD+=(--source "${SOURCE_DIR}")
+else
+  printf 'Set IMAGE_URI or SOURCE_DIR before deploying.\n' >&2
+  exit 1
+fi
 
 if [[ -n "${SERVICE_ACCOUNT}" ]]; then
   DEPLOY_CMD+=(--service-account "${SERVICE_ACCOUNT}")
@@ -34,6 +48,10 @@ fi
 
 if [[ -n "${SECRET_ENV_VARS}" ]]; then
   DEPLOY_CMD+=(--set-secrets "${SECRET_ENV_VARS}")
+fi
+
+if [[ $# -gt 0 ]]; then
+  DEPLOY_CMD+=("$@")
 fi
 
 printf 'Deploying Cloud Run service %s in %s\n' "${SERVICE_NAME}" "${REGION}"

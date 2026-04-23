@@ -170,6 +170,86 @@ class AlpacaPaperTradingAdapter:
             credential_context=credential_context,
         )
 
+    def submit_market_order_qty(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        qty: float,
+        client_order_id: str,
+        action: str,
+        credential_context: ResolvedAlpacaAccountContext | None = None,
+    ) -> AlpacaPaperExecutionResult:
+        normalized_side = (side or "").strip().lower()
+        if normalized_side not in {"buy", "sell"}:
+            raise ValueError(f"Market order side must be 'buy' or 'sell'. Received {side!r}.")
+        if qty <= 0:
+            raise ValueError("Market order qty must be greater than zero.")
+        base_url = self._resolve_base_url(credential_context).rstrip("/")
+        payload = self._request_json(
+            url=f"{base_url}/v2/orders",
+            method="POST",
+            headers=self._headers(client_order_id=client_order_id, credential_context=credential_context),
+            payload={
+                "symbol": symbol.upper(),
+                "side": normalized_side,
+                "type": "market",
+                "time_in_force": "day",
+                "qty": _format_qty(qty),
+                "client_order_id": client_order_id,
+            },
+        )
+        return AlpacaPaperExecutionResult(
+            action=action,
+            submitted=True,
+            order_status=str(payload.get("status", "submitted")),
+            order_id=_maybe_string(payload.get("id")),
+            client_order_id=_maybe_string(payload.get("client_order_id")) or client_order_id,
+            side=normalized_side,
+            notional=_maybe_float(payload.get("notional")),
+            raw_response=payload,
+        )
+
+    def submit_market_order_notional(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        notional: float,
+        client_order_id: str,
+        action: str,
+        credential_context: ResolvedAlpacaAccountContext | None = None,
+    ) -> AlpacaPaperExecutionResult:
+        normalized_side = (side or "").strip().lower()
+        if normalized_side != "buy":
+            raise ValueError("Notional market orders are currently supported for buy side only.")
+        if notional <= 0:
+            raise ValueError("Market order notional must be greater than zero.")
+        base_url = self._resolve_base_url(credential_context).rstrip("/")
+        payload = self._request_json(
+            url=f"{base_url}/v2/orders",
+            method="POST",
+            headers=self._headers(client_order_id=client_order_id, credential_context=credential_context),
+            payload={
+                "symbol": symbol.upper(),
+                "side": normalized_side,
+                "type": "market",
+                "time_in_force": "day",
+                "notional": round(notional, 2),
+                "client_order_id": client_order_id,
+            },
+        )
+        return AlpacaPaperExecutionResult(
+            action=action,
+            submitted=True,
+            order_status=str(payload.get("status", "submitted")),
+            order_id=_maybe_string(payload.get("id")),
+            client_order_id=_maybe_string(payload.get("client_order_id")) or client_order_id,
+            side=normalized_side,
+            notional=round(notional, 2),
+            raw_response=payload,
+        )
+
     def close_position(
         self,
         *,
@@ -181,6 +261,21 @@ class AlpacaPaperTradingAdapter:
         credential_context: ResolvedAlpacaAccountContext | None = None,
     ) -> AlpacaPaperExecutionResult:
         self._ensure_stock_context(asset_type=asset_type, product_key=product_key)
+        return self.close_position_symbol(
+            symbol=symbol,
+            action=action,
+            client_order_id=client_order_id,
+            credential_context=credential_context,
+        )
+
+    def close_position_symbol(
+        self,
+        *,
+        symbol: str,
+        action: str,
+        client_order_id: str,
+        credential_context: ResolvedAlpacaAccountContext | None = None,
+    ) -> AlpacaPaperExecutionResult:
         base_url = self._resolve_base_url(credential_context).rstrip("/")
         payload = self._request_json(
             url=f"{base_url}/v2/positions/{symbol.upper()}",
@@ -250,6 +345,54 @@ class AlpacaPaperTradingAdapter:
                 qty=_maybe_float(position_payload.get("qty")) or 0.0,
                 market_value=_maybe_float(position_payload.get("market_value")),
             ),
+        )
+
+    def list_recent_orders(
+        self,
+        *,
+        credential_context: ResolvedAlpacaAccountContext | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, object]]:
+        base_url = self._resolve_base_url(credential_context).rstrip("/")
+        payload = self._request_json(
+            url=f"{base_url}/v2/orders?status=all&limit={max(1, int(limit))}",
+            method="GET",
+            headers=self._headers(client_order_id="prime-orders-probe", credential_context=credential_context),
+        )
+        return payload if isinstance(payload, list) else []
+
+    def cancel_order(
+        self,
+        *,
+        order_id: str,
+        client_order_id: str | None,
+        action: str,
+        credential_context: ResolvedAlpacaAccountContext | None = None,
+    ) -> AlpacaPaperExecutionResult:
+        resolved_order_id = order_id.strip()
+        if resolved_order_id == "":
+            raise ValueError("Cancel order requires a non-empty order_id.")
+        base_url = self._resolve_base_url(credential_context).rstrip("/")
+        payload = self._request_json(
+            url=f"{base_url}/v2/orders/{resolved_order_id}",
+            method="DELETE",
+            headers=self._headers(
+                client_order_id=client_order_id or f"execution-cancel-{resolved_order_id}",
+                credential_context=credential_context,
+            ),
+        )
+        return AlpacaPaperExecutionResult(
+            action=action,
+            submitted=True,
+            order_status=str(payload.get("status", "canceled")),
+            order_id=resolved_order_id,
+            client_order_id=client_order_id,
+            side=_maybe_string(payload.get("side")),
+            notional=_maybe_float(payload.get("notional")),
+            raw_response={
+                "cancel_status": str(payload.get("status", "canceled")),
+                **(payload if isinstance(payload, dict) else {}),
+            },
         )
 
     def _submit_notional_buy(
@@ -363,6 +506,10 @@ def _maybe_float(value: object) -> float | None:
     if value is None or value == "":
         return None
     return float(value)
+
+
+def _format_qty(value: float) -> str:
+    return format(float(value), ".8f").rstrip("0").rstrip(".")
 
 
 def _sum_position_market_value(payload: dict[str, object] | list[object]) -> float | None:

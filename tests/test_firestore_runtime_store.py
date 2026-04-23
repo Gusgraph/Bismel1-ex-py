@@ -3,13 +3,86 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from app.services.firestore_runtime_store import (
+    _build_strategy_reasoning_payload,
     PrimeStocksFirestoreRuntimeStore,
     PrimeStocksLatestExecutionRecord,
     PrimeStocksRuntimeConfigRecord,
     PrimeStocksRuntimeStateRecord,
     PrimeStocksRuntimeStoreError,
+    build_default_runtime_config,
+)
+from app.products.stocks.bismel1.models import (
+    BismillahTrobotStocksV1State,
+    PineComputedSeries,
+    PineSignalSnapshot,
+    PrimeStocksStrategyResult,
 )
 from app.shared.config import AppConfig
+
+
+class FakeSnapshot:
+    def __init__(self, payload):
+        self._payload = payload
+
+    @property
+    def exists(self):
+        return self._payload is not None
+
+    def to_dict(self):
+        return self._payload
+
+
+class FakeDocumentReference:
+    def __init__(self, storage: dict, path: list[str]) -> None:
+        self._storage = storage
+        self._path = path
+
+    def collection(self, name: str):
+        return FakeCollectionReference(self._storage, [*self._path, name])
+
+    def get(self):
+        return FakeSnapshot(_resolve_payload(self._storage, self._path))
+
+    def set(self, payload, merge: bool = False):
+        _write_payload(self._storage, self._path, payload, merge=merge)
+
+
+class FakeCollectionReference:
+    def __init__(self, storage: dict, path: list[str]) -> None:
+        self._storage = storage
+        self._path = path
+
+    def document(self, name: str):
+        return FakeDocumentReference(self._storage, [*self._path, name])
+
+
+class FakeFirestoreClient:
+    def __init__(self) -> None:
+        self.storage: dict = {}
+
+    def collection(self, name: str):
+        return FakeCollectionReference(self.storage, [name])
+
+
+def _resolve_payload(storage: dict, path: list[str]):
+    cursor = storage
+    for part in path:
+        if part not in cursor:
+            return None
+        cursor = cursor[part]
+    return cursor
+
+
+def _write_payload(storage: dict, path: list[str], payload, merge: bool) -> None:
+    cursor = storage
+    for part in path[:-1]:
+        cursor = cursor.setdefault(part, {})
+    existing = cursor.get(path[-1], {})
+    if merge and isinstance(existing, dict):
+        existing.update(payload)
+        cursor[path[-1]] = existing
+        return
+    cursor[path[-1]] = payload
 
 
 
@@ -118,6 +191,347 @@ def test_load_runtime_config_document_not_found(mock_app_config):
 
         mock_load_runtime_config.assert_called_once_with(default_config)
         assert config == default_config
+
+
+def test_build_default_runtime_config_defaults_to_scalper(mock_app_config):
+    config = build_default_runtime_config(mock_app_config)
+    assert config.strategy_mode == "scalper"
+
+
+def test_load_runtime_config_upgrades_tiny_persisted_bar_limits(mock_app_config):
+    fake_client = FakeFirestoreClient()
+    store = PrimeStocksFirestoreRuntimeStore(settings=mock_app_config, client=fake_client)
+    default_config = build_default_runtime_config(mock_app_config)
+
+    fake_client.storage["runtime_products"] = {
+        "prime_stocks": {
+            "config": {
+                "current": {
+                    "product_key": "stocks.bismel1",
+                    "strategy_key": "prime_stocks",
+                    "strategy_title": "Prime Stocks Bot Trader",
+                    "symbol": "AAPL",
+                    "asset_type": "stock",
+                    "enabled": True,
+                    "dry_run": True,
+                    "paper_execution_enabled": True,
+                    "live_execution_enabled": False,
+                    "execution_timeframe": "15M",
+                    "trend_timeframe": "1D",
+                    "execution_bar_limit": 19,
+                    "trend_bar_limit": 11,
+                }
+            }
+        }
+    }
+
+    config = store.load_runtime_config(default_config)
+
+    assert config.execution_bar_limit == 160
+    assert config.trend_bar_limit == 120
+
+
+def test_load_runtime_config_clears_symbols_for_different_linked_account(mock_app_config):
+    fake_client = FakeFirestoreClient()
+    store = PrimeStocksFirestoreRuntimeStore(settings=mock_app_config, client=fake_client)
+    default_config = build_default_runtime_config(mock_app_config)
+    scoped_config = PrimeStocksRuntimeConfigRecord(
+        **{
+            **default_config.__dict__,
+            "uid": "user-a",
+            "account_id": 101,
+            "alpaca_account_id": 999,
+            "slot_number": 1,
+        }
+    )
+
+    fake_client.storage["users"] = {
+        "user-a": {
+            "accounts": {
+                "101": {
+                    "prime_stocks": {
+                        "current": {
+                            "slots": {
+                                "slot_1": {
+                                    "config": {
+                                        "current": {
+                                            **default_config.__dict__,
+                                            "uid": "user-a",
+                                            "account_id": 101,
+                                            "alpaca_account_id": 501,
+                                            "slot_number": 1,
+                                            "selected_symbols": ["AAPL"],
+                                            "symbol_states": [{"symbol": "AAPL", "mode": "active"}],
+                                            "updated_at": "2026-04-20T12:00:00+00:00",
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    config = store.load_runtime_config(scoped_config)
+
+    assert config.product_key == default_config.product_key
+    assert config.strategy_title == default_config.strategy_title
+    assert config.selected_symbols == []
+    assert config.symbol_states == []
+
+
+def test_migrate_account_scoped_runtime_to_slot_skips_different_linked_account(mock_app_config):
+    fake_client = FakeFirestoreClient()
+    store = PrimeStocksFirestoreRuntimeStore(settings=mock_app_config, client=fake_client)
+    default_config = build_default_runtime_config(mock_app_config)
+
+    fake_client.storage["users"] = {
+        "user-a": {
+            "accounts": {
+                "101": {
+                    "prime_stocks": {
+                        "current": {
+                            "config": {
+                                "current": {
+                                    **default_config.__dict__,
+                                    "uid": "user-a",
+                                    "account_id": 101,
+                                    "alpaca_account_id": 501,
+                                    "selected_symbols": ["AAPL"],
+                                    "symbol_states": [{"symbol": "AAPL", "mode": "active"}],
+                                    "updated_at": "2026-04-20T12:00:00+00:00",
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    store.migrate_account_scoped_runtime_to_slot(
+        uid="user-a",
+        account_id=101,
+        slot_number=1,
+        expected_alpaca_account_id=999,
+    )
+
+    assert _resolve_payload(
+        fake_client.storage,
+        ["users", "user-a", "accounts", "101", "prime_stocks", "current", "slots", "slot_1", "config", "current"],
+    ) is None
+
+
+def test_migrate_account_scoped_runtime_to_slot_does_not_promote_config_symbols(mock_app_config):
+    fake_client = FakeFirestoreClient()
+    store = PrimeStocksFirestoreRuntimeStore(settings=mock_app_config, client=fake_client)
+    default_config = build_default_runtime_config(mock_app_config)
+
+    fake_client.storage["users"] = {
+        "user-a": {
+            "accounts": {
+                "101": {
+                    "prime_stocks": {
+                        "current": {
+                            "config": {
+                                "current": {
+                                    **default_config.__dict__,
+                                    "uid": "user-a",
+                                    "account_id": 101,
+                                    "alpaca_account_id": 501,
+                                    "selected_symbols": ["AAPL", "NVDA"],
+                                    "symbol_states": [
+                                        {"symbol": "AAPL", "mode": "active"},
+                                        {"symbol": "NVDA", "mode": "active"},
+                                    ],
+                                    "updated_at": "2026-04-20T12:00:00+00:00",
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    store.migrate_account_scoped_runtime_to_slot(
+        uid="user-a",
+        account_id=101,
+        slot_number=1,
+        expected_alpaca_account_id=501,
+    )
+
+    assert _resolve_payload(
+        fake_client.storage,
+        ["users", "user-a", "accounts", "101", "prime_stocks", "current", "slots", "slot_1", "config", "current"],
+    ) is None
+
+
+def test_write_runtime_cycle_summary_replaces_stale_symbol_rows(mock_app_config):
+    fake_client = FakeFirestoreClient()
+    store = PrimeStocksFirestoreRuntimeStore(settings=mock_app_config, client=fake_client)
+
+    fake_client.storage["users"] = {
+        "user-a": {
+            "accounts": {
+                "101": {
+                    "prime_stocks": {
+                        "current": {
+                            "slots": {
+                                "slot_1": {
+                                    "cycles": {
+                                        "latest": {
+                                            "per_symbol_results": [
+                                                {"symbol": "AAPL", "execution_decision": "submitted_buy"},
+                                                {"symbol": "MSFT", "execution_decision": "no_op"},
+                                            ],
+                                            "symbol_states": {
+                                                "AAPL": {"symbol": "AAPL"},
+                                                "MSFT": {"symbol": "MSFT"},
+                                            },
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    store.write_runtime_cycle_summary(
+        uid="user-a",
+        account_id=101,
+        alpaca_account_id=999,
+        slot_number=1,
+        run_id="run-1",
+        trigger_type="scheduled",
+        trigger_source="test",
+        target_count=1,
+        completed_count=1,
+        results=[{"symbol": "NVDA", "execution_decision": "no_op", "run_id": "run-1"}],
+        service_revision="rev-1",
+        service_name="svc-1",
+    )
+
+    cycle = _resolve_payload(
+        fake_client.storage,
+        ["users", "user-a", "accounts", "101", "prime_stocks", "current", "slots", "slot_1", "cycles", "latest"],
+    )
+    assert [item["symbol"] for item in cycle["per_symbol_results"]] == ["NVDA"]
+    assert sorted(cycle["symbol_states"].keys()) == ["NVDA"]
+
+
+def test_write_runtime_cycle_summary_omits_no_active_symbols_placeholder_rows(mock_app_config):
+    fake_client = FakeFirestoreClient()
+    store = PrimeStocksFirestoreRuntimeStore(settings=mock_app_config, client=fake_client)
+
+    store.write_runtime_cycle_summary(
+        uid="user-a",
+        account_id=101,
+        alpaca_account_id=999,
+        slot_number=1,
+        run_id="run-1",
+        trigger_type="scheduled",
+        trigger_source="test",
+        target_count=1,
+        completed_count=1,
+        results=[{
+            "symbol": "AAPL",
+            "execution_decision": "no_active_symbols_configured",
+            "skipped_reason": "no_active_symbols_configured",
+            "run_id": "run-1",
+        }],
+        service_revision="rev-1",
+        service_name="svc-1",
+    )
+
+    cycle = _resolve_payload(
+        fake_client.storage,
+        ["users", "user-a", "accounts", "101", "prime_stocks", "current", "slots", "slot_1", "cycles", "latest"],
+    )
+    assert cycle["per_symbol_results"] == []
+    assert cycle["symbol_states"] == {}
+    assert cycle["symbols_scanned"] == []
+    assert cycle["symbols_scanned_count"] == 0
+
+
+def test_build_strategy_reasoning_payload_includes_signal_score() -> None:
+    strategy_result = PrimeStocksStrategyResult(
+        product_key="stocks.bismel1",
+        pine_strategy_title="Prime Stocks Bot Trader",
+        status="signal",
+        message="ok",
+        series=PineComputedSeries(
+            trend_ok=[True],
+            trend_base_htf=[True],
+            htf_ema_slow_slope_up=[True],
+            in_pullback_zone=[True],
+            setup_ready=[True],
+            setup_age_bars=[0],
+            setup_invalidated=[False],
+            momentum_confirm=[True],
+        ),
+        latest_signal=PineSignalSnapshot(
+            base_entry_signal=True,
+            base_entry_trigger=True,
+            add_bounce_confirm=False,
+            gate_atr_ok=False,
+            gate_dp_ok=False,
+            cap_ok=False,
+            add_signal_raw=False,
+            add_trigger=False,
+            hit_atr_trail=False,
+            hit_regime=False,
+        ),
+        latest_bar=None,
+        final_state=BismillahTrobotStocksV1State(),
+        signal_score=88.5,
+    )
+
+    payload = _build_strategy_reasoning_payload(
+        strategy_result=strategy_result,
+        candidate_action="FirstLot",
+        execution_decision="submitted_buy",
+        ai_decision=None,
+    )
+
+    assert payload["signal_score"] == 88.5
+
+
+def test_write_prime_stocks_trade_performance_updates_trade_and_summary_docs(mock_app_config):
+    fake_client = FakeFirestoreClient()
+    store = PrimeStocksFirestoreRuntimeStore(settings=mock_app_config, client=fake_client)
+
+    store.write_prime_stocks_trade_performance(
+        uid="user-a",
+        account_id=101,
+        trade_id="trade-1",
+        trade_payload={
+            "symbol": "USO",
+            "realized_pnl_dollars": 12.5,
+            "entry_notional": 300.0,
+            "exit_notional": 312.5,
+            "updated_at": "2026-04-16T20:30:00+00:00",
+        },
+    )
+
+    performance_root = fake_client.storage["users"]["user-a"]["accounts"]["101"]["performance"]["current"]
+    trade_doc = performance_root["trades"]["trade-1"]
+    summary_doc = performance_root["summary"]["current"]
+
+    assert trade_doc["symbol"] == "USO"
+    assert trade_doc["trade_id"] == "trade-1"
+    assert trade_doc["realized_pnl_dollars"] == 12.5
+    assert summary_doc["total_trades"] == 1
+    assert summary_doc["wins"] == 1
+    assert summary_doc["losses"] == 0
+    assert summary_doc["win_rate"] == 100.0
+    assert summary_doc["best_symbol"] == "USO"
+    assert summary_doc["worst_symbol"] == "USO"
 
 def test_load_latest_execution_record_document_not_found(mock_app_config):
     default_record = PrimeStocksLatestExecutionRecord()
@@ -238,12 +652,94 @@ def test_load_runtime_config_wraps_firestore_errors(mock_app_config):
         store.load_runtime_config(default_config)
 
 
+@pytest.mark.parametrize(
+    "persisted_execution_timeframe, expected_warning_fragment",
+    [
+        ("1H", "normalized execution_timeframe from 1H to 15M"),
+        ("bogus", "normalized execution_timeframe from BOGUS to 15M"),
+    ],
+)
+def test_load_runtime_config_normalizes_invalid_or_non_15m_execution_timeframe(
+    mock_app_config,
+    persisted_execution_timeframe,
+    expected_warning_fragment,
+    caplog,
+):
+    client = MagicMock()
+    config_document = MagicMock()
+    config_document.get.return_value = MagicMock(
+        exists=True,
+        to_dict=MagicMock(return_value={
+            "execution_timeframe": persisted_execution_timeframe,
+            "trend_timeframe": "1D",
+        }),
+    )
+    document_level_1 = MagicMock()
+    document_level_2 = MagicMock()
+    document_level_3 = MagicMock()
+    document_level_4 = MagicMock()
+    client.collection.return_value = document_level_1
+    document_level_1.document.return_value = document_level_2
+    document_level_2.collection.return_value = document_level_3
+    document_level_3.document.return_value = config_document
+    # Keep the mock chain explicit so the Firestore document path matches
+    # runtime_products/prime_stocks/config/current exactly.
+
+    default_config = PrimeStocksRuntimeConfigRecord(
+        product_key="stocks.bismel1",
+        strategy_key="prime_stocks",
+        strategy_title="Prime Stocks Bot Trader",
+        symbol="AAPL",
+        asset_type="stock",
+        enabled=True,
+        dry_run=True,
+        paper_execution_enabled=True,
+        live_execution_enabled=False,
+        ping_enabled=False,
+        ping_mode="off",
+        ping_daily_heartbeat_enabled=False,
+        test_mode=False,
+        test_trigger=None,
+        test_symbol_override=None,
+        force_candidate_action=None,
+        ai_validation_bypass_enabled=False,
+        execution_timeframe="1H",
+        trend_timeframe="1D",
+        pullback_window=5,
+        execution_bar_limit=351,
+        trend_bar_limit=221,
+        first_lot_notional=101.0,
+        multi_notional=73.0,
+        max_notional_per_order=303.0,
+        max_total_notional_per_symbol=707.0,
+        max_add_count=2,
+        daily_order_cap=None,
+        max_open_positions=None,
+        broker_retry_max_attempts=1,
+        account_id=None,
+        alpaca_account_id=None,
+        runtime_target="cloud_run",
+        entitlement={},
+    )
+
+    with caplog.at_level("WARNING"):
+        config = PrimeStocksFirestoreRuntimeStore(settings=mock_app_config, client=client).load_runtime_config(
+            default_config
+        )
+
+    assert config.execution_timeframe == "15M"
+    assert expected_warning_fragment in caplog.text
+
+
 def test_get_paths_scopes_runtime_documents_per_user_and_account(mock_app_config):
     store = PrimeStocksFirestoreRuntimeStore(settings=mock_app_config)
 
     paths = store.get_paths(uid="user-a", account_id=11)
+    slot_paths = store.get_paths(uid="user-a", account_id=11, slot_number=1)
 
     assert paths.config_document == "users/user-a/accounts/11/prime_stocks/current/config/current"
     assert paths.state_document == "users/user-a/accounts/11/prime_stocks/current/state/current"
     assert paths.execution_document == "users/user-a/accounts/11/prime_stocks/current/execution/current"
     assert paths.logs_collection == "users/user-a/accounts/11/prime_stocks/current/logs"
+    assert slot_paths.config_document == "users/user-a/accounts/11/prime_stocks/current/slots/slot_1/config/current"
+    assert slot_paths.state_document == "users/user-a/accounts/11/prime_stocks/current/slots/slot_1/state/current"
