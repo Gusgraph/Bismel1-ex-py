@@ -22,6 +22,9 @@ from app.shared.config import AppConfig
 
 
 SUPPORTED_STOCK_ASSET_TYPES = frozenset({"stock", "stocks", "equity", "equities"})
+SUPPORTED_CRYPTO_ASSET_TYPES = frozenset({"crypto"})
+SUPPORTED_ADMIN_CRYPTO_MONITOR_SYMBOLS = frozenset({"UNI/USD", "LINK/USD"})
+SUPPORTED_ADMIN_CRYPTO_MONITOR_UIDS = frozenset({"admin-runtime-monitor-prime", "admin-runtime-monitor-execution"})
 SUPPORTED_PRODUCT_KEYS = frozenset({"stocks.bismel1"})
 
 
@@ -139,7 +142,12 @@ class AlpacaPaperTradingAdapter:
         client_order_id: str,
         credential_context: ResolvedAlpacaAccountContext | None = None,
     ) -> AlpacaPaperExecutionResult:
-        self._ensure_stock_context(asset_type=asset_type, product_key=product_key)
+        self._ensure_tradable_context(
+            symbol=symbol,
+            asset_type=asset_type,
+            product_key=product_key,
+            credential_context=credential_context,
+        )
         return self._submit_notional_buy(
             symbol=symbol,
             notional=notional,
@@ -160,7 +168,12 @@ class AlpacaPaperTradingAdapter:
         add_tier: int | None = None,
         credential_context: ResolvedAlpacaAccountContext | None = None,
     ) -> AlpacaPaperExecutionResult:
-        self._ensure_stock_context(asset_type=asset_type, product_key=product_key)
+        self._ensure_tradable_context(
+            symbol=symbol,
+            asset_type=asset_type,
+            product_key=product_key,
+            credential_context=credential_context,
+        )
         return self._submit_notional_buy(
             symbol=symbol,
             notional=notional,
@@ -260,7 +273,12 @@ class AlpacaPaperTradingAdapter:
         client_order_id: str,
         credential_context: ResolvedAlpacaAccountContext | None = None,
     ) -> AlpacaPaperExecutionResult:
-        self._ensure_stock_context(asset_type=asset_type, product_key=product_key)
+        self._ensure_tradable_context(
+            symbol=symbol,
+            asset_type=asset_type,
+            product_key=product_key,
+            credential_context=credential_context,
+        )
         return self.close_position_symbol(
             symbol=symbol,
             action=action,
@@ -487,13 +505,28 @@ class AlpacaPaperTradingAdapter:
         return self._settings.alpaca_trading_base_url
 
     @staticmethod
-    def _ensure_stock_context(*, asset_type: str, product_key: str) -> None:
+    def _ensure_tradable_context(
+        *,
+        symbol: str,
+        asset_type: str,
+        product_key: str,
+        credential_context: ResolvedAlpacaAccountContext | None,
+    ) -> None:
         normalized_asset_type = (asset_type or "").strip().lower()
         normalized_product_key = (product_key or "").strip().lower()
         if normalized_product_key not in SUPPORTED_PRODUCT_KEYS:
             raise ValueError(f"Prime Stocks paper execution only supports product_key='stocks.bismel1'. Received {product_key!r}.")
-        if normalized_asset_type not in SUPPORTED_STOCK_ASSET_TYPES:
-            raise ValueError(f"Prime Stocks paper execution accepts stock/equity symbols only. Received asset_type={asset_type!r}.")
+        if normalized_asset_type in SUPPORTED_STOCK_ASSET_TYPES:
+            return
+        normalized_symbol = (symbol or "").strip().upper()
+        uid = (credential_context.uid if credential_context is not None else "").strip()
+        if (
+            normalized_asset_type in SUPPORTED_CRYPTO_ASSET_TYPES
+            and uid in SUPPORTED_ADMIN_CRYPTO_MONITOR_UIDS
+            and normalized_symbol in SUPPORTED_ADMIN_CRYPTO_MONITOR_SYMBOLS
+        ):
+            return
+        raise ValueError(f"Prime Stocks paper execution accepts stock/equity symbols only outside admin monitors. Received asset_type={asset_type!r}.")
 
 
 def _maybe_string(value: object) -> str | None:

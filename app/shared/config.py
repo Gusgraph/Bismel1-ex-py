@@ -48,6 +48,7 @@ class AppConfig:
     prime_stocks_test_mode: bool
     prime_stocks_test_trigger: str | None
     prime_stocks_test_symbol_override: str | None
+    prime_stocks_strategy_mode: str
     prime_stocks_execution_bar_limit: int
     prime_stocks_trend_bar_limit: int
     prime_stocks_first_lot_notional: float
@@ -132,6 +133,7 @@ def get_settings() -> AppConfig:
         prime_stocks_test_mode=_env_flag("PRIME_STOCKS_TEST_MODE", False),
         prime_stocks_test_trigger=_env_optional("PRIME_STOCKS_TEST_TRIGGER"),
         prime_stocks_test_symbol_override=_env_optional("PRIME_STOCKS_TEST_SYMBOL_OVERRIDE"),
+        prime_stocks_strategy_mode=os.getenv("PRIME_STOCKS_STRATEGY_MODE", "scalper"),
         prime_stocks_execution_bar_limit=int(os.getenv("PRIME_STOCKS_EXECUTION_BAR_LIMIT", "351")),
         prime_stocks_trend_bar_limit=int(os.getenv("PRIME_STOCKS_TREND_BAR_LIMIT", "221")),
         prime_stocks_first_lot_notional=float(os.getenv("PRIME_STOCKS_FIRST_LOT_NOTIONAL", "101.0")),

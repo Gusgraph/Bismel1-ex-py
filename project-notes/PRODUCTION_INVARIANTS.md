@@ -1,57 +1,77 @@
-# Production invariants
+# Production Invariants
 
-These rules must not regress.
+Last updated: 2026-04-28
 
-## Prime Stocks
-- Runtime state is slot-scoped and account-scoped:
-  - `users/{uid}/accounts/{account_id}/prime_stocks/current/slots/slot_{n}/...`
-- Slot config is the source of truth for Prime symbols.
-- Slot-less or account-scoped fallback reads may help continuity, but they must not mutate active slot config.
-- Preview must never downgrade real execution state.
-- Prime execution rules are product-local:
-  - per-symbol entry budget about `3%` of equity
-  - total `FirstLot` budget about `20%` of equity
-  - add-side budget about `70%` of equity
-- Prime must not reuse generic Execution guardrails such as:
-  - `max_notional_per_order`
-  - generic execution dry-run stamping
-  - Execution global guardrails
+These rules protect the recovered/stabilized Bismel1 runtime state. Read this before changing account discovery, market-data routing, history fetching, order/position monitoring, or Cloud Run release flow.
 
-## Execution
-- Runtime state is slot-scoped and symbol-first.
-- Stocks and ETFs both run through the same `us_equity` execution path.
-- Symbol-level runtime state must be written on processed cycles, including `no_signal` and skipped states.
-- Removing a symbol must clear both:
-  - `selected_symbols`
-  - `symbol_assignments`
-- Same-symbol duplicate rebuy protection must remain active.
+## 1. Admin Runtime Monitor
+- Admin-only crypto monitor exists.
+- Prime monitor symbol: `UNI/USD`.
+- Execution monitor symbol: `LINK/USD`.
+- Shared Admin Monitor Broker is used by both monitors.
+- Admin monitor crypto access is restricted to:
+  - `admin-runtime-monitor-prime`
+  - `admin-runtime-monitor-execution`
+- Admin monitor accounts must never be treated as normal customer accounts in customer UI or billing.
+- Admin monitor orders, positions, and activity must be scoped to the monitor user/account/product/symbol.
 
-## Shared app behavior
-- The selected account/slot must drive runtime reads, broker state, and UI state consistently.
-- Broker reconnect must resume the same Alpaca identity and preserve historical state.
-- Positions and orders pages must prefer Alpaca-synced truth over stale local snapshot values.
-- UI/runtime fallback reads must not resurrect removed symbols or mutate config.
+## 2. Customer Product Boundaries
+- Prime Stocks customer product remains stock/equity scoped.
+- Execution customer product remains existing supported customer asset scope.
+- Admin crypto monitor does not unlock crypto for customers.
+- No entitlement, billing, or customer access behavior changes come from monitor support.
+- Customer runtime fanout must not include admin monitor users except through the explicit admin-monitor branch.
 
-## Release hygiene
+## 3. Strategy Runtime Rules
+- Prime uses 15M closed-bar execution.
+- Prime uses 1D trend as directional bias.
+- Historical bars must be fetched and passed into strategy:
+  - Prime execution history: 227+ where applicable.
+  - Prime trend/bias history: 1D history.
+  - Execution strategy history enough for strategy warmup.
+- Latest closed bar must not blanket-skip:
+  - position monitoring
+  - exit evaluation
+  - runtime status refresh
+- Duplicate entry protection must remain.
+- No new bar can block exits or position monitoring.
+- AI cache staleness may produce an advisory or pending signal state, but must not be treated as a runtime crash when scan and strategy evaluation still complete.
+
+## 4. Exposure Rules
+- Per-symbol entry target: 3% equity.
+- Total account exposure cap: 20%.
+- Adds up to 70%.
+- These must not become per-product inconsistent unless explicitly changed and documented.
+
+## 5. Runtime Fanout Safety
+- Fanout must exclude invalid broker credentials.
+- Alpaca accounts with `sync_status` of `auth_failed` or `invalid` must not enter customer runtime fanout.
+- Fanout must include only valid, success, or partial-success broker connections.
+- Admin monitor fanout must be scoped to internal monitor UIDs and must not overwrite customer runtime docs.
+- Admin monitor crypto symbols must not appear in customer symbol sets.
+
+## 6. Market Data Safety
+- Stock/equity paths must continue using the stock/equity market-data path.
+- Crypto market-data routing is limited to explicitly allowed admin monitor users/symbols unless customer crypto support is intentionally implemented later.
+- Slash-safe Firestore IDs must be used for symbols such as `UNI/USD` and `LINK/USD`.
+
+## 7. Runtime Status/Gauge Truth
+- SCAN is operational only when bars/history were fetched and processed.
+- SIGNAL is pending/neutral for normal no-setup states.
+- ORDER/FILL/POSITION/EXIT are not failures unless an actual attempted stage fails.
+- Normal no-trade cycles such as `no_signal`, `no_op`, and `skipped_no_open_position` are not runtime failures.
+
+## 8. Git / Release Rule
+- No recovery from zip/tag may overwrite live changes without:
+  - git status check
+  - branch check
+  - remote push check
+  - backup branch/tag
+  - project-notes update
 - Do not deploy from a broadly dirty worktree.
-- Release only an intentionally staged scope.
-- After runtime changes, verify both:
-  - active Cloud Run revision
-  - live Firestore/UI truth
+- Commit and push the protected release branch before destructive recovery work.
 
-## Focused smoke checks
-- Prime runtime tests:
-  - `cd /home/gusgraphy/Bismel1-ex-py && venv/bin/pytest tests/test_prime_stocks_dry_run.py tests/test_scheduler_invocation.py tests/test_firestore_runtime_store.py -q`
-- Execution runtime tests:
-  - `cd /home/gusgraphy/Bismel1-ex-py && venv/bin/pytest tests/test_execution_runtime_base.py tests/test_scheduler_invocation.py -q`
-- Laravel automation/runtime tests:
-  - `cd /var/www/html/bismel1.com && php artisan test tests/Feature/Customer/CustomerAutomationRuntimeTest.php tests/Feature/Customer/CustomerTradingPagesTest.php tests/Feature/Customer/Bismel1EntitlementEnforcementTest.php`
-- Broker/account sync tests:
-  - `cd /var/www/html/bismel1.com && php artisan test tests/Feature/Broker/AlpacaAccountSyncServiceTest.php tests/Feature/Customer/CustomerSecretFlowsTest.php`
-
-## Release checklist
-- Confirm no user/account-specific logic was introduced.
-- Run focused tests for the changed product path.
-- Deploy only the scoped runtime/app changes.
-- Confirm new revision has `100%` traffic only after live proof.
-- Verify one Prime slot and one Execution slot end to end after deploy.
+## Current Locked Runtime References
+- Prime Cloud Run revision recorded for this lock: `bismel1-prime-stocks-00063-w9w`.
+- Execution Cloud Run revision recorded for this lock: `bismel1-execution-trader-00015-cv6`.
+- Runtime lock branch: `release/runtime-monitor-lock`.

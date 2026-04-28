@@ -49,6 +49,8 @@ from app.shared.config import AppConfig
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
 SUPPORTED_EXECUTION_ACTIONS = frozenset({"buy", "sell", "close", "cancel", "modify"})
+ADMIN_CRYPTO_MONITOR_UIDS = frozenset({"admin-runtime-monitor-prime", "admin-runtime-monitor-execution"})
+ADMIN_CRYPTO_MONITOR_SYMBOLS = frozenset({"UNI/USD", "LINK/USD"})
 
 
 class ExecutionRuntimeStoreError(RuntimeError):
@@ -209,6 +211,7 @@ class ExecutionRuntimeStore:
         resolved_uid = uid.strip() or "unknown"
         resolved_slot = max(1, int(slot_number))
         resolved_symbol = symbol.strip().upper() or "UNKNOWN"
+        symbol_document_id = _symbol_document_id(resolved_symbol)
         root = (
             f"users/{resolved_uid}/accounts/{int(account_id)}/{self.PRODUCT_ID}/current"
             f"/slots/slot_{resolved_slot}"
@@ -222,7 +225,7 @@ class ExecutionRuntimeStore:
             action_document=f"{root}/actions/latest",
             heartbeat_document=f"{root}/heartbeat/current",
             logs_collection=f"{root}/logs",
-            symbol_state_document=f"{root}/symbols/{resolved_symbol}/state/current",
+            symbol_state_document=f"{root}/symbols/{symbol_document_id}/state/current",
         )
 
     def load_runtime_config(self, runtime_request: ExecutionRuntimeRequest) -> ExecutionRuntimeConfig:
@@ -1352,6 +1355,41 @@ class ExecutionRuntimeService:
                 )
             )
         return list(self._slot_cycle_bar_cache[cache_key])
+
+    def _fetch_strategy_bars_cached(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        limit: int,
+        credential_context: ResolvedAlpacaAccountContext,
+    ) -> list[Any]:
+        if _is_admin_crypto_monitor_symbol(uid=credential_context.uid, symbol=symbol):
+            cache_key = (
+                credential_context.account_id,
+                credential_context.alpaca_account_id,
+                symbol.upper(),
+                "crypto",
+                timeframe,
+                int(limit),
+            )
+            if cache_key not in self._slot_cycle_bar_cache:
+                self._slot_cycle_bar_cache[cache_key] = list(
+                    self._market_data.fetch_crypto_bars(
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        limit=limit,
+                        credential_context=credential_context,
+                    )
+                )
+            return list(self._slot_cycle_bar_cache[cache_key])
+
+        return self._fetch_stock_bars_cached(
+            symbol=symbol,
+            timeframe=timeframe,
+            limit=limit,
+            credential_context=credential_context,
+        )
 
     def _load_execution_trade_documents_cached(
         self,
@@ -2669,7 +2707,7 @@ class ExecutionRuntimeService:
                 timeframe=strategy_config.timeframe,
                 required_bar_count=strategy_config.required_bar_count,
             )
-            bars = self._fetch_stock_bars_cached(
+            bars = self._fetch_strategy_bars_cached(
                 symbol=symbol,
                 timeframe=timeframe,
                 limit=requested_bar_limit,
@@ -3298,6 +3336,17 @@ def _normalize_symbol_assignments(
         }
         normalized[symbol] = _normalize_assignment_control_state(normalized[symbol])
     return normalized
+
+
+def _is_admin_crypto_monitor_symbol(*, uid: str | None, symbol: str) -> bool:
+    return (
+        (uid or "").strip() in ADMIN_CRYPTO_MONITOR_UIDS
+        and (symbol or "").strip().upper() in ADMIN_CRYPTO_MONITOR_SYMBOLS
+    )
+
+
+def _symbol_document_id(symbol: str) -> str:
+    return symbol.strip().upper().replace("/", "~2F") or "UNKNOWN"
 
 
 def _payload_matches_expected_linked_account(

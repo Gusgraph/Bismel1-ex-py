@@ -54,6 +54,8 @@ from app.shared.config import AppConfig
 logger = logging.getLogger(__name__)
 
 ACTIVE_ORDER_STATUSES = {"accepted", "new", "partially_filled", "filled", "submitted"}
+ADMIN_CRYPTO_MONITOR_UIDS = frozenset({"admin-runtime-monitor-prime", "admin-runtime-monitor-execution"})
+ADMIN_CRYPTO_MONITOR_SYMBOLS = frozenset({"UNI/USD", "LINK/USD"})
 
 
 def _is_active_order_status(order_status: str | None) -> bool:
@@ -1084,6 +1086,22 @@ class PrimeStocksRuntimeService:
                 bars_processed_execution=len(bar_set.execution_bars),
                 bars_processed_trend=len(bar_set.trend_bars),
             )
+        if ai_decision.is_stale:
+            logger.warning(
+                "Prime Stocks runtime continuing with advisory stale AI cache "
+                "trigger_type=%s trigger_source=%s run_id=%s symbol=%s",
+                trigger_type,
+                trigger_source,
+                run_id,
+                resolved_runtime_config.symbol,
+            )
+            ai_decision = replace(
+                ai_decision,
+                Ai_execution_allowed=True,
+                Ai_block_new_entries=False,
+                Ai_block_adds=False,
+                Ai_blocked_reason=None,
+            )
         try:
             strategy_result = self._strategy_runner(
                 strategy_input=BismillahTrobotStocksV1Input(
@@ -1155,151 +1173,14 @@ class PrimeStocksRuntimeService:
         )
         actionable_buy_candidate = candidate_action == "FirstLot" or candidate_action.startswith("MULTI-")
         if has_no_new_closed_bar and not actionable_buy_candidate:
-            skipped_decision = "skipped_no_new_bar"
-            strategy_reasoning = _build_strategy_reasoning(
-                strategy_result=strategy_result,
-                candidate_action=candidate_action,
-                execution_decision=skipped_decision,
-                ai_decision=ai_decision,
-            )
-            runtime_message = _build_runtime_message(
-                execution_mode=_resolve_mode(
-                    resolved_runtime_config,
-                    allow_execution=allow_execution,
-                    account_context=account_context,
-                    settings=self._settings,
-                ),
-                execution_decision=skipped_decision,
-            )
-            try:
-                self._runtime_store.write_runtime_result(
-                    run_id=run_id,
-                    runtime_config=resolved_runtime_config,
-                    account_context=account_context,
-                    strategy_result=strategy_result,
-                    candidate_action=candidate_action,
-                    latest_signal_time=latest_signal_time,
-                    runtime_message=runtime_message,
-                    execution_mode=_resolve_mode(
-                        resolved_runtime_config,
-                        allow_execution=allow_execution,
-                        account_context=account_context,
-                        settings=self._settings,
-                    ),
-                    execution_decision=skipped_decision,
-                    execution_result=None,
-                    skipped_reason="no_new_closed_bar",
-                    trigger_type=trigger_type,
-                    trigger_source=trigger_source,
-                    ai_decision=ai_decision,
-                    state_record=_build_runtime_state_record(
-                        run_id=run_id,
-                        runtime_state=runtime_state,
-                        runtime_config=resolved_runtime_config,
-                        account_context=account_context,
-                        strategy_result=strategy_result,
-                        candidate_action=candidate_action,
-                        execution_decision=skipped_decision,
-                        latest_signal_time=latest_signal_time,
-                        execution_result=None,
-                        advance_processed_bar=False,
-                    ),
-                )
-            except PrimeStocksRuntimeStoreError as exc:
-                logger.exception(
-                    "Prime Stocks runtime identified no new closed bar but Firestore result persistence failed "
-                    "trigger_type=%s trigger_source=%s run_id=%s",
-                    trigger_type,
-                    trigger_source,
-                    run_id,
-                )
-                return PrimeStocksRuntimeResult(
-                    run_id=run_id,
-                    mode=_resolve_mode(
-                        resolved_runtime_config,
-                        allow_execution=allow_execution,
-                        account_context=account_context,
-                        settings=self._settings,
-                    ),
-                    runtime_target=resolved_runtime_config.runtime_target,
-                    product_key=resolved_runtime_config.product_key,
-                    strategy_key=resolved_runtime_config.strategy_key,
-                    strategy_title=resolved_runtime_config.strategy_title,
-                    symbol=resolved_runtime_config.symbol,
-                    asset_type=resolved_runtime_config.asset_type,
-                    enabled=resolved_runtime_config.enabled,
-                    trigger_type=trigger_type,
-                    trigger_source=trigger_source,
-                    candidate_action=candidate_action,
-                    execution_decision=skipped_decision,
-                    order_status="not_submitted",
-                    order_submitted=False,
-                    order_id=None,
-                    client_order_id=None,
-                    add_tier=None,
-                    execution_allowed=False,
-                    skipped_reason="runtime_result_persistence_failed",
-                    latest_signal_time=None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat(),
-                    ai=serialize_ai_decision(ai_decision),
-                    strategy_reasoning=strategy_reasoning,
-                    status="degraded",
-                    message=(
-                        "Prime Stocks runtime identified no new closed bar but Firestore result persistence failed. "
-                        f"{exc}"
-                    ),
-                    bars_processed_execution=len(bar_set.execution_bars),
-                    bars_processed_trend=len(bar_set.trend_bars),
-                    firestore_paths=self._runtime_store.get_paths(
-                        uid=resolved_runtime_config.uid,
-                        account_id=resolved_runtime_config.account_id,
-                        slot_number=resolved_runtime_config.slot_number,
-                    ).__dict__,
-                )
             logger.info(
-                "Prime Stocks runtime skipped for %s because no newly closed bar is available trigger_type=%s trigger_source=%s run_id=%s",
+                "Prime Stocks continuing with existing closed bar for %s so status and exit monitoring remain fresh "
+                "trigger_type=%s trigger_source=%s run_id=%s candidate_action=%s",
                 resolved_runtime_config.symbol,
                 trigger_type,
                 trigger_source,
                 run_id,
-            )
-            return PrimeStocksRuntimeResult(
-                run_id=run_id,
-                mode=_resolve_mode(
-                    resolved_runtime_config,
-                    allow_execution=allow_execution,
-                    account_context=account_context,
-                    settings=self._settings,
-                ),
-                runtime_target=resolved_runtime_config.runtime_target,
-                product_key=resolved_runtime_config.product_key,
-                strategy_key=resolved_runtime_config.strategy_key,
-                strategy_title=resolved_runtime_config.strategy_title,
-                symbol=resolved_runtime_config.symbol,
-                asset_type=resolved_runtime_config.asset_type,
-                enabled=resolved_runtime_config.enabled,
-                trigger_type=trigger_type,
-                trigger_source=trigger_source,
-                candidate_action=candidate_action,
-                execution_decision=skipped_decision,
-                order_status="not_submitted",
-                order_submitted=False,
-                order_id=None,
-                client_order_id=None,
-                add_tier=_parse_add_tier(candidate_action),
-                execution_allowed=False,
-                skipped_reason="no_new_closed_bar",
-                latest_signal_time=None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat(),
-                ai=serialize_ai_decision(ai_decision),
-                strategy_reasoning=strategy_reasoning,
-                status="no_op",
-                message=runtime_message,
-                bars_processed_execution=len(bar_set.execution_bars),
-                bars_processed_trend=len(bar_set.trend_bars),
-                firestore_paths=self._runtime_store.get_paths(
-                    uid=resolved_runtime_config.uid,
-                    account_id=resolved_runtime_config.account_id,
-                    slot_number=resolved_runtime_config.slot_number,
-                ).__dict__,
+                candidate_action,
             )
         if has_no_new_closed_bar and actionable_buy_candidate:
             logger.info(
@@ -2463,10 +2344,18 @@ def _ensure_prime_stocks_runtime_context(
 ) -> None:
     if runtime_config.product_key != "stocks.bismel1":
         raise ValueError(f"Prime Stocks runtime only supports product_key='stocks.bismel1'. Received {runtime_config.product_key!r}.")
-    if runtime_config.asset_type != "stock":
-        raise ValueError(f"Prime Stocks runtime only supports asset_type='stock'. Received {runtime_config.asset_type!r}.")
+    if runtime_config.asset_type != "stock" and not _is_admin_crypto_monitor_runtime(runtime_config):
+        raise ValueError(f"Prime Stocks runtime only supports asset_type='stock' outside admin monitors. Received {runtime_config.asset_type!r}.")
     if allow_execution is True and not runtime_config.paper_execution_enabled:
         logger.info("Prime Stocks runtime execute trigger received while paper execution is disabled; request will stay no-op.")
+
+
+def _is_admin_crypto_monitor_runtime(runtime_config: PrimeStocksRuntimeConfigRecord) -> bool:
+    return (
+        runtime_config.asset_type == "crypto"
+        and (runtime_config.uid or "").strip() in ADMIN_CRYPTO_MONITOR_UIDS
+        and (runtime_config.symbol or "").strip().upper() in ADMIN_CRYPTO_MONITOR_SYMBOLS
+    )
 
 
 def _is_validation_ping_request(
@@ -2697,6 +2586,10 @@ def _build_strategy_reasoning(
     execution_decision: str,
     ai_decision,
 ) -> dict[str, object]:
+    def _series_list(name: str) -> list[object]:
+        value = getattr(strategy_result.series, name, None)
+        return value if isinstance(value, list) else []
+
     latest_bar = strategy_result.latest_bar
     latest_signal = strategy_result.latest_signal
     series = strategy_result.series
@@ -2706,15 +2599,12 @@ def _build_strategy_reasoning(
     trend_slope = _bool_at(series.htf_ema_slow_slope_up, latest_index)
     regime_fail = _bool_at(series.regime_fail, latest_index)
     pullback = _bool_at(series.in_pullback_zone, latest_index)
-    setup_ready = _bool_at(series.setup_ready, latest_index)
-    setup_age_bars = (
-        series.setup_age_bars[latest_index]
-        if latest_index < len(series.setup_age_bars)
-        else None
-    )
-    setup_invalidated = _bool_at(series.setup_invalidated, latest_index)
-    reversal_context = _bool_at(series.reversal_context, latest_index)
-    continuation_context = _bool_at(series.continuation_context, latest_index)
+    setup_ready = _bool_at(_series_list("setup_ready"), latest_index)
+    setup_age_bars_series = _series_list("setup_age_bars")
+    setup_age_bars = setup_age_bars_series[latest_index] if latest_index < len(setup_age_bars_series) else None
+    setup_invalidated = _bool_at(_series_list("setup_invalidated"), latest_index)
+    reversal_context = _bool_at(_series_list("reversal_context"), latest_index)
+    continuation_context = _bool_at(_series_list("continuation_context"), latest_index)
     confirmation = latest_signal.base_entry_trigger or latest_signal.add_trigger
     trigger_active = latest_signal.base_entry_trigger or latest_signal.add_trigger or latest_signal.hit_atr_trail or latest_signal.hit_regime
     setup_valid = bool(latest_signal.base_entry_signal)
@@ -3342,12 +3232,10 @@ def _timeframe_stale_threshold(execution_timeframe: str) -> timedelta:
 
 def _build_strategy_config(runtime_config: PrimeStocksRuntimeConfigRecord) -> BismillahTrobotStocksV1Config:
     return BismillahTrobotStocksV1Config(
-        strategy_mode=str(runtime_config.strategy_mode).strip().lower(),
         execution_timeframe=_normalize_runtime_timeframe(runtime_config.execution_timeframe),
         trend_timeframe=_normalize_runtime_timeframe(runtime_config.trend_timeframe),
         exec_tf_note=f"Run Bismillah on {_normalize_runtime_timeframe(runtime_config.execution_timeframe)} chart",
         trend_tf=_normalize_trend_tf(runtime_config.trend_timeframe),
-        setup_window_bars=max(3, int(runtime_config.pullback_window)),
         swing_len=max(5, int(runtime_config.pullback_window)),
         first_lot_dollars=runtime_config.first_lot_notional,
         max_adds=runtime_config.max_add_count,

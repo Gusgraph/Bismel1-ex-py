@@ -171,6 +171,10 @@ def _build_strategy_reasoning_payload(
     execution_decision: str,
     ai_decision: PrimeStocksAiDecision | None,
 ) -> dict[str, Any]:
+    def _series_list(name: str) -> list[Any]:
+        value = getattr(strategy_result.series, name, None)
+        return value if isinstance(value, list) else []
+
     latest_bar = strategy_result.latest_bar
     latest_signal = strategy_result.latest_signal
     series = strategy_result.series
@@ -180,9 +184,12 @@ def _build_strategy_reasoning_payload(
     trend_base = bool(series.trend_base_htf[latest_index]) if latest_index < len(series.trend_base_htf) else False
     trend_slope = bool(series.htf_ema_slow_slope_up[latest_index]) if latest_index < len(series.htf_ema_slow_slope_up) else False
     pullback = bool(series.in_pullback_zone[latest_index]) if latest_index < len(series.in_pullback_zone) else False
-    setup_ready = bool(series.setup_ready[latest_index]) if latest_index < len(series.setup_ready) else False
-    setup_age_bars = series.setup_age_bars[latest_index] if latest_index < len(series.setup_age_bars) else None
-    setup_invalidated = bool(series.setup_invalidated[latest_index]) if latest_index < len(series.setup_invalidated) else False
+    setup_ready_series = _series_list("setup_ready")
+    setup_age_bars_series = _series_list("setup_age_bars")
+    setup_invalidated_series = _series_list("setup_invalidated")
+    setup_ready = bool(setup_ready_series[latest_index]) if latest_index < len(setup_ready_series) else False
+    setup_age_bars = setup_age_bars_series[latest_index] if latest_index < len(setup_age_bars_series) else None
+    setup_invalidated = bool(setup_invalidated_series[latest_index]) if latest_index < len(setup_invalidated_series) else False
     confirmation = bool(latest_signal.base_entry_trigger or latest_signal.add_trigger)
     setup_valid = bool(latest_signal.base_entry_signal)
     strategy_mode = str(getattr(strategy_result, "strategy_mode", "scalper")).strip().lower()
@@ -324,10 +331,11 @@ class PrimeStocksFirestoreRuntimeStore:
         resolved_symbol = None if symbol is None else symbol.strip().upper()
         symbol_root = None
         if resolved_uid and account_id is not None and resolved_symbol:
+            symbol_document_id = _symbol_document_id(resolved_symbol)
             symbol_root = f"users/{resolved_uid}/accounts/{account_id}/{product_id}/current"
             if slot_number is not None:
                 symbol_root = f"{symbol_root}/slots/slot_{max(1, slot_number)}"
-            symbol_root = f"{symbol_root}/symbols/{resolved_symbol}"
+            symbol_root = f"{symbol_root}/symbols/{symbol_document_id}"
         return PrimeStocksRuntimeStorePaths(
             config_document=f"{root}/config/current",
             state_document=f"{root}/state/current",
@@ -885,11 +893,12 @@ class PrimeStocksFirestoreRuntimeStore:
 
     def load_ai_symbol_record(self, symbol: str) -> AiCacheRecord | None:
         resolved_symbol = symbol.strip().upper()
-        path = f"{self.get_paths().ai_symbols_collection}/{resolved_symbol}"
+        symbol_document_id = _symbol_document_id(resolved_symbol)
+        path = f"{self.get_paths().ai_symbols_collection}/{symbol_document_id}"
         snapshot = self._firestore_call(
             action="load ai symbol record",
             path=path,
-            fn=lambda: self._ai_symbols_collection().document(resolved_symbol).get(),
+            fn=lambda: self._ai_symbols_collection().document(symbol_document_id).get(),
         )
         payload = snapshot.to_dict() if getattr(snapshot, "exists", False) else None
         return None if not payload else _deserialize_ai_cache_record(payload)
@@ -906,12 +915,13 @@ class PrimeStocksFirestoreRuntimeStore:
         resolved_symbol = (record.symbol or "").strip().upper()
         if resolved_symbol == "":
             raise PrimeStocksRuntimeStoreError("AI symbol record requires a non-empty symbol.")
-        path = f"{self.get_paths().ai_symbols_collection}/{resolved_symbol}"
+        symbol_document_id = _symbol_document_id(resolved_symbol)
+        path = f"{self.get_paths().ai_symbols_collection}/{symbol_document_id}"
         payload = _serialize_ai_cache_record(record)
         self._firestore_call(
             action="write ai symbol record",
             path=path,
-            fn=lambda: self._ai_symbols_collection().document(resolved_symbol).set(payload, merge=True),
+            fn=lambda: self._ai_symbols_collection().document(symbol_document_id).set(payload, merge=True),
         )
 
     def write_runtime_result(
@@ -2258,7 +2268,7 @@ def build_default_runtime_config(settings: AppConfig) -> PrimeStocksRuntimeConfi
         test_symbol_override=None if settings.prime_stocks_test_symbol_override is None else settings.prime_stocks_test_symbol_override.upper(),
         force_candidate_action=settings.prime_stocks_force_candidate_action,
         ai_validation_bypass_enabled=settings.prime_stocks_ai_validation_bypass_enabled,
-        strategy_mode=settings.prime_stocks_strategy_mode,
+        strategy_mode=_normalize_strategy_mode(getattr(settings, "prime_stocks_strategy_mode", "scalper")),
         execution_timeframe="15M",
         trend_timeframe="1D",
         pullback_window=5,
@@ -2652,6 +2662,15 @@ def _resolve_failure_markers(
     runtime_message: str,
     now: datetime,
 ) -> dict[str, Any]:
+    if blocked_reason == "ai_cache_stale":
+        return {
+            "last_error_code": None,
+            "last_error_message": None,
+            "recovery_action": "await_next_ai_refresh",
+            "failed_at": None,
+            "recovered_at": now.isoformat(),
+        }
+
     last_error_code = broker_error_code or blocked_reason
     last_error_message = broker_error_message
     if last_error_code is not None and last_error_message is None:
@@ -2818,7 +2837,6 @@ def _resolve_notification_event_type(
         return "runtime_failure"
     if blocked_reason in {
         "ai_cache_unavailable",
-        "ai_cache_stale",
         "stale_data",
         "prime_symbol_entry_budget_exceeded",
         "prime_total_entry_budget_reached",
@@ -2886,6 +2904,10 @@ def _maybe_string(value: object) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _symbol_document_id(symbol: str) -> str:
+    return symbol.strip().upper().replace("/", "~2F") or "UNKNOWN"
 
 
 def _maybe_int(value: object) -> int | None:

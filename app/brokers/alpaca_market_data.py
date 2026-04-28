@@ -28,7 +28,9 @@ from app.shared.config import AppConfig
 
 
 SUPPORTED_STOCK_ASSET_TYPES = frozenset({"stock", "stocks", "equity", "equities"})
-SUPPORTED_VALIDATION_CRYPTO_ASSET_TYPES = frozenset({"crypto"})
+SUPPORTED_CRYPTO_ASSET_TYPES = frozenset({"crypto"})
+SUPPORTED_ADMIN_CRYPTO_MONITOR_SYMBOLS = frozenset({"UNI/USD", "LINK/USD"})
+SUPPORTED_ADMIN_CRYPTO_MONITOR_UIDS = frozenset({"admin-runtime-monitor-prime", "admin-runtime-monitor-execution"})
 SUPPORTED_PRODUCT_KEYS = frozenset({"stocks.bismel1"})
 SUPPORTED_ALPACA_TIMEFRAMES = {
     "15M": "15Min",
@@ -107,20 +109,25 @@ class AlpacaMarketDataAdapter:
         credential_context: ResolvedAlpacaAccountContext | None = None,
     ) -> PrimeStocksBarSet:
         normalized_asset_type = (asset_type or "").strip().lower()
-        if normalized_asset_type in SUPPORTED_VALIDATION_CRYPTO_ASSET_TYPES:
-            self._ensure_validation_crypto_context(asset_type=asset_type, product_key=product_key, symbol=symbol)
+        if normalized_asset_type in SUPPORTED_CRYPTO_ASSET_TYPES:
+            self._ensure_crypto_context(
+                asset_type=asset_type,
+                product_key=product_key,
+                symbol=symbol,
+                credential_context=credential_context,
+            )
             resolved_execution_timeframe = _normalize_alpaca_timeframe(execution_timeframe or "1M")
             resolved_trend_timeframe = _normalize_alpaca_timeframe(trend_timeframe or resolved_execution_timeframe)
             execution_bars = self.fetch_crypto_bars(
                 symbol=symbol,
                 timeframe=resolved_execution_timeframe,
-                limit=execution_limit or 19,
+                limit=execution_limit or self._settings.prime_stocks_execution_bar_limit,
                 credential_context=credential_context,
             )
             trend_bars = self.fetch_crypto_bars(
                 symbol=symbol,
                 timeframe=resolved_trend_timeframe,
-                limit=trend_limit or 11,
+                limit=trend_limit or self._settings.prime_stocks_trend_bar_limit,
                 credential_context=credential_context,
             )
             return PrimeStocksBarSet(
@@ -189,19 +196,25 @@ class AlpacaMarketDataAdapter:
     ) -> list[PriceBar]:
         base_url = self._settings.alpaca_data_base_url.rstrip("/")
         query_symbol = _normalize_crypto_symbol_for_query(symbol)
+        start_at, end_at = _crypto_bar_time_window(timeframe=timeframe, limit=limit)
         query = urlencode(
             {
                 "symbols": query_symbol,
                 "timeframe": timeframe,
                 "limit": limit,
-                "sort": "asc",
+                "sort": "desc",
+                "start": start_at,
+                "end": end_at,
             }
         )
         payload = self._http_client.fetch_json(
             url=f"{base_url}/v1beta3/crypto/us/bars?{query}",
             headers=self._headers(credential_context=credential_context),
         )
-        return normalize_alpaca_bars(payload=payload, symbol=query_symbol)
+        return sorted(
+            normalize_alpaca_bars(payload=payload, symbol=query_symbol),
+            key=lambda bar: bar.starts_at,
+        )
 
     def _headers(self, *, credential_context: ResolvedAlpacaAccountContext | None = None) -> dict[str, str]:
         key_id = credential_context.key_id if credential_context is not None else self._settings.alpaca_api_key_id
@@ -224,16 +237,24 @@ class AlpacaMarketDataAdapter:
             raise ValueError(f"Prime Stocks runtime accepts stock/equity symbols only. Received asset_type={asset_type!r}.")
 
     @staticmethod
-    def _ensure_validation_crypto_context(*, asset_type: str, product_key: str, symbol: str) -> None:
+    def _ensure_crypto_context(
+        *,
+        asset_type: str,
+        product_key: str,
+        symbol: str,
+        credential_context: ResolvedAlpacaAccountContext | None,
+    ) -> None:
         normalized_asset_type = (asset_type or "").strip().lower()
         normalized_product_key = (product_key or "").strip().lower()
         normalized_symbol = (symbol or "").strip().upper()
         if normalized_product_key != "stocks.bismel1":
             raise ValueError(f"Prime Stocks runtime only supports product_key='stocks.bismel1'. Received {product_key!r}.")
-        if normalized_asset_type not in SUPPORTED_VALIDATION_CRYPTO_ASSET_TYPES:
-            raise ValueError(f"Prime Stocks validation runtime accepts crypto override only. Received asset_type={asset_type!r}.")
+        if normalized_asset_type not in SUPPORTED_CRYPTO_ASSET_TYPES:
+            raise ValueError(f"Prime Stocks crypto runtime accepts crypto symbols only. Received asset_type={asset_type!r}.")
         if normalized_symbol != "SHIBUSD":
-            raise ValueError(f"Prime Stocks validation runtime only supports test symbol override 'SHIBUSD'. Received {symbol!r}.")
+            uid = (credential_context.uid if credential_context is not None else "").strip()
+            if uid not in SUPPORTED_ADMIN_CRYPTO_MONITOR_UIDS or normalized_symbol not in SUPPORTED_ADMIN_CRYPTO_MONITOR_SYMBOLS:
+                raise ValueError(f"Crypto market-data runtime is restricted to admin monitor symbols. Received {symbol!r}.")
 
 
 def normalize_alpaca_bars(payload: dict[str, object], symbol: str) -> list[PriceBar]:
@@ -287,6 +308,15 @@ def _stock_bar_time_window(*, timeframe: str, limit: int) -> tuple[str, str]:
     return start_at.isoformat(), end_at.isoformat()
 
 
+def _crypto_bar_time_window(*, timeframe: str, limit: int) -> tuple[str, str]:
+    resolved_limit = max(1, int(limit))
+    bar_minutes = _market_minutes_per_bar(timeframe)
+    calendar_days = max(2, ceil((resolved_limit * bar_minutes) / 1440 * 2) + 1)
+    end_at = datetime.now(UTC).replace(microsecond=0)
+    start_at = end_at - timedelta(days=calendar_days)
+    return start_at.isoformat(), end_at.isoformat()
+
+
 def _market_minutes_per_bar(timeframe: str) -> int:
     normalized = (timeframe or "").strip().lower()
     mapping = {
@@ -312,6 +342,6 @@ def _is_retryable_network_error(exc: Exception) -> bool:
 
 def _normalize_crypto_symbol_for_query(symbol: str) -> str:
     resolved = symbol.strip().upper().replace("/", "")
-    if resolved == "SHIBUSD":
-        return "SHIB/USD"
+    if resolved.endswith("USD") and len(resolved) > 3:
+        return f"{resolved[:-3]}/USD"
     return symbol.strip().upper()
