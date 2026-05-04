@@ -2414,18 +2414,19 @@ def test_execution_runtime_auto_disabled_assignment_skips() -> None:
     } in store.write_calls
 
 
-def test_execution_runtime_auto_disable_triggers_after_thresholds_breached() -> None:
+def test_execution_runtime_auto_disable_waits_for_effective_sample_floor() -> None:
     store = FakeExecutionRuntimeStore()
     store.runtime_config_payload = {
         "automation_enabled": True,
         "auto_disable_enabled": True,
-        "auto_disable_min_trades": 2,
+        "auto_disable_min_trades": 1,
         "auto_disable_min_win_rate": 35.0,
         "auto_disable_max_drawdown_percent": 12.0,
         "auto_disable_scope": "symbol_assignment",
         "symbol_assignments": {
             "AAPL": {
                 "enabled": True,
+                "auto_disable_min_trades": 1,
                 "strategy_key": "ema",
                 "strategy_settings": {"fast_ema_length": 3, "slow_ema_length": 5, "timeframe": "15m"},
                 "risk_settings": {"position_size_mode": "qty", "default_qty": 1},
@@ -2453,6 +2454,70 @@ def test_execution_runtime_auto_disable_triggers_after_thresholds_breached() -> 
             "realized_pnl_percent": -8.0,
             "updated_at": "2026-04-20T11:00:00+00:00",
         },
+        "trade-3": {
+            "trade_id": "trade-3",
+            "slot_number": 1,
+            "symbol": "AAPL",
+            "strategy_key": "ema",
+            "trade_state": "closed",
+            "realized_pnl_dollars": -6.0,
+            "realized_pnl_percent": -6.0,
+            "updated_at": "2026-04-20T12:00:00+00:00",
+        },
+    }
+    service = ExecutionRuntimeService(
+        settings=get_settings(),
+        runtime_store=store,
+        account_resolver=FakeAccountResolver(),
+        paper_trading=FakePaperTradingAdapter(),
+        market_data=FakeMarketDataAdapter({"AAPL": _make_bars([10, 9, 8, 7, 6, 7, 8, 9])}),
+    )
+
+    result = service.run_once({"user_id": "user-a", "account_id": 101, "slot": 1})
+
+    assert result.execution_status == "buy_submitted"
+    assert store.updated_slot_configs
+    updated_assignment = store.updated_slot_configs[-1]["config_payload"]["symbol_assignments"]["AAPL"]
+    assert updated_assignment["enabled"] is True
+    assert updated_assignment["auto_disabled"] is False
+    assert updated_assignment["auto_disable_status"] == "continue_monitoring"
+    assert updated_assignment["auto_disable_reason_code"] == "auto_disable_sample_too_small"
+    assert updated_assignment["auto_disable_counted_trades"] == 3
+    assert updated_assignment["auto_disable_configured_min_trades"] == 1
+    assert updated_assignment["auto_disable_effective_min_trades"] == 5
+
+
+def test_execution_runtime_auto_disable_triggers_after_effective_sample_floor() -> None:
+    store = FakeExecutionRuntimeStore()
+    store.runtime_config_payload = {
+        "automation_enabled": True,
+        "auto_disable_enabled": True,
+        "auto_disable_min_trades": 1,
+        "auto_disable_min_win_rate": 35.0,
+        "auto_disable_max_drawdown_percent": 12.0,
+        "auto_disable_scope": "symbol_assignment",
+        "symbol_assignments": {
+            "AAPL": {
+                "enabled": True,
+                "auto_disable_min_trades": 1,
+                "strategy_key": "ema",
+                "strategy_settings": {"fast_ema_length": 3, "slow_ema_length": 5, "timeframe": "15m"},
+                "risk_settings": {"position_size_mode": "qty", "default_qty": 1},
+            },
+        },
+    }
+    store.performance_trade_payloads = {
+        f"trade-{index}": {
+            "trade_id": f"trade-{index}",
+            "slot_number": 1,
+            "symbol": "AAPL",
+            "strategy_key": "ema",
+            "trade_state": "closed",
+            "realized_pnl_dollars": -float(index),
+            "realized_pnl_percent": -float(index),
+            "updated_at": f"2026-04-20T1{index}:00:00+00:00",
+        }
+        for index in range(1, 6)
     }
     service = ExecutionRuntimeService(
         settings=get_settings(),
@@ -2472,6 +2537,58 @@ def test_execution_runtime_auto_disable_triggers_after_thresholds_breached() -> 
     assert updated_assignment["auto_disabled"] is True
     assert updated_assignment["disabled_source"] == "auto"
     assert updated_assignment["disabled_reason"] == "auto_disabled_win_rate"
+    assert updated_assignment["auto_disable_min_trades"] == 5
+
+
+def test_execution_runtime_auto_disable_respects_configured_min_above_floor() -> None:
+    store = FakeExecutionRuntimeStore()
+    store.runtime_config_payload = {
+        "automation_enabled": True,
+        "auto_disable_enabled": True,
+        "auto_disable_min_trades": 10,
+        "auto_disable_min_win_rate": 35.0,
+        "auto_disable_max_drawdown_percent": 12.0,
+        "symbol_assignments": {
+            "AAPL": {
+                "enabled": True,
+                "auto_disable_min_trades": 10,
+                "strategy_key": "ema",
+                "strategy_settings": {"fast_ema_length": 3, "slow_ema_length": 5, "timeframe": "15m"},
+                "risk_settings": {"position_size_mode": "qty", "default_qty": 1},
+            },
+        },
+    }
+    store.performance_trade_payloads = {
+        f"trade-{index}": {
+            "trade_id": f"trade-{index}",
+            "slot_number": 1,
+            "symbol": "AAPL",
+            "strategy_key": "ema",
+            "trade_state": "closed",
+            "realized_pnl_dollars": -float(index),
+            "realized_pnl_percent": -float(index),
+            "updated_at": f"2026-04-20T1{index}:00:00+00:00",
+        }
+        for index in range(1, 8)
+    }
+    service = ExecutionRuntimeService(
+        settings=get_settings(),
+        runtime_store=store,
+        account_resolver=FakeAccountResolver(),
+        paper_trading=FakePaperTradingAdapter(),
+        market_data=FakeMarketDataAdapter({"AAPL": _make_bars([10, 9, 8, 7, 6, 7, 8, 9])}),
+    )
+
+    result = service.run_once({"user_id": "user-a", "account_id": 101, "slot": 1})
+
+    assert result.execution_status == "buy_submitted"
+    assert store.updated_slot_configs
+    updated_assignment = store.updated_slot_configs[-1]["config_payload"]["symbol_assignments"]["AAPL"]
+    assert updated_assignment["enabled"] is True
+    assert updated_assignment["auto_disabled"] is False
+    assert updated_assignment["auto_disable_reason_code"] == "auto_disable_sample_too_small"
+    assert updated_assignment["auto_disable_counted_trades"] == 7
+    assert updated_assignment["auto_disable_effective_min_trades"] == 10
 
 
 def test_execution_runtime_auto_disable_off_does_not_disable_assignment() -> None:

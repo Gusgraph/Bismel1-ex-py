@@ -51,6 +51,7 @@ T = TypeVar("T")
 SUPPORTED_EXECUTION_ACTIONS = frozenset({"buy", "sell", "close", "cancel", "modify"})
 ADMIN_CRYPTO_MONITOR_UIDS = frozenset({"admin-runtime-monitor-prime", "admin-runtime-monitor-execution"})
 ADMIN_CRYPTO_MONITOR_SYMBOLS = frozenset({"UNI/USD", "LINK/USD"})
+AUTO_DISABLE_MIN_TRADES_FLOOR = 5
 
 
 class ExecutionRuntimeStoreError(RuntimeError):
@@ -318,7 +319,7 @@ class ExecutionRuntimeStore:
             symbol_states=symbol_states if isinstance(symbol_states, dict) else None,
             automation_enabled=automation_enabled,
             auto_disable_enabled=bool(payload.get("auto_disable_enabled", True)),
-            auto_disable_min_trades=max(1, _maybe_int(payload.get("auto_disable_min_trades")) or 5),
+            auto_disable_min_trades=_normalize_auto_disable_min_trades(payload.get("auto_disable_min_trades")),
             auto_disable_max_drawdown_percent=max(0.0, _maybe_float(payload.get("auto_disable_max_drawdown_percent")) or 12.0),
             auto_disable_min_win_rate=max(0.0, min(100.0, _maybe_float(payload.get("auto_disable_min_win_rate")) or 35.0)),
             auto_disable_scope=_normalize_auto_disable_scope(payload.get("auto_disable_scope")),
@@ -2232,10 +2233,46 @@ class ExecutionRuntimeService:
             strategy_key=strategy_key,
         )
         total_trades = int(performance_snapshot.get("total_trades", 0) or 0)
-        assignment_min_trades = max(1, _maybe_int(assignment.get("auto_disable_min_trades")) or runtime_config.auto_disable_min_trades)
+        configured_min_trades = (
+            _maybe_int(assignment.get("configured_auto_disable_min_trades"))
+            or _maybe_int(assignment.get("auto_disable_min_trades"))
+            or runtime_config.auto_disable_min_trades
+        )
+        assignment_min_trades = _normalize_auto_disable_min_trades(configured_min_trades)
         assignment_min_win_rate = max(0.0, min(100.0, _maybe_float(assignment.get("auto_disable_min_win_rate")) or runtime_config.auto_disable_min_win_rate))
         assignment_max_drawdown = max(0.0, _maybe_float(assignment.get("auto_disable_max_drawdown_percent")) or runtime_config.auto_disable_max_drawdown_percent)
+        performance_snapshot.update({
+            "configured_auto_disable_min_trades": configured_min_trades,
+            "effective_auto_disable_min_trades": assignment_min_trades,
+            "auto_disable_min_trades_floor": AUTO_DISABLE_MIN_TRADES_FLOOR,
+            "auto_disable_min_win_rate": assignment_min_win_rate,
+            "auto_disable_max_drawdown_percent": assignment_max_drawdown,
+        })
         if total_trades < assignment_min_trades:
+            now = self._now_provider().isoformat()
+            updated_assignment = _normalize_assignment_control_state({
+                **assignment,
+                "enabled": True,
+                "manually_disabled": False,
+                "auto_disabled": False,
+                "disabled_source": None,
+                "disabled_reason": None,
+                "auto_disabled_reason": None,
+                "auto_disable_status": "continue_monitoring",
+                "auto_disable_reason_code": "auto_disable_sample_too_small",
+                "auto_disable_counted_trades": total_trades,
+                "auto_disable_configured_min_trades": configured_min_trades,
+                "auto_disable_effective_min_trades": assignment_min_trades,
+                "auto_disable_sample_win_rate": _maybe_float(performance_snapshot.get("win_rate")) or 0.0,
+                "auto_disable_threshold_win_rate": assignment_min_win_rate,
+                "last_auto_disable_review_at": now,
+                "last_runtime_decision_at": now,
+            })
+            self._persist_assignment_control_state(
+                runtime_config=runtime_config,
+                symbol=symbol,
+                updated_assignment=updated_assignment,
+            )
             return None
 
         win_rate = _maybe_float(performance_snapshot.get("win_rate")) or 0.0
@@ -2631,6 +2668,24 @@ class ExecutionRuntimeService:
                 raw_response={"strategy_key": strategy_key, "assignment_enabled": False, "disabled_source": "manual"},
             )
         if bool(assignment.get("auto_disabled")) or str(assignment.get("disabled_source") or "").strip().lower() == "auto":
+            auto_disabled_snapshot = self._build_assignment_performance_snapshot(
+                runtime_config=runtime_config,
+                symbol=symbol,
+                strategy_key=strategy_key,
+            )
+            auto_disabled_counted_trades = int(auto_disabled_snapshot.get("total_trades", 0) or 0)
+            auto_disabled_configured_min_trades = (
+                _maybe_int(assignment.get("configured_auto_disable_min_trades"))
+                or _maybe_int(assignment.get("auto_disable_min_trades"))
+                or runtime_config.auto_disable_min_trades
+            )
+            auto_disabled_effective_min_trades = _normalize_auto_disable_min_trades(auto_disabled_configured_min_trades)
+            auto_disabled_snapshot.update({
+                "configured_auto_disable_min_trades": auto_disabled_configured_min_trades,
+                "effective_auto_disable_min_trades": auto_disabled_effective_min_trades,
+                "auto_disable_min_trades_floor": AUTO_DISABLE_MIN_TRADES_FLOOR,
+                "would_not_disable_under_current_floor": auto_disabled_counted_trades < auto_disabled_effective_min_trades,
+            })
             return self._build_result(
                 runtime_config=runtime_config,
                 run_id=run_id,
@@ -2645,7 +2700,20 @@ class ExecutionRuntimeService:
                 disabled_reason=_maybe_string(assignment.get("auto_disabled_reason")) or _maybe_string(assignment.get("disabled_reason")) or "auto_disabled",
                 auto_disabled_at=_maybe_string(assignment.get("auto_disabled_at")),
                 last_runtime_decision_at=self._now_provider().isoformat(),
-                raw_response={"strategy_key": strategy_key, "assignment_enabled": False, "disabled_source": "auto"},
+                enforcement_metric_snapshot=auto_disabled_snapshot,
+                raw_response={
+                    "strategy_key": strategy_key,
+                    "assignment_enabled": False,
+                    "disabled_source": "auto",
+                    "auto_disable": {
+                        "currently_disabled": True,
+                        "disabled_reason": _maybe_string(assignment.get("auto_disabled_reason")) or _maybe_string(assignment.get("disabled_reason")) or "auto_disabled",
+                        "configured_min_trades": auto_disabled_configured_min_trades,
+                        "effective_min_trades": auto_disabled_effective_min_trades,
+                        "counted_trades": auto_disabled_counted_trades,
+                        "would_not_disable_under_current_floor": auto_disabled_counted_trades < auto_disabled_effective_min_trades,
+                    },
+                },
             )
         auto_disable_result = self._enforce_assignment_auto_disable(
             runtime_config=runtime_config,
@@ -3285,7 +3353,8 @@ def _normalize_symbol_assignments(
                 "re_enabled_at": _maybe_string(assignment.get("re_enabled_at")),
                 "re_enabled_by": _maybe_string(assignment.get("re_enabled_by")),
                 "auto_disable_enabled": bool(assignment.get("auto_disable_enabled", fallback_auto_disable_settings.get("auto_disable_enabled", True))),
-                "auto_disable_min_trades": max(1, _maybe_int(assignment.get("auto_disable_min_trades")) or _maybe_int(fallback_auto_disable_settings.get("auto_disable_min_trades")) or 5),
+                "configured_auto_disable_min_trades": _maybe_int(assignment.get("auto_disable_min_trades")) or _maybe_int(fallback_auto_disable_settings.get("auto_disable_min_trades")) or AUTO_DISABLE_MIN_TRADES_FLOOR,
+                "auto_disable_min_trades": _normalize_auto_disable_min_trades(assignment.get("auto_disable_min_trades"), fallback_auto_disable_settings.get("auto_disable_min_trades")),
                 "auto_disable_max_drawdown_percent": max(0.0, _maybe_float(assignment.get("auto_disable_max_drawdown_percent")) or _maybe_float(fallback_auto_disable_settings.get("auto_disable_max_drawdown_percent")) or 12.0),
                 "auto_disable_min_win_rate": max(0.0, min(100.0, _maybe_float(assignment.get("auto_disable_min_win_rate")) or _maybe_float(fallback_auto_disable_settings.get("auto_disable_min_win_rate")) or 35.0)),
                 "risk_caps_enabled": bool(assignment.get("risk_caps_enabled", True)),
@@ -3318,7 +3387,8 @@ def _normalize_symbol_assignments(
             "re_enabled_at": None,
             "re_enabled_by": None,
             "auto_disable_enabled": bool(fallback_auto_disable_settings.get("auto_disable_enabled", True)),
-            "auto_disable_min_trades": max(1, _maybe_int(fallback_auto_disable_settings.get("auto_disable_min_trades")) or 5),
+            "configured_auto_disable_min_trades": _maybe_int(fallback_auto_disable_settings.get("auto_disable_min_trades")) or AUTO_DISABLE_MIN_TRADES_FLOOR,
+            "auto_disable_min_trades": _normalize_auto_disable_min_trades(fallback_auto_disable_settings.get("auto_disable_min_trades")),
             "auto_disable_max_drawdown_percent": max(0.0, _maybe_float(fallback_auto_disable_settings.get("auto_disable_max_drawdown_percent")) or 12.0),
             "auto_disable_min_win_rate": max(0.0, min(100.0, _maybe_float(fallback_auto_disable_settings.get("auto_disable_min_win_rate")) or 35.0)),
             "risk_caps_enabled": True,
@@ -3367,6 +3437,13 @@ def _normalize_auto_disable_scope(value: Any) -> str:
     return scope if scope in {"strategy", "symbol_assignment"} else "symbol_assignment"
 
 
+def _normalize_auto_disable_min_trades(value: Any, fallback: Any = None) -> int:
+    configured = _maybe_int(value)
+    if configured is None:
+        configured = _maybe_int(fallback)
+    return max(AUTO_DISABLE_MIN_TRADES_FLOOR, configured or AUTO_DISABLE_MIN_TRADES_FLOOR)
+
+
 def _normalize_assignment_control_state(assignment: dict[str, Any]) -> dict[str, Any]:
     enabled = bool(assignment.get("enabled", True))
     manually_disabled = bool(assignment.get("manually_disabled", False))
@@ -3405,7 +3482,7 @@ def _normalize_assignment_control_state(assignment: dict[str, Any]) -> dict[str,
         "disabled_reason": disabled_reason,
         "auto_disabled_reason": auto_disabled_reason,
         "auto_disable_enabled": bool(assignment.get("auto_disable_enabled", True)),
-        "auto_disable_min_trades": max(1, _maybe_int(assignment.get("auto_disable_min_trades")) or 5),
+        "auto_disable_min_trades": _normalize_auto_disable_min_trades(assignment.get("auto_disable_min_trades")),
         "auto_disable_max_drawdown_percent": max(0.0, _maybe_float(assignment.get("auto_disable_max_drawdown_percent")) or 12.0),
         "auto_disable_min_win_rate": max(0.0, min(100.0, _maybe_float(assignment.get("auto_disable_min_win_rate")) or 35.0)),
         "risk_caps_enabled": bool(assignment.get("risk_caps_enabled", True)),
