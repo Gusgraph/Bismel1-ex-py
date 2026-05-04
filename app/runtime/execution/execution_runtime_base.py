@@ -2564,6 +2564,7 @@ class ExecutionRuntimeService:
                     "trade_state": "close_order_submitted",
                     "exit_order_id": result.order_id or existing.get("exit_order_id"),
                     "exit_client_order_id": result.client_order_id or existing.get("exit_client_order_id"),
+                    "exit_reason": _raw_response_string(result.raw_response, "exit_reason") or existing.get("exit_reason"),
                     "exit_submitted_at": existing.get("exit_submitted_at") or now,
                     "updated_at": now,
                 }
@@ -2815,6 +2816,18 @@ class ExecutionRuntimeService:
                     action="evaluate",
                 )
 
+        stop_loss_result = self._evaluate_optional_stop_loss(
+            runtime_request=runtime_request,
+            runtime_config=runtime_config,
+            account_context=account_context,
+            run_id=run_id,
+            symbol=symbol,
+            assignment=assignment,
+            bars=bars,
+        )
+        if stop_loss_result is not None:
+            return stop_loss_result
+
         if strategy_key == "breakout":
             evaluation = evaluate_breakout_strategy(symbol=symbol, bars=bars, config=strategy_config)
         elif strategy_key == "vwap":
@@ -2959,6 +2972,135 @@ class ExecutionRuntimeService:
             last_processed_bar_at=_maybe_string(_evaluation_payload(evaluation).get("latest_bar_ended_at")),
             raw_response={
                 "evaluation": _evaluation_payload(evaluation),
+                "broker": execution_result.raw_response,
+            },
+        )
+
+    def _evaluate_optional_stop_loss(
+        self,
+        *,
+        runtime_request: ExecutionRuntimeRequest,
+        runtime_config: ExecutionRuntimeConfig,
+        account_context: ResolvedAlpacaAccountContext,
+        run_id: str,
+        symbol: str,
+        assignment: dict[str, Any],
+        bars: list[Any],
+    ) -> ExecutionRuntimeResult | None:
+        risk_settings = assignment.get("risk_settings") if isinstance(assignment.get("risk_settings"), dict) else {}
+        stop_loss_enabled = bool(risk_settings.get("stop_loss_enabled", False))
+        stop_loss_percent = _maybe_float(risk_settings.get("stop_loss_percent")) or 0.0
+        if not stop_loss_enabled or stop_loss_percent <= 0:
+            return None
+        if not bars:
+            return None
+
+        latest_price = _maybe_float(getattr(bars[-1], "close", None))
+        if latest_price is None or latest_price <= 0:
+            return None
+
+        try:
+            submission_state = self._paper_trading.get_submission_state(
+                symbol=symbol,
+                credential_context=account_context,
+            )
+        except AlpacaPaperTradingError as exc:
+            return self._build_result(
+                runtime_config=runtime_config,
+                run_id=run_id,
+                execution_status="failed",
+                message=_normalize_execution_error_message(exc.message),
+                account_context=account_context,
+                symbol=symbol,
+                action="evaluate",
+                broker_error_code=exc.code,
+                broker_error_message=_normalize_execution_error_message(exc.message),
+                raw_response=exc.raw_response,
+            )
+
+        position = submission_state.position
+        if position is None or position.qty <= 0:
+            return None
+
+        entry_price = _maybe_float(getattr(position, "avg_entry_price", None))
+        if entry_price is None or entry_price <= 0:
+            return None
+
+        stop_loss_price = entry_price * (1 - (stop_loss_percent / 100.0))
+        if latest_price > stop_loss_price:
+            return None
+
+        trade_config = self._build_trade_config(
+            runtime_config=runtime_config,
+            symbol=symbol,
+            action="close",
+            assignment=assignment,
+            latest_price=latest_price,
+        )
+        trade_request = ExecutionRuntimeRequest(
+            user_id=runtime_request.user_id,
+            account_id=runtime_request.account_id,
+            slot=runtime_request.slot,
+            symbol=symbol,
+            action="close",
+            alpaca_account_id=runtime_request.alpaca_account_id,
+            broker_environment=runtime_request.broker_environment,
+            payload=runtime_request.payload,
+        )
+        try:
+            execution_result = self._execute_order(
+                runtime_request=trade_request,
+                runtime_config=trade_config,
+                account_context=account_context,
+            )
+        except AlpacaPaperTradingError as exc:
+            return self._build_result(
+                runtime_config=trade_config,
+                run_id=run_id,
+                execution_status="failed",
+                message=_normalize_execution_error_message(exc.message),
+                account_context=account_context,
+                symbol=symbol,
+                action="close",
+                broker_error_code=exc.code,
+                broker_error_message=_normalize_execution_error_message(exc.message),
+                raw_response=exc.raw_response,
+            )
+
+        execution_status = _strategy_execution_status(action="close", execution_result=execution_result)
+        return self._build_result(
+            runtime_config=trade_config,
+            run_id=run_id,
+            execution_status=execution_status,
+            message="Execution runtime submitted stop-loss close order for "
+            f"{symbol}." if execution_result.submitted else _strategy_result_message(symbol=symbol, action="close", execution_result=execution_result),
+            account_context=account_context,
+            symbol=symbol,
+            action="close",
+            order_id=execution_result.order_id,
+            client_order_id=execution_result.client_order_id,
+            side=execution_result.side,
+            qty=trade_config.qty,
+            notional=execution_result.notional if execution_result.notional is not None else trade_config.notional,
+            broker_error_code=execution_result.broker_error_code,
+            broker_error_message=execution_result.broker_error_message,
+            enforcement_reason="stop_loss",
+            manually_disabled=bool(assignment.get("manually_disabled")),
+            auto_disabled=bool(assignment.get("auto_disabled")),
+            disabled_source=_maybe_string(assignment.get("disabled_source")),
+            disabled_reason=_maybe_string(assignment.get("disabled_reason")),
+            auto_disabled_at=_maybe_string(assignment.get("auto_disabled_at")),
+            last_runtime_decision_at=self._now_provider().isoformat(),
+            last_processed_bar_at=_maybe_string(getattr(bars[-1], "ends_at", None)),
+            raw_response={
+                "exit_reason": "stop_loss",
+                "stop_loss": {
+                    "enabled": True,
+                    "entry_price": entry_price,
+                    "latest_price": latest_price,
+                    "stop_loss_percent": stop_loss_percent,
+                    "stop_loss_price": round(stop_loss_price, 6),
+                },
                 "broker": execution_result.raw_response,
             },
         )

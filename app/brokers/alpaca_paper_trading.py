@@ -97,6 +97,7 @@ class AlpacaPaperPositionState:
     symbol: str
     qty: float
     market_value: float | None = None
+    avg_entry_price: float | None = None
 
 
 @dataclass(frozen=True)
@@ -362,6 +363,7 @@ class AlpacaPaperTradingAdapter:
                 symbol=symbol.upper(),
                 qty=_maybe_float(position_payload.get("qty")) or 0.0,
                 market_value=_maybe_float(position_payload.get("market_value")),
+                avg_entry_price=_maybe_float(position_payload.get("avg_entry_price")),
             ),
         )
 
