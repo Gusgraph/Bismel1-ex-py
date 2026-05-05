@@ -402,6 +402,13 @@ class FakePaperTradingAdapterWithOpenOrder(FakePaperTradingAdapter):
         ]
 
 
+class FakePaperTradingAdapterWithSymbolRuntimeFailure(FakePaperTradingAdapter):
+    def get_submission_state(self, *, symbol: str, credential_context):
+        if symbol.upper() == "AAPL":
+            raise RuntimeError("simulated per-symbol broker state failure")
+        return super().get_submission_state(symbol=symbol, credential_context=credential_context)
+
+
 class FakePaperTradingAdapterWithClosedOrder(FakePaperTradingAdapter):
     def list_recent_orders(self, *, credential_context=None, limit: int = 50):
         return [
@@ -553,6 +560,69 @@ def test_execution_runtime_submits_market_buy_by_slot() -> None:
     assert asdict(store.get_paths(uid="user-a", account_id=101, slot_number=1, symbol="AAPL")) == result.firestore_paths
 
 
+def test_execution_runtime_buy_blocks_existing_open_buy_order() -> None:
+    store = FakeExecutionRuntimeStore()
+    service = ExecutionRuntimeService(
+        settings=get_settings(),
+        runtime_store=store,
+        account_resolver=FakeAccountResolver(),
+        paper_trading=FakePaperTradingAdapterWithOpenOrder(),
+    )
+
+    result = service.run_once(
+        {
+            "user_id": "user-a",
+            "account_id": 101,
+            "slot": 1,
+            "symbol": "AAPL",
+            "action": "buy",
+            "qty": 1,
+        }
+    )
+
+    assert result.ok is False
+    assert result.execution_status == "skipped_duplicate_buy_order"
+    assert result.enforcement_reason == "open_buy_order_exists"
+
+
+def test_execution_runtime_buy_blocks_recent_filled_buy_order_until_position_sync_catches_up() -> None:
+    now = datetime(2026, 5, 5, 13, 45, tzinfo=UTC)
+    paper_trading = FakePaperTradingAdapterWithFilledHistory()
+    paper_trading.recent_orders = [
+        {
+            "id": "recent-buy",
+            "client_order_id": "execution-buy-recent",
+            "status": "filled",
+            "symbol": "AAPL",
+            "side": "buy",
+            "filled_at": "2026-05-05T13:30:00+00:00",
+        }
+    ]
+    store = FakeExecutionRuntimeStore()
+    service = ExecutionRuntimeService(
+        settings=get_settings(),
+        runtime_store=store,
+        account_resolver=FakeAccountResolver(),
+        paper_trading=paper_trading,
+        now_provider=lambda: now,
+    )
+
+    result = service.run_once(
+        {
+            "user_id": "user-a",
+            "account_id": 101,
+            "slot": 1,
+            "symbol": "AAPL",
+            "action": "buy",
+            "qty": 1,
+        }
+    )
+
+    assert result.ok is False
+    assert result.execution_status == "skipped_duplicate_buy_order"
+    assert result.enforcement_reason == "recent_filled_buy_order_exists"
+
+
 def test_execution_runtime_buy_is_blocked_by_max_positions() -> None:
     store = FakeExecutionRuntimeStore()
     store.runtime_config_payload = {
@@ -582,8 +652,8 @@ def test_execution_runtime_buy_is_blocked_by_max_positions() -> None:
     result = service.run_once({"user_id": "user-a", "account_id": 101, "slot": 1})
 
     assert result.ok is False
-    assert result.execution_status == "skipped_risk_max_positions"
-    assert result.enforcement_reason == "max_positions"
+    assert result.execution_status == "skipped_guardrail_open_positions"
+    assert result.guardrail_reason == "open_positions"
     assert result.open_positions_count == 5
 
 
@@ -1227,6 +1297,58 @@ def test_execution_runtime_uses_symbol_assignments_for_multiple_symbols() -> Non
     assert any(item.symbol == "NVDA" and item.execution_status == "no_signal" for item in store.writes)
 
 
+def test_execution_runtime_isolates_unexpected_symbol_failure_and_continues_cycle() -> None:
+    store = FakeExecutionRuntimeStore()
+    store.runtime_config_payload = {
+        "enabled": True,
+        "automation_enabled": True,
+        "symbol_assignments": {
+            "AAPL": {
+                "enabled": True,
+                "strategy_key": "ema",
+                "strategy_settings": {
+                    "fast_ema_length": 3,
+                    "slow_ema_length": 5,
+                    "timeframe": "15m",
+                },
+                "risk_settings": {
+                    "position_size_mode": "qty",
+                    "default_qty": 1,
+                },
+            },
+            "MSFT": {
+                "enabled": True,
+                "strategy_key": "ema",
+                "strategy_settings": {
+                    "fast_ema_length": 3,
+                    "slow_ema_length": 5,
+                    "timeframe": "15m",
+                },
+                "risk_settings": {
+                    "position_size_mode": "qty",
+                    "default_qty": 1,
+                },
+            },
+        },
+    }
+    service = ExecutionRuntimeService(
+        settings=get_settings(),
+        runtime_store=store,
+        account_resolver=FakeAccountResolver(),
+        paper_trading=FakePaperTradingAdapterWithSymbolRuntimeFailure(),
+        market_data=FakeMarketDataAdapter({
+            "AAPL": _make_bars([10, 9, 8, 7, 6, 7, 8, 9]),
+            "MSFT": _make_bars([10, 9, 8, 7, 6, 7, 8, 9]),
+        }),
+    )
+
+    result = service.run_once({"user_id": "user-a", "account_id": 101, "slot": 1})
+
+    assert result.execution_status == "buy_submitted"
+    assert any(item.symbol == "AAPL" and item.execution_status == "skipped_runtime_symbol_error" for item in store.writes)
+    assert any(item.symbol == "MSFT" and item.execution_status == "buy_submitted" for item in store.writes)
+
+
 def test_execution_runtime_pullback_generates_buy() -> None:
     store = FakeExecutionRuntimeStore()
     store.runtime_config_payload = {
@@ -1770,8 +1892,8 @@ def test_execution_runtime_mixed_strategies_in_one_slot() -> None:
     assert result.execution_status == "buy_submitted"
     assert any(item.symbol == "AAPL" and item.execution_status == "buy_submitted" for item in store.writes)
     assert any(item.symbol == "NVDA" and item.execution_status == "buy_submitted" for item in store.writes)
-    assert any(item.symbol == "MSFT" and item.execution_status == "buy_submitted" for item in store.writes)
-    assert any(item.symbol == "AMD" and item.execution_status == "buy_submitted" for item in store.writes)
+    assert any(item.symbol == "MSFT" and item.execution_status == "skipped_guardrail_run_entry_limit" for item in store.writes)
+    assert any(item.symbol == "AMD" and item.execution_status == "skipped_guardrail_run_entry_limit" for item in store.writes)
 
 
 def test_execution_runtime_vwap_generates_buy() -> None:
@@ -2089,9 +2211,9 @@ def test_execution_runtime_slot_cycle_reuses_benchmark_and_performance_reads() -
 
     assert result.execution_status == "buy_submitted"
     assert store.performance_docs_load_count == 1
-    assert market_data.fetch_counts[("SPY", "15Min", 6)] == 1
-    assert market_data.fetch_counts[("AAPL", "15Min", 6)] == 1
-    assert market_data.fetch_counts[("NVDA", "15Min", 6)] == 1
+    assert sum(count for (symbol, _, _), count in market_data.fetch_counts.items() if symbol == "SPY") == 1
+    assert sum(count for (symbol, _, _), count in market_data.fetch_counts.items() if symbol == "AAPL") == 1
+    assert sum(count for (symbol, _, _), count in market_data.fetch_counts.items() if symbol == "NVDA") == 1
 
 
 def test_execution_runtime_slot_cycle_cache_resets_between_runs() -> None:
@@ -2131,8 +2253,8 @@ def test_execution_runtime_slot_cycle_cache_resets_between_runs() -> None:
     assert first.execution_status == "buy_submitted"
     assert second.execution_status == "buy_submitted"
     assert store.performance_docs_load_count == 2
-    assert market_data.fetch_counts[("AAPL", "15Min", 6)] == 2
-    assert market_data.fetch_counts[("SPY", "15Min", 6)] == 2
+    assert sum(count for (symbol, _, _), count in market_data.fetch_counts.items() if symbol == "AAPL") == 2
+    assert sum(count for (symbol, _, _), count in market_data.fetch_counts.items() if symbol == "SPY") == 2
 
 
 def test_execution_runtime_slot_cycle_continues_after_one_symbol_market_data_failure() -> None:

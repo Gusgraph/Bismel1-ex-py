@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import logging
 from typing import Any, Callable, Protocol, TypeVar
 from uuid import uuid4
@@ -52,6 +52,7 @@ SUPPORTED_EXECUTION_ACTIONS = frozenset({"buy", "sell", "close", "cancel", "modi
 ADMIN_CRYPTO_MONITOR_UIDS = frozenset({"admin-runtime-monitor-prime", "admin-runtime-monitor-execution"})
 ADMIN_CRYPTO_MONITOR_SYMBOLS = frozenset({"UNI/USD", "LINK/USD"})
 AUTO_DISABLE_MIN_TRADES_FLOOR = 5
+RECENT_BUY_DUPLICATE_GUARD_MINUTES = 45
 
 
 class ExecutionRuntimeStoreError(RuntimeError):
@@ -1439,6 +1440,7 @@ class ExecutionRuntimeService:
                 runtime_config=runtime_config,
                 submission_state=submission_state,
                 assignment=assignment,
+                account_context=account_context,
             )
             if risk_decision is not None:
                 return risk_decision
@@ -1687,6 +1689,7 @@ class ExecutionRuntimeService:
         runtime_config: ExecutionRuntimeConfig,
         submission_state: AlpacaPaperSubmissionState,
         assignment: dict[str, Any] | None = None,
+        account_context: ResolvedAlpacaAccountContext,
     ) -> AlpacaPaperExecutionResult | None:
         normalized_assignment = _normalize_assignment_control_state(assignment or {})
         risk_caps_enabled = bool(normalized_assignment.get("risk_caps_enabled", True))
@@ -1718,6 +1721,13 @@ class ExecutionRuntimeService:
                     "open_positions_count": submission_state.account.open_positions_count,
                 },
             )
+
+        duplicate_order_decision = self._enforce_duplicate_buy_order(
+            runtime_config=runtime_config,
+            account_context=account_context,
+        )
+        if duplicate_order_decision is not None:
+            return duplicate_order_decision
 
         max_positions = _maybe_int(risk_settings.get("max_positions"))
         open_positions_count = submission_state.account.open_positions_count
@@ -1804,6 +1814,65 @@ class ExecutionRuntimeService:
                     },
                 )
         return None
+
+    def _enforce_duplicate_buy_order(
+        self,
+        *,
+        runtime_config: ExecutionRuntimeConfig,
+        account_context: ResolvedAlpacaAccountContext,
+    ) -> AlpacaPaperExecutionResult | None:
+        try:
+            recent_orders = self._paper_trading.list_recent_orders(
+                credential_context=account_context,
+                limit=100,
+            )
+        except Exception as exc:
+            return AlpacaPaperExecutionResult(
+                action=runtime_config.action,
+                submitted=False,
+                order_status="skipped",
+                order_id=None,
+                client_order_id=None,
+                side="buy",
+                notional=runtime_config.notional,
+                skipped_reason="broker_order_state_unavailable",
+                broker_error_code="broker_order_state_unavailable",
+                broker_error_message=(
+                    "Execution runtime buy skipped because recent broker orders could not be checked safely."
+                ),
+                raw_response={
+                    "enforcement_reason": "broker_order_state_unavailable",
+                    "error_type": exc.__class__.__name__,
+                },
+            )
+
+        duplicate_order = _find_duplicate_buy_order(
+            recent_orders=recent_orders,
+            symbol=runtime_config.symbol,
+            now=self._now_provider(),
+        )
+        if duplicate_order is None:
+            return None
+
+        reason = "open_buy_order_exists" if _is_order_open(duplicate_order) else "recent_filled_buy_order_exists"
+        return AlpacaPaperExecutionResult(
+            action=runtime_config.action,
+            submitted=False,
+            order_status="skipped",
+            order_id=_maybe_string(duplicate_order.get("id")),
+            client_order_id=_maybe_string(duplicate_order.get("client_order_id")),
+            side="buy",
+            notional=runtime_config.notional,
+            skipped_reason="duplicate_buy_order",
+            broker_error_code="duplicate_buy_order",
+            broker_error_message="Execution runtime buy skipped because a same-symbol buy order already exists.",
+            raw_response={
+                "enforcement_reason": reason,
+                "duplicate_order_status": _maybe_string(duplicate_order.get("status")),
+                "duplicate_order_symbol": _maybe_string(duplicate_order.get("symbol")),
+                "duplicate_order_side": _maybe_string(duplicate_order.get("side")),
+            },
+        )
 
     def _enforce_global_buy_guardrails(
         self,
@@ -2133,14 +2202,39 @@ class ExecutionRuntimeService:
 
         symbol_results: list[ExecutionRuntimeResult] = []
         for symbol, assignment in symbol_assignments.items():
-            symbol_result = self._run_assigned_symbol(
-                runtime_request=runtime_request,
-                runtime_config=runtime_config,
-                account_context=account_context,
-                run_id=run_id,
-                symbol=symbol,
-                assignment=assignment,
-            )
+            try:
+                symbol_result = self._run_assigned_symbol(
+                    runtime_request=runtime_request,
+                    runtime_config=runtime_config,
+                    account_context=account_context,
+                    run_id=run_id,
+                    symbol=symbol,
+                    assignment=assignment,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Execution runtime isolated symbol failure account_id=%s slot=%s symbol=%s",
+                    runtime_config.account_id,
+                    runtime_config.slot_number,
+                    symbol,
+                )
+                symbol_result = self._build_result(
+                    runtime_config=runtime_config,
+                    run_id=run_id,
+                    execution_status="skipped_runtime_symbol_error",
+                    message=f"Execution runtime skipped {symbol} because this symbol failed during evaluation.",
+                    account_context=account_context,
+                    symbol=symbol,
+                    action="evaluate",
+                    broker_error_code="runtime_symbol_error",
+                    broker_error_message="Execution runtime isolated a per-symbol error so the remaining symbols could continue.",
+                    last_runtime_decision_at=self._now_provider().isoformat(),
+                    raw_response={
+                        "error_type": exc.__class__.__name__,
+                        "reason_code": "runtime_symbol_error",
+                        "isolated": True,
+                    },
+                )
             symbol_results.append(symbol_result)
             symbol_request = ExecutionRuntimeRequest(
                 user_id=runtime_request.user_id,
@@ -2186,12 +2280,20 @@ class ExecutionRuntimeService:
                 max_new_entries_per_run=runtime_config.max_new_entries_per_run,
                 emergency_kill_switch=runtime_config.emergency_kill_switch,
             )
-            self._runtime_store.write_runtime_result(
-                runtime_request=symbol_request,
-                runtime_config=symbol_config,
-                account_context=account_context,
-                result=symbol_result,
-            )
+            try:
+                self._runtime_store.write_runtime_result(
+                    runtime_request=symbol_request,
+                    runtime_config=symbol_config,
+                    account_context=account_context,
+                    result=symbol_result,
+                )
+            except Exception:
+                logger.exception(
+                    "Execution runtime symbol writeback failed account_id=%s slot=%s symbol=%s",
+                    runtime_config.account_id,
+                    runtime_config.slot_number,
+                    symbol,
+                )
 
         summary = self._summarize_strategy_results(
             runtime_config=runtime_config,
@@ -3197,6 +3299,7 @@ class ExecutionRuntimeService:
             "skipped_risk_max_exposure",
             "skipped_risk_max_positions",
             "skipped_risk_invalid_size",
+            "skipped_runtime_symbol_error",
             "skipped_invalid_config",
             "skipped_strategy_not_implemented",
             "skipped_market_data_unavailable",
@@ -3709,6 +3812,8 @@ def _strategy_execution_status(*, action: str, execution_result: AlpacaPaperExec
         "risk_max_exposure": "skipped_risk_max_exposure",
         "risk_max_positions": "skipped_risk_max_positions",
         "risk_invalid_size": "skipped_risk_invalid_size",
+        "duplicate_buy_order": "skipped_duplicate_buy_order",
+        "broker_order_state_unavailable": "skipped_broker_order_state_unavailable",
     }
     return mapping.get(code, "failed" if execution_result.order_status == "rejected" else "skipped")
 
@@ -3742,6 +3847,8 @@ def _manual_execution_status(*, action: str, execution_result: AlpacaPaperExecut
         "risk_max_exposure": "skipped_risk_max_exposure",
         "risk_max_positions": "skipped_risk_max_positions",
         "risk_invalid_size": "skipped_risk_invalid_size",
+        "duplicate_buy_order": "skipped_duplicate_buy_order",
+        "broker_order_state_unavailable": "skipped_broker_order_state_unavailable",
         "no_position_to_close": "skipped_no_open_position",
         "no_position_to_sell": "skipped_no_open_position",
         "insufficient_position_qty": "skipped_no_open_position",
@@ -3903,3 +4010,32 @@ def _execution_strategy_bar_fetch_limit(*, timeframe: str, required_bar_count: i
 def _is_order_open(order_payload: dict[str, Any]) -> bool:
     status = (_maybe_string(order_payload.get("status")) or "").lower()
     return status in {"new", "accepted", "pending_new", "partially_filled", "accepted_for_bidding"}
+
+
+def _find_duplicate_buy_order(
+    *,
+    recent_orders: list[dict[str, Any]],
+    symbol: str,
+    now: datetime,
+) -> dict[str, Any] | None:
+    normalized_symbol = symbol.strip().upper()
+    recent_cutoff = now - timedelta(minutes=RECENT_BUY_DUPLICATE_GUARD_MINUTES)
+    for order_payload in recent_orders:
+        if not isinstance(order_payload, dict):
+            continue
+        order_symbol = (_maybe_string(order_payload.get("symbol")) or "").upper()
+        order_side = (_maybe_string(order_payload.get("side")) or "").lower()
+        if order_symbol != normalized_symbol or order_side != "buy":
+            continue
+        if _is_order_open(order_payload):
+            return order_payload
+        if _is_filled_order(order_payload):
+            order_time = (
+                _iso_to_datetime(order_payload.get("filled_at"))
+                or _iso_to_datetime(order_payload.get("submitted_at"))
+                or _iso_to_datetime(order_payload.get("created_at"))
+                or _iso_to_datetime(order_payload.get("updated_at"))
+            )
+            if order_time is not None and order_time >= recent_cutoff:
+                return order_payload
+    return None
