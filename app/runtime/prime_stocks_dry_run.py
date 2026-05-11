@@ -1608,6 +1608,13 @@ class PrimeStocksRuntimeService:
             return None, "dry_run_only", "paper_execution_disabled", False, 0, None, None, None
         if candidate_action not in {"FirstLot", "EXIT_ATR", "EXIT_REGIME"} and not candidate_action.startswith("MULTI-"):
             return None, "no_op", "no_action_candidate", False, 0, None, None, None
+        if candidate_action in {"EXIT_ATR", "EXIT_REGIME"}:
+            logger.warning(
+                "Prime Stocks non-TP close blocked before broker submission symbol=%s candidate_action=%s",
+                runtime_config.symbol,
+                candidate_action,
+            )
+            return None, "prime_non_tp_exit_blocked", "prime_non_tp_exit_blocked", False, 0, None, None, None
         if not account_context.trade_enabled:
             return None, "credential_trade_access_missing", "credential_trade_access_missing", False, 0, None, None, None
         if not account_context.environment.strip():

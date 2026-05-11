@@ -253,7 +253,6 @@ def test_strategy_reasoning_treats_downtrend_as_soft_bias_in_scalper_mode() -> N
         execution_allowed=True,
         execution_timeframe="15M",
         trend_timeframe="1D",
-        strategy_mode="scalper",
     )
 
     reasoning = _build_strategy_reasoning_payload(
@@ -392,7 +391,7 @@ def test_runtime_service_can_force_candidate_action_for_validation() -> None:
     assert paper_trading.calls[-1]["action"] == "FirstLot"
 
 
-def test_runtime_service_submits_exit_order_when_exit_candidate_is_present() -> None:
+def test_runtime_service_blocks_non_tp_exit_order_when_exit_candidate_is_present() -> None:
     settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
     fake_client = FakeFirestoreClient()
     runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
@@ -408,9 +407,9 @@ def test_runtime_service_submits_exit_order_when_exit_candidate_is_present() -> 
 
     result = service.run_once(symbol="AAPL", allow_execution=True)
 
-    assert result.execution_decision == "submitted_exit"
-    assert result.order_submitted is True
-    assert paper_trading.calls[-1]["action"] == "EXIT_ATR"
+    assert result.execution_decision == "prime_non_tp_exit_blocked"
+    assert result.order_submitted is False
+    assert paper_trading.calls == []
 
 
 def test_runtime_service_submits_tier_aware_multi_buy_when_add_signal_is_present() -> None:
@@ -901,9 +900,9 @@ def test_runtime_service_blocks_exit_without_open_position() -> None:
 
     result = service.run_once(symbol="AAPL", allow_execution=True)
 
-    assert result.execution_decision == "exit_requires_open_position"
+    assert result.execution_decision == "prime_non_tp_exit_blocked"
     assert result.order_submitted is False
-    assert paper_trading.calls[0]["action"] == "submission_state"
+    assert paper_trading.calls == []
 
 
 def test_runtime_service_blocks_when_max_add_count_is_exceeded() -> None:
@@ -1081,9 +1080,9 @@ def test_runtime_service_allows_exit_when_global_kill_switch_is_enabled() -> Non
 
     result = service.run_once(symbol="AAPL", allow_execution=True)
 
-    assert result.execution_decision == "submitted_exit"
-    assert result.order_submitted is True
-    assert paper_trading.calls[-1]["action"] == "EXIT_REGIME"
+    assert result.execution_decision == "prime_non_tp_exit_blocked"
+    assert result.order_submitted is False
+    assert paper_trading.calls == []
 
 
 def test_runtime_service_uses_same_logic_for_paper_and_live_execution_paths() -> None:
@@ -2109,7 +2108,7 @@ def test_runtime_service_persists_runtime_state_after_add() -> None:
     assert state["last_entry_time"] == "2026-04-09T10:00:00+00:00"
 
 
-def test_runtime_service_resets_runtime_state_after_exit() -> None:
+def test_runtime_service_preserves_runtime_state_when_non_tp_exit_is_blocked() -> None:
     settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
     fake_client = FakeFirestoreClient()
     fake_client.collection("runtime_products").document("prime_stocks").collection("state").document("current").set(
@@ -2147,13 +2146,13 @@ def test_runtime_service_resets_runtime_state_after_exit() -> None:
     result = service.run_once(symbol="AAPL", allow_execution=True)
 
     state = fake_client.storage["runtime_products"]["prime_stocks"]["state"]["current"]
-    assert result.execution_decision == "submitted_exit"
-    assert state["position_open"] is False
-    assert state["position_size"] == 0.0
-    assert state["position_avg_price"] is None
-    assert state["dollars_used"] == 0.0
-    assert state["add_count"] == 0
-    assert state["last_exit_time"] == _bars()[-1].ends_at.isoformat()
+    assert result.execution_decision == "prime_non_tp_exit_blocked"
+    assert state["position_open"] is True
+    assert state["position_size"] == 2.0
+    assert state["position_avg_price"] == 101.0
+    assert state["dollars_used"] == 174.0
+    assert state["add_count"] == 2
+    assert state.get("last_exit_time") is None
 
 
 def test_runtime_service_updates_state_fields_on_no_signal() -> None:
@@ -2365,7 +2364,7 @@ def test_runtime_service_allows_new_entry_when_ai_cache_is_risk_off() -> None:
     assert paper_trading.calls[-1]["action"] == "FirstLot"
 
 
-def test_runtime_service_allows_exit_when_market_ai_cache_is_risk_off() -> None:
+def test_runtime_service_blocks_non_tp_exit_when_market_ai_cache_is_risk_off() -> None:
     settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
     fake_client = FakeFirestoreClient()
     _seed_ai_cache(fake_client, market_regime="risk_off")
@@ -2382,20 +2381,20 @@ def test_runtime_service_allows_exit_when_market_ai_cache_is_risk_off() -> None:
 
     result = service.run_once(symbol="AAPL", allow_execution=True)
 
-    assert result.execution_decision == "submitted_exit"
-    assert result.execution_allowed is True
-    assert result.order_submitted is True
+    assert result.execution_decision == "prime_non_tp_exit_blocked"
+    assert result.execution_allowed is False
+    assert result.order_submitted is False
     assert result.candidate_action == "EXIT_ATR"
     assert result.ai is not None
     assert result.ai["Ai_regime_label"] == "risk_off"
     assert result.ai["Ai_blocked_reason"] is None
-    assert paper_trading.calls[-1]["action"] == "EXIT_ATR"
+    assert paper_trading.calls == []
     root = fake_client.storage["runtime_products"]["prime_stocks"]
-    assert root["execution"]["current"]["execution_decision"] == "submitted_exit"
-    assert root["execution"]["current"]["execution_allowed"] is True
+    assert root["execution"]["current"]["execution_decision"] == "prime_non_tp_exit_blocked"
+    assert root["execution"]["current"]["execution_allowed"] is False
 
 
-def test_runtime_service_allows_exit_when_symbol_ai_cache_is_unsafe() -> None:
+def test_runtime_service_blocks_non_tp_exit_when_symbol_ai_cache_is_unsafe() -> None:
     settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
     fake_client = FakeFirestoreClient()
     _seed_ai_cache(fake_client, symbol_safety="unsafe")
@@ -2412,17 +2411,17 @@ def test_runtime_service_allows_exit_when_symbol_ai_cache_is_unsafe() -> None:
 
     result = service.run_once(symbol="AAPL", allow_execution=True)
 
-    assert result.execution_decision == "submitted_exit"
-    assert result.execution_allowed is True
-    assert result.order_submitted is True
+    assert result.execution_decision == "prime_non_tp_exit_blocked"
+    assert result.execution_allowed is False
+    assert result.order_submitted is False
     assert result.candidate_action == "EXIT_REGIME"
     assert result.ai is not None
     assert result.ai["Ai_safety_label"] == "unsafe"
     assert result.ai["Ai_blocked_reason"] == "ai_safety_unsafe"
-    assert paper_trading.calls[-1]["action"] == "EXIT_REGIME"
+    assert paper_trading.calls == []
     root = fake_client.storage["runtime_products"]["prime_stocks"]
-    assert root["execution"]["current"]["execution_decision"] == "submitted_exit"
-    assert root["execution"]["current"]["execution_allowed"] is True
+    assert root["execution"]["current"]["execution_decision"] == "prime_non_tp_exit_blocked"
+    assert root["execution"]["current"]["execution_allowed"] is False
 
 
 def test_runtime_service_allows_when_ai_cache_is_stale() -> None:
@@ -3225,6 +3224,7 @@ def _settings(**overrides) -> AppConfig:
         prime_stocks_test_mode=False,
         prime_stocks_test_trigger=None,
         prime_stocks_test_symbol_override=None,
+        prime_stocks_strategy_mode="scalper",
         prime_stocks_execution_bar_limit=351,
         prime_stocks_trend_bar_limit=221,
         prime_stocks_first_lot_notional=101.0,
