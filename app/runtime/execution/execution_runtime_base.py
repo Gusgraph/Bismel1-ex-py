@@ -2360,6 +2360,9 @@ class ExecutionRuntimeService:
                 "disabled_source": None,
                 "disabled_reason": None,
                 "auto_disabled_reason": None,
+                "system_review": False,
+                "review_reason": None,
+                "review_status": "monitoring",
                 "auto_disable_status": "continue_monitoring",
                 "auto_disable_reason_code": "auto_disable_sample_too_small",
                 "auto_disable_counted_trades": total_trades,
@@ -2386,18 +2389,48 @@ class ExecutionRuntimeService:
             auto_disabled_reason = "auto_disabled_drawdown"
 
         if auto_disabled_reason is None:
+            if bool(assignment.get("system_review")) or _maybe_string(assignment.get("review_reason")):
+                now = self._now_provider().isoformat()
+                updated_assignment = _normalize_assignment_control_state({
+                    **assignment,
+                    "enabled": True,
+                    "manually_disabled": False,
+                    "auto_disabled": False,
+                    "disabled_source": None,
+                    "disabled_reason": None,
+                    "auto_disabled_reason": None,
+                    "auto_disabled_at": None,
+                    "system_review": False,
+                    "review_reason": None,
+                    "review_status": "monitoring",
+                    "auto_disable_status": "monitoring",
+                    "auto_disable_reason_code": None,
+                    "last_auto_disable_review_at": now,
+                    "last_runtime_decision_at": now,
+                })
+                self._persist_assignment_control_state(
+                    runtime_config=runtime_config,
+                    symbol=symbol,
+                    updated_assignment=updated_assignment,
+                )
             return None
 
         now = self._now_provider().isoformat()
         updated_assignment = _normalize_assignment_control_state({
             **assignment,
-            "enabled": False,
+            "enabled": True,
             "manually_disabled": False,
-            "auto_disabled": True,
-            "disabled_source": "auto",
-            "disabled_reason": auto_disabled_reason,
-            "auto_disabled_reason": auto_disabled_reason,
-            "auto_disabled_at": now,
+            "auto_disabled": False,
+            "disabled_source": None,
+            "disabled_reason": None,
+            "auto_disabled_reason": None,
+            "auto_disabled_at": None,
+            "system_review": True,
+            "review_reason": auto_disabled_reason,
+            "review_status": "system_review",
+            "reviewed_at": now,
+            "auto_disable_status": "system_review",
+            "auto_disable_reason_code": auto_disabled_reason,
             "last_runtime_decision_at": now,
         })
         self._persist_assignment_control_state(
@@ -2409,22 +2442,23 @@ class ExecutionRuntimeService:
         return self._build_result(
             runtime_config=runtime_config,
             run_id=run_id,
-            execution_status="skipped_auto_disabled",
-            message=f"Execution runtime auto-disabled {symbol} because {auto_disabled_reason.replace('_', ' ')} thresholds were breached.",
+            execution_status="skipped_system_review",
+            message=f"Execution runtime placed {symbol} into system review because {auto_disabled_reason.replace('_', ' ')} thresholds need review.",
             account_context=account_context,
             symbol=symbol,
             action="evaluate",
             enforcement_reason=auto_disabled_reason,
             manually_disabled=False,
-            auto_disabled=True,
-            disabled_source="auto",
-            disabled_reason=auto_disabled_reason,
-            auto_disabled_at=now,
+            auto_disabled=False,
+            disabled_source=None,
+            disabled_reason=None,
+            auto_disabled_at=None,
             last_runtime_decision_at=now,
             enforcement_metric_snapshot=performance_snapshot,
             raw_response={
                 "strategy_key": strategy_key,
-                "auto_disable": True,
+                "system_review": True,
+                "review_reason": auto_disabled_reason,
                 "performance_snapshot": performance_snapshot,
             },
         )
@@ -2769,54 +2803,6 @@ class ExecutionRuntimeService:
                 disabled_reason=_maybe_string(assignment.get("disabled_reason")) or "manually_disabled",
                 last_runtime_decision_at=self._now_provider().isoformat(),
                 raw_response={"strategy_key": strategy_key, "assignment_enabled": False, "disabled_source": "manual"},
-            )
-        if bool(assignment.get("auto_disabled")) or str(assignment.get("disabled_source") or "").strip().lower() == "auto":
-            auto_disabled_snapshot = self._build_assignment_performance_snapshot(
-                runtime_config=runtime_config,
-                symbol=symbol,
-                strategy_key=strategy_key,
-            )
-            auto_disabled_counted_trades = int(auto_disabled_snapshot.get("total_trades", 0) or 0)
-            auto_disabled_configured_min_trades = (
-                _maybe_int(assignment.get("configured_auto_disable_min_trades"))
-                or _maybe_int(assignment.get("auto_disable_min_trades"))
-                or runtime_config.auto_disable_min_trades
-            )
-            auto_disabled_effective_min_trades = _normalize_auto_disable_min_trades(auto_disabled_configured_min_trades)
-            auto_disabled_snapshot.update({
-                "configured_auto_disable_min_trades": auto_disabled_configured_min_trades,
-                "effective_auto_disable_min_trades": auto_disabled_effective_min_trades,
-                "auto_disable_min_trades_floor": AUTO_DISABLE_MIN_TRADES_FLOOR,
-                "would_not_disable_under_current_floor": auto_disabled_counted_trades < auto_disabled_effective_min_trades,
-            })
-            return self._build_result(
-                runtime_config=runtime_config,
-                run_id=run_id,
-                execution_status="skipped_auto_disabled",
-                message=f"Execution runtime skipped {symbol} because the symbol assignment is auto-disabled.",
-                account_context=account_context,
-                symbol=symbol,
-                action="evaluate",
-                manually_disabled=False,
-                auto_disabled=True,
-                disabled_source="auto",
-                disabled_reason=_maybe_string(assignment.get("auto_disabled_reason")) or _maybe_string(assignment.get("disabled_reason")) or "auto_disabled",
-                auto_disabled_at=_maybe_string(assignment.get("auto_disabled_at")),
-                last_runtime_decision_at=self._now_provider().isoformat(),
-                enforcement_metric_snapshot=auto_disabled_snapshot,
-                raw_response={
-                    "strategy_key": strategy_key,
-                    "assignment_enabled": False,
-                    "disabled_source": "auto",
-                    "auto_disable": {
-                        "currently_disabled": True,
-                        "disabled_reason": _maybe_string(assignment.get("auto_disabled_reason")) or _maybe_string(assignment.get("disabled_reason")) or "auto_disabled",
-                        "configured_min_trades": auto_disabled_configured_min_trades,
-                        "effective_min_trades": auto_disabled_effective_min_trades,
-                        "counted_trades": auto_disabled_counted_trades,
-                        "would_not_disable_under_current_floor": auto_disabled_counted_trades < auto_disabled_effective_min_trades,
-                    },
-                },
             )
         auto_disable_result = self._enforce_assignment_auto_disable(
             runtime_config=runtime_config,
@@ -3286,7 +3272,7 @@ class ExecutionRuntimeService:
             "close_submitted",
             "sell_submitted",
             "failed",
-            "skipped_auto_disabled",
+            "skipped_system_review",
             "skipped_manually_disabled",
             "skipped_order_management_disabled",
             "skipped_cancel_disabled",
@@ -3594,6 +3580,10 @@ def _normalize_symbol_assignments(
                 "disabled_reason": _maybe_string(assignment.get("disabled_reason")),
                 "auto_disabled_at": _maybe_string(assignment.get("auto_disabled_at")),
                 "auto_disabled_reason": _maybe_string(assignment.get("auto_disabled_reason")),
+                "system_review": bool(assignment.get("system_review", False)),
+                "review_reason": _maybe_string(assignment.get("review_reason")),
+                "review_status": _maybe_string(assignment.get("review_status")),
+                "reviewed_at": _maybe_string(assignment.get("reviewed_at")),
                 "last_runtime_decision_at": _maybe_string(assignment.get("last_runtime_decision_at")),
                 "re_enabled_at": _maybe_string(assignment.get("re_enabled_at")),
                 "re_enabled_by": _maybe_string(assignment.get("re_enabled_by")),
@@ -3628,6 +3618,10 @@ def _normalize_symbol_assignments(
             "disabled_reason": None,
             "auto_disabled_at": None,
             "auto_disabled_reason": None,
+            "system_review": False,
+            "review_reason": None,
+            "review_status": None,
+            "reviewed_at": None,
             "last_runtime_decision_at": None,
             "re_enabled_at": None,
             "re_enabled_by": None,
@@ -3696,20 +3690,39 @@ def _normalize_assignment_control_state(assignment: dict[str, Any]) -> dict[str,
     disabled_source = (_maybe_string(assignment.get("disabled_source")) or "").lower() or None
     disabled_reason = _maybe_string(assignment.get("disabled_reason"))
     auto_disabled_reason = _maybe_string(assignment.get("auto_disabled_reason"))
+    legacy_auto_reason = auto_disabled_reason or disabled_reason or "auto_disabled"
+    system_review = bool(assignment.get("system_review", False))
+    review_reason = _maybe_string(assignment.get("review_reason"))
+    review_status = _maybe_string(assignment.get("review_status"))
+    reviewed_at = _maybe_string(assignment.get("reviewed_at"))
 
-    if enabled:
+    if manually_disabled or disabled_source == "manual":
+        enabled = False
+        manually_disabled = True
+        auto_disabled = False
+        disabled_source = "manual"
+        disabled_reason = disabled_reason or "manually_disabled"
+        auto_disabled_reason = None
+        system_review = False
+        review_reason = None
+        review_status = None
+    elif auto_disabled or disabled_source == "auto":
+        enabled = True
         manually_disabled = False
         auto_disabled = False
         disabled_source = None
         disabled_reason = None
         auto_disabled_reason = None
-    elif auto_disabled or disabled_source == "auto":
-        enabled = False
+        system_review = True
+        review_reason = review_reason or legacy_auto_reason
+        review_status = review_status or "system_review"
+        reviewed_at = reviewed_at or _maybe_string(assignment.get("auto_disabled_at"))
+    elif enabled:
         manually_disabled = False
-        auto_disabled = True
-        disabled_source = "auto"
-        disabled_reason = disabled_reason or auto_disabled_reason or "auto_disabled"
-        auto_disabled_reason = auto_disabled_reason or disabled_reason
+        auto_disabled = False
+        disabled_source = None
+        disabled_reason = None
+        auto_disabled_reason = None
     else:
         enabled = False
         manually_disabled = True
@@ -3717,6 +3730,9 @@ def _normalize_assignment_control_state(assignment: dict[str, Any]) -> dict[str,
         disabled_source = "manual"
         disabled_reason = disabled_reason or "manually_disabled"
         auto_disabled_reason = None
+        system_review = False
+        review_reason = None
+        review_status = None
 
     return {
         **assignment,
@@ -3726,6 +3742,10 @@ def _normalize_assignment_control_state(assignment: dict[str, Any]) -> dict[str,
         "disabled_source": disabled_source,
         "disabled_reason": disabled_reason,
         "auto_disabled_reason": auto_disabled_reason,
+        "system_review": system_review,
+        "review_reason": review_reason,
+        "review_status": review_status,
+        "reviewed_at": reviewed_at,
         "auto_disable_enabled": bool(assignment.get("auto_disable_enabled", True)),
         "auto_disable_min_trades": _normalize_auto_disable_min_trades(assignment.get("auto_disable_min_trades")),
         "auto_disable_max_drawdown_percent": max(0.0, _maybe_float(assignment.get("auto_disable_max_drawdown_percent")) or 12.0),
@@ -3741,7 +3761,7 @@ def _normalize_assignment_control_state(assignment: dict[str, Any]) -> dict[str,
 
 def _assignment_is_runnable(assignment: dict[str, Any]) -> bool:
     normalized = _normalize_assignment_control_state(assignment)
-    return bool(normalized.get("enabled", True)) and not bool(normalized.get("manually_disabled")) and not bool(normalized.get("auto_disabled"))
+    return bool(normalized.get("enabled", True)) and not bool(normalized.get("manually_disabled"))
 
 
 def _symbol_assignments_to_symbol_states(symbol_assignments: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:

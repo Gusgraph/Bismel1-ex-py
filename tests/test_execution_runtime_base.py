@@ -1966,6 +1966,10 @@ def test_execution_runtime_vwap_loss_closes_position() -> None:
 
     result = service.run_once({"user_id": "user-a", "account_id": 101, "slot": 1})
     assert result.execution_status == "close_submitted"
+    if store.updated_slot_configs:
+        updated_assignment = store.updated_slot_configs[-1]["config_payload"]["symbol_assignments"]["AAPL"]
+        assert updated_assignment["enabled"] is True
+        assert updated_assignment["auto_disabled"] is False
 
 
 def test_execution_runtime_bollinger_reversion_generates_buy() -> None:
@@ -2130,6 +2134,10 @@ def test_execution_runtime_relative_strength_missing_benchmark_skips_cleanly() -
 
     result = service.run_once({"user_id": "user-a", "account_id": 101, "slot": 1})
     assert result.execution_status == "skipped_market_data_unavailable"
+    if store.updated_slot_configs:
+        updated_assignment = store.updated_slot_configs[-1]["config_payload"]["symbol_assignments"]["AAPL"]
+        assert updated_assignment["enabled"] is True
+        assert updated_assignment["auto_disabled"] is False
 
 
 def test_execution_runtime_fetches_buffered_history_for_indicator_strategies() -> None:
@@ -2621,7 +2629,7 @@ def test_execution_runtime_manually_disabled_assignment_skips() -> None:
     } in store.write_calls
 
 
-def test_execution_runtime_auto_disabled_assignment_skips() -> None:
+def test_execution_runtime_legacy_auto_disabled_assignment_reenters_runtime_cycle() -> None:
     store = FakeExecutionRuntimeStore()
     store.runtime_config_payload = {
         "automation_enabled": True,
@@ -2650,13 +2658,14 @@ def test_execution_runtime_auto_disabled_assignment_skips() -> None:
 
     result = service.run_once({"user_id": "user-a", "account_id": 101, "slot": 1})
 
-    assert result.execution_status == "skipped_auto_disabled"
-    assert any(item.symbol == "AAPL" and item.execution_status == "skipped_auto_disabled" for item in store.writes)
-    assert {
-        "symbol": "AAPL",
-        "execution_status": "skipped_auto_disabled",
-        "write_symbol_state": True,
-    } in store.write_calls
+    assert result.execution_status == "buy_submitted"
+    assert any(item.symbol == "AAPL" and item.execution_status == "buy_submitted" for item in store.writes)
+    assert store.updated_slot_configs
+    updated_assignment = store.updated_slot_configs[-1]["config_payload"]["symbol_assignments"]["AAPL"]
+    assert updated_assignment["enabled"] is True
+    assert updated_assignment["auto_disabled"] is False
+    assert updated_assignment["system_review"] is False
+    assert updated_assignment["auto_disable_status"] == "continue_monitoring"
 
 
 def test_execution_runtime_auto_disable_waits_for_effective_sample_floor() -> None:
@@ -2732,7 +2741,7 @@ def test_execution_runtime_auto_disable_waits_for_effective_sample_floor() -> No
     assert updated_assignment["auto_disable_effective_min_trades"] == 5
 
 
-def test_execution_runtime_auto_disable_triggers_after_effective_sample_floor() -> None:
+def test_execution_runtime_auto_disable_thresholds_create_system_review_without_hard_disable() -> None:
     store = FakeExecutionRuntimeStore()
     store.runtime_config_payload = {
         "automation_enabled": True,
@@ -2774,14 +2783,17 @@ def test_execution_runtime_auto_disable_triggers_after_effective_sample_floor() 
 
     result = service.run_once({"user_id": "user-a", "account_id": 101, "slot": 1})
 
-    assert result.execution_status == "skipped_auto_disabled"
+    assert result.execution_status == "skipped_system_review"
     assert result.enforcement_reason == "auto_disabled_win_rate"
     assert store.updated_slot_configs
     updated_assignment = store.updated_slot_configs[-1]["config_payload"]["symbol_assignments"]["AAPL"]
-    assert updated_assignment["enabled"] is False
-    assert updated_assignment["auto_disabled"] is True
-    assert updated_assignment["disabled_source"] == "auto"
-    assert updated_assignment["disabled_reason"] == "auto_disabled_win_rate"
+    assert updated_assignment["enabled"] is True
+    assert updated_assignment["auto_disabled"] is False
+    assert updated_assignment["disabled_source"] is None
+    assert updated_assignment["disabled_reason"] is None
+    assert updated_assignment["system_review"] is True
+    assert updated_assignment["review_reason"] == "auto_disabled_win_rate"
+    assert updated_assignment["review_status"] == "system_review"
     assert updated_assignment["auto_disable_min_trades"] == 5
 
 
