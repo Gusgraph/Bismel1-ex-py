@@ -2945,6 +2945,33 @@ class ExecutionRuntimeService:
                 symbol=symbol,
                 action="evaluate",
             )
+        stale_reason = _execution_market_data_stale_reason(
+            bars=bars,
+            timeframe=timeframe,
+            now=self._now_provider(),
+        )
+        if stale_reason is not None:
+            return self._build_result(
+                runtime_config=runtime_config,
+                run_id=run_id,
+                execution_status="market_data_issue",
+                message="Latest required market bars are missing or stale. No trade decision was made.",
+                account_context=account_context,
+                symbol=symbol,
+                action="evaluate",
+                manually_disabled=bool(assignment.get("manually_disabled")),
+                auto_disabled=bool(assignment.get("auto_disabled")),
+                disabled_source=_maybe_string(assignment.get("disabled_source")),
+                disabled_reason=_maybe_string(assignment.get("disabled_reason")),
+                auto_disabled_at=_maybe_string(assignment.get("auto_disabled_at")),
+                last_runtime_decision_at=self._now_provider().isoformat(),
+                last_processed_bar_at=_maybe_string(getattr(bars[-1], "ends_at", None)) if bars else None,
+                raw_response={
+                    "reason": stale_reason,
+                    "market_data_issue": True,
+                    "close_blocked": True,
+                },
+            )
 
         benchmark_bars: list[Any] | None = None
         if strategy_key == "relative_strength":
@@ -3366,6 +3393,7 @@ class ExecutionRuntimeService:
             "skipped_invalid_config",
             "skipped_strategy_not_implemented",
             "skipped_market_data_unavailable",
+            "market_data_issue",
             "skipped_direction_filter",
             "skipped_no_open_position",
             "no_signal",
@@ -4154,6 +4182,31 @@ def _map_execution_timeframe(timeframe: str) -> str:
     if normalized not in mapping:
         raise ValueError("Execution runtime supports EMA timeframes 15m and 1h only.")
     return mapping[normalized]
+
+
+def _execution_market_data_stale_reason(*, bars: list[Any], timeframe: str, now: datetime) -> str | None:
+    if not bars:
+        return "missing_last_bar"
+
+    latest_bar = bars[-1]
+    latest_at = getattr(latest_bar, "ends_at", None) or getattr(latest_bar, "starts_at", None)
+    if not isinstance(latest_at, datetime):
+        return "missing_last_bar"
+
+    resolved_now = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+    resolved_latest = latest_at if latest_at.tzinfo is not None else latest_at.replace(tzinfo=UTC)
+    if resolved_now.astimezone(UTC) - resolved_latest.astimezone(UTC) > _execution_bar_stale_threshold(timeframe):
+        return "stale_bar"
+
+    return None
+
+
+def _execution_bar_stale_threshold(timeframe: str) -> timedelta:
+    normalized = (timeframe or "").strip().lower()
+    if normalized in {"15min", "15m", "1hour", "1h"}:
+        return timedelta(hours=2, minutes=15)
+
+    return timedelta(hours=2, minutes=15)
 
 
 def _execution_strategy_bar_fetch_limit(*, timeframe: str, required_bar_count: int) -> int:

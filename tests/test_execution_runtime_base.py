@@ -490,7 +490,26 @@ class FakeFirestoreClient:
 
 
 def _make_bars(closes: list[float]) -> list[PriceBar]:
-    base = datetime(2026, 4, 19, 12, 0, tzinfo=UTC)
+    base = datetime.now(tz=UTC) - timedelta(minutes=15 * max(len(closes) - 1, 0))
+    bars: list[PriceBar] = []
+    for index, close in enumerate(closes):
+        stamp = base + timedelta(minutes=15 * index)
+        bars.append(
+            PriceBar(
+                starts_at=stamp,
+                ends_at=stamp,
+                open=close,
+                high=close,
+                low=close,
+                close=close,
+                volume=1000.0,
+            )
+        )
+    return bars
+
+
+def _make_stale_bars(closes: list[float]) -> list[PriceBar]:
+    base = datetime.now(tz=UTC) - timedelta(days=2, minutes=15 * max(len(closes) - 1, 0))
     bars: list[PriceBar] = []
     for index, close in enumerate(closes):
         stamp = base + timedelta(minutes=15 * index)
@@ -509,7 +528,7 @@ def _make_bars(closes: list[float]) -> list[PriceBar]:
 
 
 def _make_ohlcv_bars(rows: list[tuple[float, float, float, float, float | None]]) -> list[PriceBar]:
-    base = datetime(2026, 4, 19, 12, 0, tzinfo=UTC)
+    base = datetime.now(tz=UTC) - timedelta(minutes=15 * max(len(rows) - 1, 0))
     bars: list[PriceBar] = []
     for index, (open_price, high, low, close, volume) in enumerate(rows):
         stamp = base + timedelta(minutes=15 * index)
@@ -1129,6 +1148,77 @@ def test_execution_runtime_stop_loss_enabled_closes_below_threshold() -> None:
     assert symbol_result.enforcement_reason == "stop_loss"
     assert symbol_result.raw_response["exit_reason"] == "stop_loss"
     assert symbol_result.raw_response["stop_loss"]["stop_loss_price"] == 95.0
+
+
+def test_execution_runtime_stop_loss_enabled_blocks_when_latest_bar_is_stale() -> None:
+    store = FakeExecutionRuntimeStore()
+    store.runtime_config_payload = {
+        "enabled": True,
+        "automation_enabled": True,
+        "strategy_key": "ema",
+        "strategy_settings": {
+            "fast_ema_length": 3,
+            "slow_ema_length": 5,
+            "timeframe": "15m",
+            "direction_filter": "both",
+        },
+        "risk_settings": {
+            "position_size_mode": "qty",
+            "default_qty": 1,
+            "stop_loss_enabled": True,
+            "stop_loss_percent": 5,
+        },
+        "selected_symbols": ["AAPL"],
+    }
+    service = ExecutionRuntimeService(
+        settings=get_settings(),
+        runtime_store=store,
+        account_resolver=FakeAccountResolver(),
+        paper_trading=FakePaperTradingAdapterWithEntryPosition(avg_entry_price=100.0),
+        market_data=FakeMarketDataAdapter({"AAPL": _make_stale_bars([94, 94, 94, 94, 94, 94, 94])}),
+    )
+
+    service.run_once({"user_id": "user-a", "account_id": 101, "slot": 1})
+
+    assert not any(item.execution_status == "close_submitted" for item in store.writes)
+    symbol_result = next(item for item in store.writes if item.symbol == "AAPL")
+    assert symbol_result.execution_status == "market_data_issue"
+    assert symbol_result.raw_response["reason"] == "stale_bar"
+    assert symbol_result.raw_response["close_blocked"] is True
+
+
+def test_execution_runtime_strategy_exit_blocks_when_latest_bar_is_stale() -> None:
+    store = FakeExecutionRuntimeStore()
+    store.runtime_config_payload = {
+        "enabled": True,
+        "automation_enabled": True,
+        "strategy_key": "ema",
+        "strategy_settings": {
+            "fast_ema_length": 3,
+            "slow_ema_length": 5,
+            "timeframe": "15m",
+            "direction_filter": "both",
+        },
+        "risk_settings": {
+            "position_size_mode": "qty",
+            "default_qty": 1,
+        },
+        "selected_symbols": ["AAPL"],
+    }
+    service = ExecutionRuntimeService(
+        settings=get_settings(),
+        runtime_store=store,
+        account_resolver=FakeAccountResolver(),
+        paper_trading=FakePaperTradingAdapterWithEntryPosition(avg_entry_price=100.0),
+        market_data=FakeMarketDataAdapter({"AAPL": _make_stale_bars([10, 11, 12, 9, 8, 7, 6])}),
+    )
+
+    service.run_once({"user_id": "user-a", "account_id": 101, "slot": 1})
+
+    assert not any(item.execution_status == "close_submitted" for item in store.writes)
+    symbol_result = next(item for item in store.writes if item.symbol == "AAPL")
+    assert symbol_result.execution_status == "market_data_issue"
+    assert symbol_result.raw_response["reason"] == "stale_bar"
 
 
 def test_execution_runtime_ema_invalid_config_skips_cleanly() -> None:
