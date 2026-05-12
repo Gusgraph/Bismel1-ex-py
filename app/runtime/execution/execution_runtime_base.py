@@ -1423,6 +1423,15 @@ class ExecutionRuntimeService:
             runtime_config=runtime_config,
             symbol=runtime_config.symbol,
         )
+        if action == "close":
+            close_guard = self._validate_execution_close_order(
+                runtime_request=runtime_request,
+                runtime_config=runtime_config,
+                assignment=assignment,
+                client_order_id=client_order_id,
+            )
+            if close_guard is not None:
+                return close_guard
         submission_state = self._paper_trading.get_submission_state(
             symbol=runtime_config.symbol,
             credential_context=account_context,
@@ -1663,6 +1672,62 @@ class ExecutionRuntimeService:
             )
 
         raise ValueError(f"Execution runtime does not support action={action!r}.")
+
+    def _validate_execution_close_order(
+        self,
+        *,
+        runtime_request: ExecutionRuntimeRequest,
+        runtime_config: ExecutionRuntimeConfig,
+        assignment: dict[str, Any],
+        client_order_id: str,
+    ) -> AlpacaPaperExecutionResult | None:
+        payload = runtime_request.payload if isinstance(runtime_request.payload, dict) else {}
+        product = _maybe_string(payload.get("product")) or runtime_config.product_id
+        request_action = _maybe_string(payload.get("request_action")) or runtime_config.action
+        close_reason = _normalize_execution_close_reason(
+            payload.get("close_reason")
+            or payload.get("exit_reason")
+            or _nested_payload_value(payload, "internal_strategy_state", "exit_reason")
+            or _nested_payload_value(payload, "internal_strategy_state", "close_reason")
+        )
+        source_type = _maybe_string(payload.get("source_type")) or _maybe_string(payload.get("runtime_source")) or "execution_runtime"
+
+        block_reason: str | None = None
+        if product != "execution" or request_action != "close" or not client_order_id.startswith("execution-close-"):
+            block_reason = "execution_close_metadata_invalid"
+        elif close_reason is None:
+            block_reason = "execution_unknown_close_reason"
+        elif close_reason == "broker_reconcile":
+            block_reason = "execution_close_metadata_invalid"
+        elif close_reason == "stop_loss" and not _execution_stop_loss_enabled(assignment):
+            block_reason = "execution_stop_loss_disabled"
+        elif close_reason == "take_profit" and not _execution_take_profit_configured(assignment, payload):
+            block_reason = "execution_close_metadata_invalid"
+
+        if block_reason is None:
+            return None
+
+        return AlpacaPaperExecutionResult(
+            action="close",
+            submitted=False,
+            order_status="skipped",
+            order_id=None,
+            client_order_id=client_order_id,
+            side="sell",
+            notional=None,
+            skipped_reason=block_reason,
+            broker_error_code=block_reason,
+            broker_error_message="Execution runtime close blocked before broker submission because close metadata or product rules did not pass.",
+            raw_response={
+                "close_guard": {
+                    "product": product,
+                    "request_action": request_action,
+                    "close_reason": close_reason,
+                    "source_type": source_type,
+                    "blocked_reason": block_reason,
+                },
+            },
+        )
 
     def _resolve_target_order(
         self,
@@ -2980,7 +3045,13 @@ class ExecutionRuntimeService:
             notional=trade_config.notional,
             alpaca_account_id=runtime_request.alpaca_account_id,
             broker_environment=runtime_request.broker_environment,
-            payload=runtime_request.payload,
+            payload=_execution_order_metadata_payload(
+                runtime_request.payload,
+                action=action,
+                close_reason="strategy_exit" if action == "close" else None,
+                source_type="selected_strategy",
+                strategy_key=strategy_key,
+            ),
         )
         try:
             execution_result = self._execute_order(
@@ -3133,7 +3204,13 @@ class ExecutionRuntimeService:
             action="close",
             alpaca_account_id=runtime_request.alpaca_account_id,
             broker_environment=runtime_request.broker_environment,
-            payload=runtime_request.payload,
+            payload=_execution_order_metadata_payload(
+                runtime_request.payload,
+                action="close",
+                close_reason="stop_loss",
+                source_type="optional_stop_loss",
+                strategy_key=str(assignment.get("strategy_key") or runtime_config.strategy_key or "unknown"),
+            ),
         )
         try:
             execution_result = self._execute_order(
@@ -3500,6 +3577,64 @@ def _maybe_string(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _nested_payload_value(payload: dict[str, Any], key: str, nested_key: str) -> Any:
+    nested = payload.get(key)
+    if not isinstance(nested, dict):
+        return None
+    return nested.get(nested_key)
+
+
+def _normalize_execution_close_reason(value: Any) -> str | None:
+    raw = (_maybe_string(value) or "").lower().replace("-", "_").replace(" ", "_")
+    if raw == "":
+        return None
+    if raw in {"take_profit", "tp", "tp_exit", "tp_close"}:
+        return "take_profit"
+    if raw in {"stop_loss", "stop"}:
+        return "stop_loss"
+    if raw in {"strategy_exit", "strategy_close", "signal_exit"}:
+        return "strategy_exit"
+    if raw in {"manual", "manual_close"}:
+        return "manual_close"
+    if raw in {"risk_safety_exit", "risk_exit", "safety_exit", "guardrail"}:
+        return "risk_safety_exit"
+    if raw in {"broker_reconcile", "broker_sync", "reconcile"}:
+        return "broker_reconcile"
+    return None
+
+
+def _execution_stop_loss_enabled(assignment: dict[str, Any]) -> bool:
+    risk_settings = assignment.get("risk_settings") if isinstance(assignment.get("risk_settings"), dict) else {}
+    return bool(risk_settings.get("stop_loss_enabled", False)) and ((_maybe_float(risk_settings.get("stop_loss_percent")) or 0.0) > 0.0)
+
+
+def _execution_take_profit_configured(assignment: dict[str, Any], payload: dict[str, Any]) -> bool:
+    if bool(payload.get("take_profit_configured")) or bool(_nested_payload_value(payload, "safe_flags", "take_profit_exit")):
+        return True
+    risk_settings = assignment.get("risk_settings") if isinstance(assignment.get("risk_settings"), dict) else {}
+    return ((_maybe_float(risk_settings.get("take_profit_percent")) or 0.0) > 0.0)
+
+
+def _execution_order_metadata_payload(
+    payload: dict[str, Any] | None,
+    *,
+    action: str,
+    close_reason: str | None = None,
+    source_type: str,
+    strategy_key: str | None,
+) -> dict[str, Any]:
+    resolved = dict(payload) if isinstance(payload, dict) else {}
+    resolved["product"] = "execution"
+    resolved["request_action"] = action
+    resolved["source_type"] = source_type
+    if strategy_key:
+        resolved["strategy_key"] = strategy_key
+    if action == "close" and close_reason:
+        resolved["close_reason"] = close_reason
+        resolved["exit_reason"] = close_reason
+    return resolved
 
 
 def _normalize_guardrail_limit(value: Any, *, default: float | None = None) -> float | None:

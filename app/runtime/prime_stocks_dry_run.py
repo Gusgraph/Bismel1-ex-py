@@ -1769,6 +1769,18 @@ class PrimeStocksRuntimeService:
                 broker_state=broker_state,
                 additional_notional=result.notional,
             )
+        close_guard = _validate_prime_close_order_metadata(
+            candidate_action=candidate_action,
+            client_order_id=client_order_id,
+        )
+        if close_guard is not None:
+            logger.warning(
+                "Prime Stocks close blocked by final guard symbol=%s candidate_action=%s blocked_reason=%s",
+                runtime_config.symbol,
+                candidate_action,
+                close_guard,
+            )
+            return None, close_guard, close_guard, False, state_retry_count, close_guard, "Prime Stocks close blocked before broker submission by final product close guard.", current_total_exposure_pct
         try:
             logger.info(
                 "Prime Stocks broker submit attempted symbol=%s candidate_action=%s order_type=close_position client_order_id=%s",
@@ -2905,6 +2917,21 @@ def _build_client_order_id(*, run_id: str, candidate_action: str) -> str:
     action_slug = candidate_action.lower().replace("_", "-")
     run_slug = run_id.replace("dryrun-", "").replace("run-", "")
     return f"prime-{action_slug}-{run_slug}"[:47]
+
+
+def _validate_prime_close_order_metadata(*, candidate_action: str, client_order_id: str) -> str | None:
+    close_reason = {
+        "take_profit": "take_profit",
+        "TAKE_PROFIT": "take_profit",
+        "TP": "take_profit",
+        "EXIT_ATR": "atr_exit",
+        "EXIT_REGIME": "regime_exit",
+    }.get(candidate_action, candidate_action.lower())
+    if not client_order_id.startswith("prime-"):
+        return "prime_close_metadata_invalid"
+    if close_reason != "take_profit":
+        return "prime_non_tp_close_blocked"
+    return None
 
 
 def _validate_successful_execution_result(

@@ -2514,7 +2514,17 @@ def test_execution_runtime_manual_buy_and_close_update_performance_trade_state()
         },
     ]
 
-    close_result = service.run_once({"user_id": "user-a", "account_id": 101, "slot": 1, "symbol": "AAPL", "action": "close"})
+    close_result = service.run_once({
+        "user_id": "user-a",
+        "account_id": 101,
+        "slot": 1,
+        "symbol": "AAPL",
+        "action": "close",
+        "product": "execution",
+        "request_action": "close",
+        "close_reason": "manual_close",
+        "source_type": "manual_runtime_test",
+    })
 
     assert close_result.execution_status == "close_submitted"
     trade_payload = next(iter(store.performance_trade_payloads.values()))
@@ -3142,9 +3152,39 @@ def test_execution_runtime_close_still_allowed_when_kill_switch_is_active() -> N
         market_data=FakeMarketDataAdapter({}),
     )
 
-    result = service.run_once({"user_id": "user-a", "account_id": 101, "slot": 1, "symbol": "AAPL", "action": "close"})
+    result = service.run_once({
+        "user_id": "user-a",
+        "account_id": 101,
+        "slot": 1,
+        "symbol": "AAPL",
+        "action": "close",
+        "product": "execution",
+        "request_action": "close",
+        "close_reason": "manual_close",
+        "source_type": "manual_runtime_test",
+    })
 
     assert result.execution_status == "close_submitted"
+
+
+def test_execution_runtime_close_without_structured_reason_is_blocked() -> None:
+    store = FakeExecutionRuntimeStore()
+    store.runtime_config_payload = {
+        "automation_enabled": True,
+        "global_guardrails_enabled": True,
+    }
+    service = ExecutionRuntimeService(
+        settings=get_settings(),
+        runtime_store=store,
+        account_resolver=FakeAccountResolver(),
+        paper_trading=FakePaperTradingAdapterWithPosition(),
+        market_data=FakeMarketDataAdapter({}),
+    )
+
+    result = service.run_once({"user_id": "user-a", "account_id": 101, "slot": 1, "symbol": "AAPL", "action": "close"})
+
+    assert result.execution_status == "skipped"
+    assert result.broker_error_code == "execution_unknown_close_reason"
 
 
 def test_execution_runtime_mixed_enabled_and_disabled_assignments_are_isolated() -> None:

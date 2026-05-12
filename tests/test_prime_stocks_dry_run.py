@@ -33,7 +33,7 @@ from app.products.stocks.bismel1.models import (
     PriceBar,
     PrimeStocksStrategyResult,
 )
-from app.runtime.prime_stocks_dry_run import PrimeStocksRuntimeService
+from app.runtime.prime_stocks_dry_run import PrimeStocksRuntimeService, _validate_prime_close_order_metadata
 from app.services.alpaca_account_resolver import AlpacaAccountResolutionError, ResolvedAlpacaAccountContext
 from app.services.firestore_runtime_store import (
     PrimeStocksFirestoreRuntimeStore,
@@ -84,6 +84,14 @@ def test_dry_run_service_writes_snapshot_signal_state_and_log_records() -> None:
     assert root["execution"]["current"]["execution_decision"] == "dry_run_only"
     assert root["actions"]["latest"]["execution"]["submitted"] is False
     assert len(root["logs"]) == 1
+
+
+def test_prime_final_close_guard_allows_take_profit_only() -> None:
+    assert _validate_prime_close_order_metadata(candidate_action="take_profit", client_order_id="prime-take-profit-run") is None
+    assert _validate_prime_close_order_metadata(candidate_action="EXIT_ATR", client_order_id="prime-exit-atr-run") == "prime_non_tp_close_blocked"
+    assert _validate_prime_close_order_metadata(candidate_action="EXIT_REGIME", client_order_id="prime-exit-regime-run") == "prime_non_tp_close_blocked"
+    assert _validate_prime_close_order_metadata(candidate_action="unknown", client_order_id="prime-unknown-run") == "prime_non_tp_close_blocked"
+    assert _validate_prime_close_order_metadata(candidate_action="take_profit", client_order_id="broker-generated") == "prime_close_metadata_invalid"
 
 
 def test_strategy_reasoning_uses_full_1h_and_1d_context() -> None:
