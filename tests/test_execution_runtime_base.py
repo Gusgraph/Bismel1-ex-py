@@ -342,6 +342,39 @@ class FakePaperTradingAdapterWithEntryPosition(FakePaperTradingAdapter):
         )
 
 
+class FakePaperTradingAdapterWithTrackedEntryPosition(FakePaperTradingAdapterWithEntryPosition):
+    def __init__(self, *, avg_entry_price: float = 100.0, qty: float = 3.0) -> None:
+        super().__init__(avg_entry_price=avg_entry_price, qty=qty)
+        self.close_position_called = False
+        self.submitted_qty_orders: list[dict[str, object]] = []
+
+    def submit_market_order_qty(self, *, symbol: str, side: str, qty: float, client_order_id: str, action: str, credential_context):
+        self.submitted_qty_orders.append({
+            "symbol": symbol,
+            "side": side,
+            "qty": qty,
+            "client_order_id": client_order_id,
+            "action": action,
+        })
+        return super().submit_market_order_qty(
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            client_order_id=client_order_id,
+            action=action,
+            credential_context=credential_context,
+        )
+
+    def close_position_symbol(self, *, symbol: str, action: str, client_order_id: str, credential_context):
+        self.close_position_called = True
+        return super().close_position_symbol(
+            symbol=symbol,
+            action=action,
+            client_order_id=client_order_id,
+            credential_context=credential_context,
+        )
+
+
 class FakePaperTradingAdapterWithFilledHistory(FakePaperTradingAdapter):
     def __init__(self) -> None:
         self.recent_orders: list[dict[str, object]] = []
@@ -357,6 +390,28 @@ class FakePaperTradingAdapterWithFilledHistory(FakePaperTradingAdapter):
 
     def list_recent_orders(self, *, credential_context=None, limit: int = 50):
         return list(self.recent_orders)
+
+    def submit_market_order_qty(self, *, symbol: str, side: str, qty: float, client_order_id: str, action: str, credential_context):
+        if side == "sell":
+            return AlpacaPaperExecutionResult(
+                action=action,
+                submitted=True,
+                order_status="accepted",
+                order_id="order-close",
+                client_order_id=client_order_id,
+                side=side,
+                notional=None,
+                raw_response={"id": "order-close", "status": "accepted"},
+            )
+
+        return super().submit_market_order_qty(
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            client_order_id=client_order_id,
+            action=action,
+            credential_context=credential_context,
+        )
 
 
 class FakePaperTradingAdapterAtMaxPositions(FakePaperTradingAdapter):
@@ -986,14 +1041,17 @@ def test_execution_runtime_ema_cross_down_submits_close() -> None:
         "risk_settings": {
             "position_size_mode": "qty",
             "default_qty": 1,
+            "stop_loss_enabled": True,
+            "stop_loss_percent": 2,
         },
         "selected_symbols": ["AAPL"],
     }
+    paper_trading = FakePaperTradingAdapterWithTrackedEntryPosition(avg_entry_price=100.0, qty=3.0)
     service = ExecutionRuntimeService(
         settings=get_settings(),
         runtime_store=store,
         account_resolver=FakeAccountResolver(),
-        paper_trading=FakePaperTradingAdapterWithPosition(),
+        paper_trading=paper_trading,
         market_data=FakeMarketDataAdapter({"AAPL": _make_bars([8, 9, 10, 11, 12, 11, 9, 7])}),
     )
 
@@ -1008,6 +1066,62 @@ def test_execution_runtime_ema_cross_down_submits_close() -> None:
     assert result.ok is True
     assert result.execution_status == "close_submitted"
     assert any(item.execution_status == "close_submitted" and item.symbol == "AAPL" for item in store.writes)
+    assert paper_trading.close_position_called is False
+    assert paper_trading.submitted_qty_orders[-1]["client_order_id"].startswith("execution-close-")
+    assert paper_trading.submitted_qty_orders[-1]["qty"] == 3.0
+
+
+def test_execution_runtime_strategy_exit_below_entry_is_blocked_when_stop_loss_disabled() -> None:
+    service = ExecutionRuntimeService(
+        settings=get_settings(),
+        runtime_store=FakeExecutionRuntimeStore(),
+        account_resolver=FakeAccountResolver(),
+        paper_trading=FakePaperTradingAdapterWithTrackedEntryPosition(avg_entry_price=100.0, qty=3.0),
+        market_data=FakeMarketDataAdapter({"AAPL": _make_bars([8, 9, 10, 11, 12, 11, 9, 7])}),
+    )
+    runtime_request = ExecutionRuntimeRequest(
+        user_id="user-a",
+        account_id=101,
+        slot=1,
+        symbol="AAPL",
+        action="close",
+        payload={
+            "product": "execution",
+            "request_action": "close",
+            "close_reason": "strategy_exit",
+            "source_type": "selected_strategy",
+        },
+    )
+    runtime_config = ExecutionRuntimeConfig(
+        product_id="execution",
+        enabled=True,
+        execution_mode="strategy_cycle",
+        uid="user-a",
+        account_id=101,
+        slot_number=1,
+        symbol="AAPL",
+        action="close",
+        strategy_settings={"_latest_price": 99.0},
+        risk_settings={"stop_loss_enabled": False, "stop_loss_percent": 0, "take_profit_percent": 4},
+    )
+    submission_state = AlpacaPaperSubmissionState(
+        account=AlpacaPaperAccountState(buying_power=10000.0, open_positions_count=1, equity=10000.0, total_exposure=100.0),
+        asset=AlpacaPaperAssetState(symbol="AAPL", tradable=True, status="active"),
+        position=AlpacaPaperPositionState(symbol="AAPL", qty=3.0, market_value=297.0, avg_entry_price=100.0),
+    )
+
+    result = service._validate_execution_close_order(
+        runtime_request=runtime_request,
+        runtime_config=runtime_config,
+        assignment={"risk_settings": {"stop_loss_enabled": False, "stop_loss_percent": 0}},
+        client_order_id="execution-close-test",
+        submission_state=submission_state,
+    )
+
+    assert result is not None
+    assert result.submitted is False
+    assert result.broker_error_code == "execution_strategy_loss_exit_blocked"
+    assert result.client_order_id == "execution-close-test"
 
 
 def test_execution_runtime_ema_no_cross_writes_no_signal() -> None:
@@ -1325,7 +1439,7 @@ def test_execution_runtime_ema_direction_filter_blocks_disallowed_signal() -> No
         settings=get_settings(),
         runtime_store=store,
         account_resolver=FakeAccountResolver(),
-        paper_trading=FakePaperTradingAdapterWithPosition(),
+        paper_trading=FakePaperTradingAdapterWithEntryPosition(avg_entry_price=1.0),
         market_data=FakeMarketDataAdapter({"AAPL": _make_bars([8, 9, 10, 11, 12, 11, 9, 7])}),
     )
 
@@ -1531,7 +1645,7 @@ def test_execution_runtime_pullback_trend_break_closes_position() -> None:
         settings=get_settings(),
         runtime_store=store,
         account_resolver=FakeAccountResolver(),
-        paper_trading=FakePaperTradingAdapterWithPosition(),
+        paper_trading=FakePaperTradingAdapterWithEntryPosition(avg_entry_price=1.0),
         market_data=FakeMarketDataAdapter({"AAPL": _make_bars([15, 16, 17, 18, 15, 12, 10])}),
     )
 
@@ -1690,7 +1804,7 @@ def test_execution_runtime_breakout_breakdown_closes_position() -> None:
         settings=get_settings(),
         runtime_store=store,
         account_resolver=FakeAccountResolver(),
-        paper_trading=FakePaperTradingAdapterWithPosition(),
+        paper_trading=FakePaperTradingAdapterWithEntryPosition(avg_entry_price=1.0),
         market_data=FakeMarketDataAdapter({"AAPL": _make_bars([10, 10.2, 10.1, 10.25, 10.3, 9.7])}),
     )
 
@@ -1798,7 +1912,7 @@ def test_execution_runtime_rsi_reversion_overbought_closes_position() -> None:
         settings=get_settings(),
         runtime_store=store,
         account_resolver=FakeAccountResolver(),
-        paper_trading=FakePaperTradingAdapterWithPosition(),
+        paper_trading=FakePaperTradingAdapterWithEntryPosition(avg_entry_price=1.0),
         market_data=FakeMarketDataAdapter({"AAPL": _make_bars([10, 10.2, 10.4, 10.1, 10.2, 10.8])}),
     )
 
@@ -1903,7 +2017,7 @@ def test_execution_runtime_momentum_fade_closes_position() -> None:
         settings=get_settings(),
         runtime_store=store,
         account_resolver=FakeAccountResolver(),
-        paper_trading=FakePaperTradingAdapterWithPosition(),
+        paper_trading=FakePaperTradingAdapterWithEntryPosition(avg_entry_price=1.0),
         market_data=FakeMarketDataAdapter({"AAPL": _make_bars([10, 10.5, 11.0, 11.5, 10.6])}),
     )
 
@@ -2043,7 +2157,7 @@ def test_execution_runtime_vwap_loss_closes_position() -> None:
         settings=get_settings(),
         runtime_store=store,
         account_resolver=FakeAccountResolver(),
-        paper_trading=FakePaperTradingAdapterWithPosition(),
+        paper_trading=FakePaperTradingAdapterWithEntryPosition(avg_entry_price=1.0),
         market_data=FakeMarketDataAdapter({
             "AAPL": _make_ohlcv_bars([
                 (10.0, 10.4, 9.9, 10.3, 1800),

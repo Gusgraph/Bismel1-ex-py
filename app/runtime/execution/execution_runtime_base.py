@@ -1423,19 +1423,20 @@ class ExecutionRuntimeService:
             runtime_config=runtime_config,
             symbol=runtime_config.symbol,
         )
+        submission_state = self._paper_trading.get_submission_state(
+            symbol=runtime_config.symbol,
+            credential_context=account_context,
+        )
         if action == "close":
             close_guard = self._validate_execution_close_order(
                 runtime_request=runtime_request,
                 runtime_config=runtime_config,
                 assignment=assignment,
                 client_order_id=client_order_id,
+                submission_state=submission_state,
             )
             if close_guard is not None:
                 return close_guard
-        submission_state = self._paper_trading.get_submission_state(
-            symbol=runtime_config.symbol,
-            credential_context=account_context,
-        )
 
         if action == "buy":
             guardrail_decision = self._enforce_global_buy_guardrails(
@@ -1533,8 +1534,10 @@ class ExecutionRuntimeService:
                     broker_error_code="no_position_to_close",
                     broker_error_message="Execution runtime close skipped because the slot has no open position.",
                 )
-            return self._paper_trading.close_position_symbol(
+            return self._paper_trading.submit_market_order_qty(
                 symbol=runtime_config.symbol,
+                side="sell",
+                qty=position.qty,
                 action=action,
                 client_order_id=client_order_id,
                 credential_context=account_context,
@@ -1680,6 +1683,7 @@ class ExecutionRuntimeService:
         runtime_config: ExecutionRuntimeConfig,
         assignment: dict[str, Any],
         client_order_id: str,
+        submission_state: AlpacaPaperSubmissionState,
     ) -> AlpacaPaperExecutionResult | None:
         payload = runtime_request.payload if isinstance(runtime_request.payload, dict) else {}
         product = _maybe_string(payload.get("product")) or runtime_config.product_id
@@ -1701,6 +1705,12 @@ class ExecutionRuntimeService:
             block_reason = "execution_close_metadata_invalid"
         elif close_reason == "stop_loss" and not _execution_stop_loss_enabled(assignment):
             block_reason = "execution_stop_loss_disabled"
+        elif close_reason == "strategy_exit" and _execution_strategy_exit_would_realize_loss(
+            assignment=assignment,
+            runtime_config=runtime_config,
+            submission_state=submission_state,
+        ):
+            block_reason = "execution_strategy_loss_exit_blocked"
         elif close_reason == "take_profit" and not _execution_take_profit_configured(assignment, payload):
             block_reason = "execution_close_metadata_invalid"
 
@@ -3643,6 +3653,30 @@ def _execution_take_profit_configured(assignment: dict[str, Any], payload: dict[
         return True
     risk_settings = assignment.get("risk_settings") if isinstance(assignment.get("risk_settings"), dict) else {}
     return ((_maybe_float(risk_settings.get("take_profit_percent")) or 0.0) > 0.0)
+
+
+def _execution_strategy_exit_would_realize_loss(
+    *,
+    assignment: dict[str, Any],
+    runtime_config: ExecutionRuntimeConfig,
+    submission_state: AlpacaPaperSubmissionState,
+) -> bool:
+    if _execution_stop_loss_enabled(assignment):
+        return False
+
+    position = submission_state.position
+    if position is None or position.qty <= 0:
+        return False
+
+    entry_price = _maybe_float(getattr(position, "avg_entry_price", None))
+    latest_price = _maybe_float((runtime_config.strategy_settings or {}).get("_latest_price"))
+
+    if entry_price is None or entry_price <= 0:
+        return True
+    if latest_price is None or latest_price <= 0:
+        return True
+
+    return latest_price <= entry_price
 
 
 def _execution_order_metadata_payload(
