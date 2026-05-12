@@ -54,6 +54,12 @@ from app.shared.config import AppConfig
 logger = logging.getLogger(__name__)
 
 ACTIVE_ORDER_STATUSES = {"accepted", "new", "partially_filled", "filled", "submitted"}
+PRIME_DIAGNOSTIC_ATR_REVIEW = "DIAGNOSTIC_ATR_REVIEW"
+PRIME_DIAGNOSTIC_REGIME_REVIEW = "DIAGNOSTIC_REGIME_REVIEW"
+PRIME_DIAGNOSTIC_ACTIONS = {
+    PRIME_DIAGNOSTIC_ATR_REVIEW,
+    PRIME_DIAGNOSTIC_REGIME_REVIEW,
+}
 ADMIN_CRYPTO_MONITOR_UIDS = frozenset({"admin-runtime-monitor-prime", "admin-runtime-monitor-execution"})
 ADMIN_CRYPTO_MONITOR_SYMBOLS = frozenset({"UNI/USD", "LINK/USD"})
 
@@ -1599,10 +1605,9 @@ class PrimeStocksRuntimeService:
             account_context=account_context,
             settings=self._settings,
         )
-        if preview_only and (
-            candidate_action in {"FirstLot", "EXIT_ATR", "EXIT_REGIME"}
-            or candidate_action.startswith("MULTI-")
-        ):
+        if candidate_action in PRIME_DIAGNOSTIC_ACTIONS:
+            return None, "prime_diagnostic_review", _prime_diagnostic_reason(candidate_action) or "prime_review", False, 0, None, None, None
+        if preview_only and (candidate_action == "FirstLot" or candidate_action.startswith("MULTI-")):
             return None, "preview_only", "preview_only", False, 0, None, None, None
         if execution_mode == "dry-run":
             return None, "dry_run_only", "paper_execution_disabled", False, 0, None, None, None
@@ -2575,9 +2580,9 @@ def _has_no_new_closed_bar(
 def _resolve_candidate_action(strategy_result) -> str:
     latest_signal = strategy_result.latest_signal
     if latest_signal.hit_atr_trail:
-        return "EXIT_ATR"
+        return PRIME_DIAGNOSTIC_ATR_REVIEW
     if latest_signal.hit_regime:
-        return "EXIT_REGIME"
+        return PRIME_DIAGNOSTIC_REGIME_REVIEW
     if latest_signal.add_trigger:
         add_tier = 1
         if strategy_result.latest_bar is not None:
@@ -2586,6 +2591,23 @@ def _resolve_candidate_action(strategy_result) -> str:
     if latest_signal.base_entry_trigger:
         return "FirstLot"
     return "HOLD"
+
+
+def _prime_diagnostic_reason(candidate_action: str) -> str | None:
+    if candidate_action in {PRIME_DIAGNOSTIC_ATR_REVIEW, "EXIT_ATR"}:
+        return "atr_review"
+    if candidate_action in {PRIME_DIAGNOSTIC_REGIME_REVIEW, "EXIT_REGIME"}:
+        return "regime_review"
+    return None
+
+
+def _prime_diagnostic_summary(candidate_action: str) -> str | None:
+    reason = _prime_diagnostic_reason(candidate_action)
+    if reason == "atr_review":
+        return "Non-executable review signal: ATR condition observed. Prime closes only by take profit."
+    if reason == "regime_review":
+        return "Non-executable review signal: regime condition observed. Prime closes only by take profit."
+    return None
 
 
 def _resolve_ai_blocked_candidate_action(*, candidate_action: str, ai_decision) -> str | None:
@@ -2648,8 +2670,8 @@ def _build_strategy_reasoning(
         trigger_state = "Buy" if latest_signal.base_entry_trigger else ("Waiting" if latest_signal.base_entry_signal else "No signal")
     elif candidate_action.startswith("MULTI-"):
         trigger_state = "Add" if latest_signal.add_trigger else "Waiting"
-    elif latest_signal.hit_atr_trail or latest_signal.hit_regime:
-        trigger_state = "Exit"
+    elif candidate_action in PRIME_DIAGNOSTIC_ACTIONS or latest_signal.hit_atr_trail or latest_signal.hit_regime:
+        trigger_state = "Review"
     elif candidate_action in {"HOLD", "no_op"}:
         trigger_state = "Hold"
     else:
@@ -2670,8 +2692,10 @@ def _build_strategy_reasoning(
 
     if execution_decision in {"submitted_buy", "submitted_add_buy", "FirstLot"}:
         final_decision = "Buy"
-    elif execution_decision in {"submitted_exit", "EXIT_ATR", "EXIT_REGIME"}:
+    elif execution_decision == "submitted_exit":
         final_decision = "Sell"
+    elif execution_decision == "prime_diagnostic_review" or candidate_action in PRIME_DIAGNOSTIC_ACTIONS:
+        final_decision = "Review"
     elif execution_decision in {"skipped_no_new_bar"}:
         final_decision = "Wait"
     elif execution_decision in {"no_op", "hold", "no_signal"}:
@@ -2685,10 +2709,12 @@ def _build_strategy_reasoning(
         primary_reason = f"AI {ai_decision.Ai_blocked_reason}"
     elif execution_decision == "skipped_no_new_bar":
         primary_reason = "Awaiting latest 15M close."
+    elif candidate_action in PRIME_DIAGNOSTIC_ACTIONS:
+        primary_reason = _prime_diagnostic_summary(candidate_action) or "Non-executable review signal observed. Prime closes only by take profit."
     elif latest_signal.hit_regime:
-        primary_reason = "1D regime exit confirmed."
+        primary_reason = "Non-executable review signal: regime condition observed. Prime closes only by take profit."
     elif latest_signal.hit_atr_trail:
-        primary_reason = "ATR trail exit confirmed."
+        primary_reason = "Non-executable review signal: ATR condition observed. Prime closes only by take profit."
     elif candidate_action == "FirstLot":
         if strategy_mode == "trend" and not trend_ok:
             primary_reason = "Against 1D bias."
@@ -2733,6 +2759,8 @@ def _build_strategy_reasoning(
         "final_decision": final_decision,
         "primary_reason": primary_reason,
         "trigger_active": trigger_active,
+        "diagnostic_reason": _prime_diagnostic_reason(candidate_action),
+        "diagnostic_executable": False if _prime_diagnostic_reason(candidate_action) is not None else None,
     }
 
 
@@ -2842,6 +2870,10 @@ def _build_runtime_message(*, execution_mode: str, execution_decision: str) -> s
         return (
             "Prime Stocks Cloud Run runtime blocked buy-side execution because cached AI safety data is unsafe "
             f"({execution_decision})."
+        )
+    if execution_decision == "prime_diagnostic_review":
+        return (
+            "Prime Stocks runtime recorded a non-executable diagnostic review signal. Prime closes only by take profit."
         )
     if execution_mode == "paper":
         return (
@@ -3302,8 +3334,12 @@ def _normalize_forced_candidate_action(value: str | None) -> str | None:
         return None
     aliases = {
         "FIRSTLOT": "FirstLot",
-        "EXIT_ATR": "EXIT_ATR",
-        "EXIT_REGIME": "EXIT_REGIME",
+        "EXIT_ATR": PRIME_DIAGNOSTIC_ATR_REVIEW,
+        "ATR_REVIEW": PRIME_DIAGNOSTIC_ATR_REVIEW,
+        "DIAGNOSTIC_ATR_REVIEW": PRIME_DIAGNOSTIC_ATR_REVIEW,
+        "EXIT_REGIME": PRIME_DIAGNOSTIC_REGIME_REVIEW,
+        "REGIME_REVIEW": PRIME_DIAGNOSTIC_REGIME_REVIEW,
+        "DIAGNOSTIC_REGIME_REVIEW": PRIME_DIAGNOSTIC_REGIME_REVIEW,
         "HOLD": "HOLD",
     }
     if normalized in aliases:

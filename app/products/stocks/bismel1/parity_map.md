@@ -29,7 +29,7 @@ This file documents the exact source of truth in `reference/pine/Bismel1-Pine-Fi
   - swing mode
   - run on `1H` execution chart with `1D` trend timeframe
   - pullback window `20` bars
-  - exit by ATR trailing stop plus optional regime-fail exit
+  - legacy ATR/regime observations now treated as diagnostic review signals only
   - hidden auto tier threshold `ATR% < 1.2`
   - split pause behavior: regime fail pauses new baskets only, not recovery adds
   - alerts are emitted via `alert()` JSON payloads
@@ -194,13 +194,13 @@ This file documents the exact source of truth in `reference/pine/Bismel1-Pine-Fi
 
 `position_avg_price` is a Python-only runtime mirror used to evaluate add gating without claiming broker/runtime parity.
 
-## Entry, add, exit, and alert naming
+## Entry, add, diagnostic, and alert naming
 
-### Strategy order / close names
+### Strategy order / diagnostic names
 
 - Base entry order name: `FirstLot`
 - Add order names: `MULTI-1`, `MULTI-2`, `MULTI-3`, `MULTI-4`
-- Close comments: `EXIT_REGIME`, `EXIT_ATR`
+- Prime closes only by take profit. ATR/regime observations are diagnostic review states, not executable close comments.
 
 ### Alert id and payload naming
 
@@ -250,7 +250,7 @@ This file documents the exact source of truth in `reference/pine/Bismel1-Pine-Fi
 - The sequential evaluator resets Pine `var` mirrors when flat, updates `posHigh` and `trailStop` only while a mirrored position is open, and advances the minimum position mirror required to preserve trigger edges:
   - base entry opens the mirrored position using close-price notional-to-qty conversion
   - adds update `addCount`, `lastAddPrice`, `dollarsUsed`, `position_size`, and weighted `position_avg_price`
-  - ATR-trail or regime-fail exit resets the mirrored position state back to flat
+- ATR/regime diagnostic observations do not create executable close actions.
 - This is signal/state parity only. The mirrored position exists solely so later bars can evaluate Pine-equivalent gates and edge triggers.
 
 ## This phase proves
@@ -258,14 +258,14 @@ This file documents the exact source of truth in `reference/pine/Bismel1-Pine-Fi
 - New-basket pause and add pause are split exactly as Pine documents: regime fail can pause `pauseNewBasket` while leaving `pauseAdds` clear.
 - Base entry uses Pine naming and edge-trigger behavior: `baseEntryTrigger = baseEntrySignal and not baseEntrySignal[1]`.
 - Add logic uses Pine naming and edge-trigger behavior: `addTrigger = addSignalRaw and not addSignalRaw[1]`, evaluated against the prior bar's raw signal from the sequential state path rather than recomputing the prior bar with current state.
-- ATR-trail exit is evaluated as a parity trigger only: `close <= trailStop` while the mirrored position is open.
-- Regime-fail exit is evaluated as a parity trigger only: `exitOnRegimeFail and regimeFail` while the mirrored position is open.
+- ATR review is evaluated as a diagnostic parity trigger only: `close <= trailStop` while the mirrored position is open.
+- Regime review is evaluated as a diagnostic parity trigger only: `exitOnRegimeFail and regimeFail` while the mirrored position is open.
 - Focused tests now cover:
   - `pauseNewBasket` vs `pauseAdds`
   - base entry edge triggering
   - multi-add raw signal and trigger edges
-  - ATR trail exit trigger
-  - regime-fail exit trigger
+  - ATR diagnostic review trigger
+  - regime diagnostic review trigger
 
 ## Documented ambiguities and non-goals
 

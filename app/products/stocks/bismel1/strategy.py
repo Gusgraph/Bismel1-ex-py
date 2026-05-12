@@ -42,8 +42,8 @@ from app.products.stocks.bismel1.models import (
 
 ENTRY_NAME_FIRST_LOT = "FirstLot"
 ENTRY_NAME_MULTI_PREFIX = "MULTI-"
-EXIT_COMMENT_ATR = "EXIT_ATR"
-EXIT_COMMENT_REGIME = "EXIT_REGIME"
+DIAGNOSTIC_COMMENT_ATR_REVIEW = "DIAGNOSTIC_ATR_REVIEW"
+DIAGNOSTIC_COMMENT_REGIME_REVIEW = "DIAGNOSTIC_REGIME_REVIEW"
 ALERT_ACTION_BUY = "Buy"
 ALERT_ACTION_MULTI = "Multi"
 ALERT_ACTION_SELL = "Sell"
@@ -784,9 +784,9 @@ def _apply_ai_decision(
 
 def _resolve_strategy_status(signal: PineSignalSnapshot) -> tuple[str, str]:
     if signal.hit_atr_trail:
-        return "exit", "Prime Stocks strategy produced an ATR trail exit signal."
+        return "diagnostic_review", "Prime Stocks observed a non-executable ATR review condition."
     if signal.hit_regime:
-        return "exit", "Prime Stocks strategy produced a regime-fail exit signal."
+        return "diagnostic_review", "Prime Stocks observed a non-executable regime review condition."
     if signal.base_entry_trigger:
         return "signal", "Prime Stocks strategy produced a first-entry signal."
     if signal.add_trigger:

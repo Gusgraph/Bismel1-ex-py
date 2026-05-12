@@ -35,6 +35,12 @@ T = TypeVar("T")
 logger = logging.getLogger(__name__)
 
 SUBMITTED_EXECUTION_DECISIONS = frozenset({"submitted_buy", "submitted_exit"})
+PRIME_DIAGNOSTIC_ATR_REVIEW = "DIAGNOSTIC_ATR_REVIEW"
+PRIME_DIAGNOSTIC_REGIME_REVIEW = "DIAGNOSTIC_REGIME_REVIEW"
+PRIME_DIAGNOSTIC_ACTIONS = {
+    PRIME_DIAGNOSTIC_ATR_REVIEW,
+    PRIME_DIAGNOSTIC_REGIME_REVIEW,
+}
 
 
 class PrimeStocksRuntimeStoreError(RuntimeError):
@@ -213,8 +219,8 @@ def _build_strategy_reasoning_payload(
         trigger_state = "Buy" if latest_signal.base_entry_trigger else ("Waiting" if latest_signal.base_entry_signal else "No signal")
     elif candidate_action.startswith("MULTI-"):
         trigger_state = "Add" if latest_signal.add_trigger else "Waiting"
-    elif latest_signal.hit_atr_trail or latest_signal.hit_regime:
-        trigger_state = "Exit"
+    elif candidate_action in PRIME_DIAGNOSTIC_ACTIONS or latest_signal.hit_atr_trail or latest_signal.hit_regime:
+        trigger_state = "Review"
     elif latest_signal.base_entry_signal:
         trigger_state = "Waiting"
     else:
@@ -235,8 +241,10 @@ def _build_strategy_reasoning_payload(
 
     if execution_decision in {"submitted_buy", "submitted_add_buy", "FirstLot"}:
         final_decision = "Buy"
-    elif execution_decision in {"submitted_exit", "EXIT_ATR", "EXIT_REGIME"}:
+    elif execution_decision == "submitted_exit":
         final_decision = "Sell"
+    elif execution_decision == "prime_diagnostic_review" or candidate_action in PRIME_DIAGNOSTIC_ACTIONS:
+        final_decision = "Review"
     elif execution_decision in {"skipped_no_new_bar"}:
         final_decision = "Wait"
     elif execution_decision in {"no_op", "hold", "no_signal"}:
@@ -250,10 +258,12 @@ def _build_strategy_reasoning_payload(
         primary_reason = f"AI {ai_decision.Ai_blocked_reason}"
     elif execution_decision == "skipped_no_new_bar":
         primary_reason = "Awaiting latest 15M close."
+    elif candidate_action in PRIME_DIAGNOSTIC_ACTIONS:
+        primary_reason = _prime_diagnostic_summary(candidate_action) or "Non-executable review signal observed. Prime closes only by take profit."
     elif latest_signal.hit_regime:
-        primary_reason = "1D regime exit confirmed."
+        primary_reason = "Non-executable review signal: regime condition observed. Prime closes only by take profit."
     elif latest_signal.hit_atr_trail:
-        primary_reason = "ATR trail exit confirmed."
+        primary_reason = "Non-executable review signal: ATR condition observed. Prime closes only by take profit."
     elif candidate_action == "FirstLot":
         if strategy_mode == "trend" and not trend_ok:
             primary_reason = "Against 1D bias."
@@ -295,6 +305,8 @@ def _build_strategy_reasoning_payload(
         "final_decision": final_decision,
         "primary_reason": primary_reason,
         "signal_score": latest_signal_score,
+        "diagnostic_reason": _prime_diagnostic_reason(candidate_action),
+        "diagnostic_executable": False if _prime_diagnostic_reason(candidate_action) is not None else None,
     }
 
 
@@ -1047,6 +1059,8 @@ class PrimeStocksFirestoreRuntimeStore:
             "Ai_execution_allowed": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_execution_allowed"],
             "Ai_blocked_reason": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_blocked_reason"],
             "strategy_reasoning": strategy_reasoning,
+            "diagnostic_reason": strategy_reasoning["diagnostic_reason"],
+            "diagnostic_executable": strategy_reasoning["diagnostic_executable"],
             "signal_score": strategy_reasoning["signal_score"],
             "execution_timeframe": strategy_reasoning["execution_timeframe"],
             "trend_timeframe": strategy_reasoning["trend_timeframe"],
@@ -1116,6 +1130,8 @@ class PrimeStocksFirestoreRuntimeStore:
             "Ai_execution_allowed": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_execution_allowed"],
             "Ai_blocked_reason": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_blocked_reason"],
             "strategy_reasoning": strategy_reasoning,
+            "diagnostic_reason": strategy_reasoning["diagnostic_reason"],
+            "diagnostic_executable": strategy_reasoning["diagnostic_executable"],
             "signal_score": strategy_reasoning["signal_score"],
             "state": _serialize_runtime_state(persisted_state),
             "signal": serialized_signal,
@@ -2728,6 +2744,23 @@ def _resolve_exit_reason(*, candidate_action: str, execution_decision: str) -> s
     if candidate_action == "EXIT_ATR":
         return "atr_trail_hit"
     return "manual_exit"
+
+
+def _prime_diagnostic_reason(candidate_action: str) -> str | None:
+    if candidate_action in {PRIME_DIAGNOSTIC_ATR_REVIEW, "EXIT_ATR"}:
+        return "atr_review"
+    if candidate_action in {PRIME_DIAGNOSTIC_REGIME_REVIEW, "EXIT_REGIME"}:
+        return "regime_review"
+    return None
+
+
+def _prime_diagnostic_summary(candidate_action: str) -> str | None:
+    reason = _prime_diagnostic_reason(candidate_action)
+    if reason == "atr_review":
+        return "Non-executable review signal: ATR condition observed. Prime closes only by take profit."
+    if reason == "regime_review":
+        return "Non-executable review signal: regime condition observed. Prime closes only by take profit."
+    return None
 
 
 def _build_notification_payload(

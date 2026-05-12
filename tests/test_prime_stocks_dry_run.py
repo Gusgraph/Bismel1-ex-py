@@ -399,7 +399,7 @@ def test_runtime_service_can_force_candidate_action_for_validation() -> None:
     assert paper_trading.calls[-1]["action"] == "FirstLot"
 
 
-def test_runtime_service_blocks_non_tp_exit_order_when_exit_candidate_is_present() -> None:
+def test_runtime_service_treats_non_tp_exit_signal_as_diagnostic_only() -> None:
     settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
     fake_client = FakeFirestoreClient()
     runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
@@ -415,7 +415,9 @@ def test_runtime_service_blocks_non_tp_exit_order_when_exit_candidate_is_present
 
     result = service.run_once(symbol="AAPL", allow_execution=True)
 
-    assert result.execution_decision == "prime_non_tp_exit_blocked"
+    assert result.execution_decision == "prime_diagnostic_review"
+    assert result.candidate_action == "DIAGNOSTIC_ATR_REVIEW"
+    assert result.skipped_reason == "atr_review"
     assert result.order_submitted is False
     assert paper_trading.calls == []
 
@@ -892,7 +894,7 @@ def test_runtime_service_uses_specific_billing_block_reason_from_laravel_entitle
     assert result.order_submitted is False
 
 
-def test_runtime_service_blocks_exit_without_open_position() -> None:
+def test_runtime_service_records_review_without_open_position_check() -> None:
     settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
     fake_client = FakeFirestoreClient()
     runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
@@ -908,7 +910,8 @@ def test_runtime_service_blocks_exit_without_open_position() -> None:
 
     result = service.run_once(symbol="AAPL", allow_execution=True)
 
-    assert result.execution_decision == "prime_non_tp_exit_blocked"
+    assert result.execution_decision == "prime_diagnostic_review"
+    assert result.candidate_action == "DIAGNOSTIC_ATR_REVIEW"
     assert result.order_submitted is False
     assert paper_trading.calls == []
 
@@ -1069,7 +1072,7 @@ def test_runtime_service_prime_first_lot_ignores_global_kill_switch() -> None:
     assert result.order_submitted is True
 
 
-def test_runtime_service_allows_exit_when_global_kill_switch_is_enabled() -> None:
+def test_runtime_service_records_review_when_global_kill_switch_is_enabled() -> None:
     settings = _settings(
         prime_stocks_dry_run=False,
         prime_stocks_paper_execution_enabled=True,
@@ -1088,7 +1091,8 @@ def test_runtime_service_allows_exit_when_global_kill_switch_is_enabled() -> Non
 
     result = service.run_once(symbol="AAPL", allow_execution=True)
 
-    assert result.execution_decision == "prime_non_tp_exit_blocked"
+    assert result.execution_decision == "prime_diagnostic_review"
+    assert result.candidate_action == "DIAGNOSTIC_REGIME_REVIEW"
     assert result.order_submitted is False
     assert paper_trading.calls == []
 
@@ -2154,7 +2158,8 @@ def test_runtime_service_preserves_runtime_state_when_non_tp_exit_is_blocked() -
     result = service.run_once(symbol="AAPL", allow_execution=True)
 
     state = fake_client.storage["runtime_products"]["prime_stocks"]["state"]["current"]
-    assert result.execution_decision == "prime_non_tp_exit_blocked"
+    assert result.execution_decision == "prime_diagnostic_review"
+    assert result.candidate_action == "DIAGNOSTIC_ATR_REVIEW"
     assert state["position_open"] is True
     assert state["position_size"] == 2.0
     assert state["position_avg_price"] == 101.0
@@ -2372,7 +2377,7 @@ def test_runtime_service_allows_new_entry_when_ai_cache_is_risk_off() -> None:
     assert paper_trading.calls[-1]["action"] == "FirstLot"
 
 
-def test_runtime_service_blocks_non_tp_exit_when_market_ai_cache_is_risk_off() -> None:
+def test_runtime_service_records_atr_review_as_non_executable_diagnostic() -> None:
     settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
     fake_client = FakeFirestoreClient()
     _seed_ai_cache(fake_client, market_regime="risk_off")
@@ -2389,20 +2394,27 @@ def test_runtime_service_blocks_non_tp_exit_when_market_ai_cache_is_risk_off() -
 
     result = service.run_once(symbol="AAPL", allow_execution=True)
 
-    assert result.execution_decision == "prime_non_tp_exit_blocked"
+    assert result.execution_decision == "prime_diagnostic_review"
     assert result.execution_allowed is False
     assert result.order_submitted is False
-    assert result.candidate_action == "EXIT_ATR"
+    assert result.candidate_action == "DIAGNOSTIC_ATR_REVIEW"
+    assert result.skipped_reason == "atr_review"
+    assert result.strategy_reasoning is not None
+    assert result.strategy_reasoning["diagnostic_reason"] == "atr_review"
+    assert result.strategy_reasoning["diagnostic_executable"] is False
+    assert result.strategy_reasoning["final_decision"] == "Review"
     assert result.ai is not None
     assert result.ai["Ai_regime_label"] == "risk_off"
     assert result.ai["Ai_blocked_reason"] is None
     assert paper_trading.calls == []
     root = fake_client.storage["runtime_products"]["prime_stocks"]
-    assert root["execution"]["current"]["execution_decision"] == "prime_non_tp_exit_blocked"
+    assert root["execution"]["current"]["execution_decision"] == "prime_diagnostic_review"
     assert root["execution"]["current"]["execution_allowed"] is False
+    assert root["execution"]["current"]["exit_reason"] is None
+    assert root["signals"]["latest"]["symbol_state"]["strategy_reasoning"]["diagnostic_reason"] == "atr_review"
 
 
-def test_runtime_service_blocks_non_tp_exit_when_symbol_ai_cache_is_unsafe() -> None:
+def test_runtime_service_records_regime_review_as_non_executable_diagnostic() -> None:
     settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
     fake_client = FakeFirestoreClient()
     _seed_ai_cache(fake_client, symbol_safety="unsafe")
@@ -2419,17 +2431,24 @@ def test_runtime_service_blocks_non_tp_exit_when_symbol_ai_cache_is_unsafe() -> 
 
     result = service.run_once(symbol="AAPL", allow_execution=True)
 
-    assert result.execution_decision == "prime_non_tp_exit_blocked"
+    assert result.execution_decision == "prime_diagnostic_review"
     assert result.execution_allowed is False
     assert result.order_submitted is False
-    assert result.candidate_action == "EXIT_REGIME"
+    assert result.candidate_action == "DIAGNOSTIC_REGIME_REVIEW"
+    assert result.skipped_reason == "regime_review"
+    assert result.strategy_reasoning is not None
+    assert result.strategy_reasoning["diagnostic_reason"] == "regime_review"
+    assert result.strategy_reasoning["diagnostic_executable"] is False
+    assert result.strategy_reasoning["final_decision"] == "Review"
     assert result.ai is not None
     assert result.ai["Ai_safety_label"] == "unsafe"
     assert result.ai["Ai_blocked_reason"] == "ai_safety_unsafe"
     assert paper_trading.calls == []
     root = fake_client.storage["runtime_products"]["prime_stocks"]
-    assert root["execution"]["current"]["execution_decision"] == "prime_non_tp_exit_blocked"
+    assert root["execution"]["current"]["execution_decision"] == "prime_diagnostic_review"
     assert root["execution"]["current"]["execution_allowed"] is False
+    assert root["execution"]["current"]["exit_reason"] is None
+    assert root["signals"]["latest"]["symbol_state"]["strategy_reasoning"]["diagnostic_reason"] == "regime_review"
 
 
 def test_runtime_service_allows_when_ai_cache_is_stale() -> None:
@@ -2952,8 +2971,8 @@ def _strategy_result(
 ) -> PrimeStocksStrategyResult:
     base_entry_trigger = candidate_action == "FirstLot"
     add_trigger = candidate_action.startswith("MULTI")
-    hit_atr_trail = candidate_action == "EXIT_ATR"
-    hit_regime = candidate_action == "EXIT_REGIME"
+    hit_atr_trail = candidate_action in {"EXIT_ATR", "DIAGNOSTIC_ATR_REVIEW"}
+    hit_regime = candidate_action in {"EXIT_REGIME", "DIAGNOSTIC_REGIME_REVIEW"}
     if in_position_before is None:
         in_position_before = add_trigger or hit_atr_trail or hit_regime
     state = state_before or BismillahTrobotStocksV1State()
@@ -2994,7 +3013,7 @@ def _strategy_result(
     return PrimeStocksStrategyResult(
         product_key="stocks.bismel1",
         pine_strategy_title="Prime Stocks Bot Trader",
-        status="exit" if hit_atr_trail or hit_regime else "signal" if base_entry_trigger or add_trigger else "no_signal",
+        status="diagnostic_review" if hit_atr_trail or hit_regime else "signal" if base_entry_trigger or add_trigger else "no_signal",
         message="stub strategy result",
         series=evaluation.series,
         latest_signal=signal,
