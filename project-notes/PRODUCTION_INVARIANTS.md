@@ -1,6 +1,6 @@
 # Production Invariants
 
-Last updated: 2026-04-28
+Last updated: 2026-05-12
 
 These rules protect the recovered/stabilized Bismel1 runtime state. Read this before changing account discovery, market-data routing, history fetching, order/position monitoring, or Cloud Run release flow.
 
@@ -61,7 +61,13 @@ These rules protect the recovered/stabilized Bismel1 runtime state. Read this be
 - ORDER/FILL/POSITION/EXIT are not failures unless an actual attempted stage fails.
 - Normal no-trade cycles such as `no_signal`, `no_op`, and `skipped_no_open_position` are not runtime failures.
 
-## 8. Git / Release Rule
+## 8. Laravel UI / Notification Boundary
+- Laravel homepage and admin email notification changes must not alter Python runtime strategy logic.
+- Affiliate request and product purchase admin notifications are web-app operational emails only.
+- Python Cloud Run runtime remains the automated strategy/runtime authority.
+- Runtime code must not emit or depend on Laravel admin notification email side effects.
+
+## 9. Git / Release Rule
 - No recovery from zip/tag may overwrite live changes without:
   - git status check
   - branch check
