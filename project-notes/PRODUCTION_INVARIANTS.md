@@ -1,6 +1,6 @@
 # Production Invariants
 
-Last updated: 2026-05-12
+Last updated: 2026-05-13
 
 These rules protect the recovered/stabilized Bismel1 runtime state. Read this before changing account discovery, market-data routing, history fetching, order/position monitoring, or Cloud Run release flow.
 
@@ -49,6 +49,8 @@ These rules protect the recovered/stabilized Bismel1 runtime state. Read this be
 - Fanout must include only valid, success, or partial-success broker connections.
 - Admin monitor fanout must be scoped to internal monitor UIDs and must not overwrite customer runtime docs.
 - Admin monitor crypto symbols must not appear in customer symbol sets.
+- Python Cloud Run remains the automated strategy/runtime order authority.
+- Laravel is the account/config bridge and reporting app; Laravel automated broker submit must remain disabled unless explicitly approved as emergency rollback.
 
 ## 6. Market Data Safety
 - Stock/equity paths must continue using the stock/equity market-data path.
@@ -60,14 +62,24 @@ These rules protect the recovered/stabilized Bismel1 runtime state. Read this be
 - SIGNAL is pending/neutral for normal no-setup states.
 - ORDER/FILL/POSITION/EXIT are not failures unless an actual attempted stage fails.
 - Normal no-trade cycles such as `no_signal`, `no_op`, and `skipped_no_open_position` are not runtime failures.
+- Execution legacy auto-disabled assignments are normalized into review state and must not be permanently excluded unless user/admin manual disable is explicit.
+- Prime ATR/regime/trailing observations are diagnostic review signals only and must not become executable close requests.
 
-## 8. Laravel UI / Notification Boundary
+## 8. Close-Order Safety
+- Prime executable close reason is take profit only.
+- Prime non-TP close candidates must be blocked before broker submission.
+- Execution stop-loss close requires `stop_loss_enabled=true` and a valid configured percent.
+- Strategy-driven closes require fresh market data or fresh take-profit confirmation.
+- Bismel1-submitted close orders must carry structured metadata and controlled client order IDs.
+- Broker-reconciled sells without local metadata must be treated as broker reconcile, not strategy close.
+
+## 9. Laravel UI / Notification Boundary
 - Laravel homepage and admin email notification changes must not alter Python runtime strategy logic.
 - Affiliate request and product purchase admin notifications are web-app operational emails only.
 - Python Cloud Run runtime remains the automated strategy/runtime authority.
 - Runtime code must not emit or depend on Laravel admin notification email side effects.
 
-## 9. Git / Release Rule
+## 10. Git / Release Rule
 - No recovery from zip/tag may overwrite live changes without:
   - git status check
   - branch check

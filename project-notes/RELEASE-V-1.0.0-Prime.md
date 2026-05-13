@@ -12,7 +12,13 @@ Production Prime Stocks runtime release.
 - removal of generic Execution guardrail leakage from Prime
 - slot-config continuity / migration protections
 - focused Prime scheduler/runtime regression coverage
+- deployed guard blocking legacy/non-TP Prime close paths before broker submission
+- close-order metadata validation for Prime close requests
+- fresh market confirmation policy for take-profit close handling
+- ATR/regime/trailing observations reclassified as diagnostic review signals only
+- Python Cloud Run authority as the automated Prime order submitter while Laravel automated submit remains disabled/report-only
 
 ## Excluded
 - unrelated experimental runtime files
 - `__pycache__` / `*.pyc`
+- Prime stop loss, trailing-stop close, ATR close, regime close, or Laravel automated Prime order submission
