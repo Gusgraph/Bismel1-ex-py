@@ -94,6 +94,81 @@ def test_prime_final_close_guard_allows_take_profit_only() -> None:
     assert _validate_prime_close_order_metadata(candidate_action="take_profit", client_order_id="broker-generated") == "prime_close_metadata_invalid"
 
 
+def test_runtime_service_submits_take_profit_when_fresh_bar_confirms_threshold() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading(
+        submission_state=AlpacaPaperSubmissionState(
+            account=AlpacaPaperAccountState(
+                buying_power=1000.0,
+                open_positions_count=1,
+                equity=10000.0,
+                total_exposure=215.0,
+            ),
+            asset=AlpacaPaperAssetState(symbol="AAPL", tradable=True, status="active"),
+            position=AlpacaPaperPositionState(symbol="AAPL", qty=2.0, market_value=215.0, avg_entry_price=100.0),
+        )
+    )
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("HOLD"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.candidate_action == "take_profit"
+    assert result.execution_decision == "submitted_exit"
+    assert result.order_submitted is True
+    assert result.client_order_id is not None
+    assert result.client_order_id.startswith("prime-tp-")
+    assert paper_trading.calls[-1]["action"] == "take_profit"
+    assert paper_trading.calls[-1]["side"] == "sell"
+    assert paper_trading.calls[-1]["qty"] == 2.0
+    execution = fake_client.storage["runtime_products"]["prime_stocks"]["execution"]["current"]
+    assert execution["exit_reason"] == "take_profit"
+    assert execution["close_reason"] == "take_profit"
+    assert execution["request_action"] == "close"
+    assert execution["market_confirmation"]["market_confirmation_fresh"] is True
+
+
+def test_runtime_service_does_not_submit_take_profit_below_threshold() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading(
+        submission_state=AlpacaPaperSubmissionState(
+            account=AlpacaPaperAccountState(
+                buying_power=1000.0,
+                open_positions_count=1,
+                equity=10000.0,
+                total_exposure=213.0,
+            ),
+            asset=AlpacaPaperAssetState(symbol="AAPL", tradable=True, status="active"),
+            position=AlpacaPaperPositionState(symbol="AAPL", qty=2.0, market_value=213.0, avg_entry_price=106.0),
+        )
+    )
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("HOLD"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.candidate_action == "HOLD"
+    assert result.execution_decision == "no_op"
+    assert result.order_submitted is False
+    assert paper_trading.calls[-1]["action"] == "submission_state"
+
+
 def test_strategy_reasoning_uses_full_1h_and_1d_context() -> None:
     series = PineComputedSeries(
         trend_ok=[False, True],
@@ -674,7 +749,7 @@ def test_runtime_service_skips_noop_when_candidate_action_is_hold() -> None:
     assert result.execution_decision == "no_op"
     assert result.order_submitted is False
     assert result.skipped_reason == "no_action_candidate"
-    assert paper_trading.calls == []
+    assert [call["action"] for call in paper_trading.calls] == ["submission_state"]
 
 
 def test_runtime_service_force_candidate_action_still_respects_ai_context() -> None:
@@ -2841,6 +2916,20 @@ class FakePaperTrading:
             side="buy",
             notional=float(kwargs["notional"]),
             add_tier=kwargs.get("add_tier"),
+        )
+
+    def submit_market_order_qty(self, **kwargs) -> AlpacaPaperExecutionResult:
+        self.calls.append({"action": kwargs["action"], **kwargs})
+        return AlpacaPaperExecutionResult(
+            action=str(kwargs["action"]),
+            submitted=True,
+            order_status="accepted",
+            order_id="order-qty",
+            client_order_id=str(kwargs["client_order_id"]),
+            side=str(kwargs["side"]),
+            notional=None,
+            add_tier=None,
+            raw_response={"client_order_id": str(kwargs["client_order_id"])},
         )
 
     def close_position(self, **kwargs) -> AlpacaPaperExecutionResult:

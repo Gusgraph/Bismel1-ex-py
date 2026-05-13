@@ -77,6 +77,9 @@ class AppConfig:
     prime_stocks_total_entry_exposure_cap_pct: float = 20.0
     prime_stocks_total_add_exposure_cap_pct: float = 70.0
     prime_stocks_global_kill_switch_enabled: bool = False
+    prime_stocks_tp_mode: str = "atr"
+    prime_stocks_tp_atr_mult: float = 2.3
+    prime_stocks_tp_percent: float = 3.1
     prime_stocks_runtime_api_token: str | None = None
     prime_stocks_notifications_enabled: bool = True
     cloud_run_service_name: str | None = None
@@ -177,6 +180,9 @@ def get_settings() -> AppConfig:
             )
         ),
         prime_stocks_global_kill_switch_enabled=_env_flag("PRIME_STOCKS_GLOBAL_KILL_SWITCH_ENABLED", False),
+        prime_stocks_tp_mode=os.getenv("PRIME_STOCKS_TP_MODE", "atr"),
+        prime_stocks_tp_atr_mult=float(os.getenv("PRIME_STOCKS_TP_ATR_MULT", "2.3")),
+        prime_stocks_tp_percent=float(os.getenv("PRIME_STOCKS_TP_PERCENT", "3.1")),
         prime_stocks_runtime_api_token=_env_optional("PRIME_STOCKS_RUNTIME_API_TOKEN"),
         prime_stocks_notifications_enabled=_env_flag("PRIME_STOCKS_NOTIFICATIONS_ENABLED", True),
     )

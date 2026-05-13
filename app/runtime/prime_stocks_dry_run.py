@@ -1388,10 +1388,13 @@ class PrimeStocksRuntimeService:
                 account_context=account_context,
                 candidate_action=candidate_action,
                 latest_signal_time=latest_signal_time,
+                latest_execution_bar=bar_set.execution_bars[-1] if bar_set.execution_bars else None,
                 latest_execution=latest_execution,
                 allow_execution=allow_execution,
                 preview_only=preview_only,
             )
+            if execution_result is not None and execution_result.action == "take_profit":
+                candidate_action = "take_profit"
         except Exception as exc:
             logger.exception(
                 "Prime Stocks runtime failed during candidate execution trigger_type=%s trigger_source=%s run_id=%s",
@@ -1583,6 +1586,7 @@ class PrimeStocksRuntimeService:
         account_context: ResolvedAlpacaAccountContext,
         candidate_action: str,
         latest_signal_time: datetime | None,
+        latest_execution_bar: Any | None,
         latest_execution: PrimeStocksLatestExecutionRecord,
         allow_execution: bool | None,
         preview_only: bool = False,
@@ -1611,8 +1615,6 @@ class PrimeStocksRuntimeService:
             return None, "preview_only", "preview_only", False, 0, None, None, None
         if execution_mode == "dry-run":
             return None, "dry_run_only", "paper_execution_disabled", False, 0, None, None, None
-        if candidate_action not in {"FirstLot", "EXIT_ATR", "EXIT_REGIME"} and not candidate_action.startswith("MULTI-"):
-            return None, "no_op", "no_action_candidate", False, 0, None, None, None
         if candidate_action in {"EXIT_ATR", "EXIT_REGIME"}:
             logger.warning(
                 "Prime Stocks non-TP close blocked before broker submission symbol=%s candidate_action=%s",
@@ -1627,20 +1629,21 @@ class PrimeStocksRuntimeService:
         if execution_mode == "live" and not runtime_config.live_execution_enabled:
             return None, "live_execution_disabled", "live_execution_disabled", False, 0, None, None, None
 
-        execution_key = _build_execution_key(candidate_action, latest_signal_time, symbol=runtime_config.symbol)
-        if latest_execution.execution_key == execution_key and latest_execution.order_status in ACTIVE_ORDER_STATUSES:
-            return None, "skipped_duplicate", "duplicate_candidate_action", False, 0, None, None, None
-        latest_signal_time_value = (
+        pre_broker_execution_key = _build_execution_key(candidate_action, latest_signal_time, symbol=runtime_config.symbol)
+        pre_broker_latest_signal_time_value = (
             latest_signal_time.astimezone(UTC).isoformat()
             if latest_signal_time is not None
             else None
         )
-        if (
-            latest_execution.latest_signal_time == latest_signal_time_value
-            and latest_execution.order_status in ACTIVE_ORDER_STATUSES
-            and latest_execution.candidate_action not in {None, candidate_action}
-        ):
-            return None, "conflicting_same_bar_execution", "conflicting_same_bar_execution", False, 0, None, None, None
+        if candidate_action == "FirstLot" or candidate_action.startswith("MULTI-"):
+            if latest_execution.execution_key == pre_broker_execution_key and latest_execution.order_status in ACTIVE_ORDER_STATUSES:
+                return None, "skipped_duplicate", "duplicate_candidate_action", False, 0, None, None, None
+            if (
+                latest_execution.latest_signal_time == pre_broker_latest_signal_time_value
+                and latest_execution.order_status in ACTIVE_ORDER_STATUSES
+                and latest_execution.candidate_action not in {None, candidate_action}
+            ):
+                return None, "conflicting_same_bar_execution", "conflicting_same_bar_execution", False, 0, None, None, None
 
         try:
             broker_state, state_retry_count = self._call_broker_with_retry(
@@ -1656,24 +1659,54 @@ class PrimeStocksRuntimeService:
             return None, exc.code, exc.code, False, int(getattr(exc, "retry_count", 0)), exc.code, exc.message, None
 
         current_total_exposure_pct = _resolve_total_exposure_pct(broker_state=broker_state)
-
-        duplicate_failure = self._resolve_first_lot_duplicate_failure(
+        tp_candidate = _resolve_prime_take_profit_candidate(
             runtime_config=runtime_config,
+            strategy_result=strategy_result,
+            broker_state=broker_state,
             latest_signal_time=latest_signal_time,
-            latest_execution=latest_execution,
-            account_context=account_context,
+            latest_execution_bar=latest_execution_bar,
         )
-        if duplicate_failure is not None:
-            return (
-                None,
-                duplicate_failure.execution_decision,
-                duplicate_failure.skipped_reason,
-                duplicate_failure.execution_allowed,
-                duplicate_failure.retry_count,
-                duplicate_failure.broker_error_code,
-                duplicate_failure.broker_error_message,
-                current_total_exposure_pct,
+        if tp_candidate is not None:
+            candidate_action = "take_profit"
+            logger.info(
+                "Prime Stocks take-profit candidate confirmed symbol=%s source=%s price=%s threshold=%s",
+                runtime_config.symbol,
+                tp_candidate["market_confirmation_source"],
+                tp_candidate["market_confirmation_price"],
+                tp_candidate["tp_threshold"],
             )
+
+        if candidate_action not in {"FirstLot", "EXIT_ATR", "EXIT_REGIME", "take_profit"} and not candidate_action.startswith("MULTI-"):
+            return None, "no_op", "tp_not_reached" if broker_state.position is not None else "no_action_candidate", False, state_retry_count, None, None, current_total_exposure_pct
+
+        execution_key = _build_execution_key(candidate_action, latest_signal_time, symbol=runtime_config.symbol)
+        if latest_execution.execution_key == execution_key and latest_execution.order_status in ACTIVE_ORDER_STATUSES:
+            return None, "skipped_duplicate", "duplicate_candidate_action", False, state_retry_count, None, None, current_total_exposure_pct
+        if (
+            latest_execution.latest_signal_time == pre_broker_latest_signal_time_value
+            and latest_execution.order_status in ACTIVE_ORDER_STATUSES
+            and latest_execution.candidate_action not in {None, candidate_action}
+        ):
+            return None, "conflicting_same_bar_execution", "conflicting_same_bar_execution", False, state_retry_count, None, None, current_total_exposure_pct
+
+        if candidate_action == "FirstLot":
+            duplicate_failure = self._resolve_first_lot_duplicate_failure(
+                runtime_config=runtime_config,
+                latest_signal_time=latest_signal_time,
+                latest_execution=latest_execution,
+                account_context=account_context,
+            )
+            if duplicate_failure is not None:
+                return (
+                    None,
+                    duplicate_failure.execution_decision,
+                    duplicate_failure.skipped_reason,
+                    duplicate_failure.execution_allowed,
+                    duplicate_failure.retry_count,
+                    duplicate_failure.broker_error_code,
+                    duplicate_failure.broker_error_message,
+                    current_total_exposure_pct,
+                )
 
         guard_failure = self._evaluate_submission_guards(
             runtime_config=runtime_config,
@@ -1786,29 +1819,44 @@ class PrimeStocksRuntimeService:
                 close_guard,
             )
             return None, close_guard, close_guard, False, state_retry_count, close_guard, "Prime Stocks close blocked before broker submission by final product close guard.", current_total_exposure_pct
+        position_qty = _maybe_float(getattr(broker_state.position, "qty", None)) if broker_state.position is not None else None
+        if position_qty is None or position_qty <= 0:
+            return None, "take_profit_position_unavailable", "take_profit_position_unavailable", False, state_retry_count, "take_profit_position_unavailable", "Prime Stocks take-profit close requires a current broker position.", current_total_exposure_pct
         try:
             logger.info(
-                "Prime Stocks broker submit attempted symbol=%s candidate_action=%s order_type=close_position client_order_id=%s",
+                "Prime Stocks broker submit attempted symbol=%s candidate_action=%s order_type=take_profit_market_sell client_order_id=%s",
                 runtime_config.symbol,
                 candidate_action,
                 client_order_id,
             )
             result, submit_retry_count = self._call_broker_with_retry(
-                operation=lambda: self._paper_trading.close_position(
+                operation=lambda: self._paper_trading.submit_market_order_qty(
                     symbol=runtime_config.symbol,
-                    asset_type=runtime_config.asset_type,
-                    product_key=runtime_config.product_key,
+                    side="sell",
+                    qty=position_qty,
                     action=candidate_action,
                     client_order_id=client_order_id,
                     credential_context=account_context,
                 ),
                 can_retry=False,
                 max_retries=0,
-                operation_label="submit exit",
+                operation_label="submit take-profit close",
             )
         except AlpacaPaperTradingError as exc:
             return None, exc.code, exc.code, False, state_retry_count + int(getattr(exc, "retry_count", 0)), exc.code, exc.message, current_total_exposure_pct
         total_retry_count = state_retry_count + submit_retry_count
+        if tp_candidate is not None:
+            raw_response = result.raw_response if isinstance(result.raw_response, dict) else {}
+            result = replace(
+                result,
+                raw_response={
+                    **raw_response,
+                    "request_action": "close",
+                    "close_reason": "take_profit",
+                    "market_confirmation": tp_candidate,
+                    "bismel1_market_confirmation": tp_candidate,
+                },
+            )
         result = replace(result, retry_count=total_retry_count)
         invalid_execution_result = _validate_successful_execution_result(result=result, candidate_action=candidate_action)
         if invalid_execution_result is not None:
@@ -1861,7 +1909,7 @@ class PrimeStocksRuntimeService:
         latest_signal_time: datetime | None,
         run_id: str,
     ) -> None:
-        if candidate_action not in {"EXIT_ATR", "EXIT_REGIME"}:
+        if candidate_action != "take_profit":
             return
 
         if execution_result is None or not execution_result.submitted:
@@ -2079,6 +2127,10 @@ class PrimeStocksRuntimeService:
                 return PrimeStocksExecutionFailure("max_add_count_exceeded", "max_add_count_exceeded")
             if state_before is not None and add_tier != (state_before.add_count + 1):
                 return PrimeStocksExecutionFailure("invalid_add_tier", "invalid_add_tier")
+            return None
+        if candidate_action == "take_profit":
+            if not has_broker_position:
+                return PrimeStocksExecutionFailure("take_profit_requires_open_position", "take_profit_requires_open_position")
             return None
         if candidate_action in {"EXIT_ATR", "EXIT_REGIME"} and not (has_runtime_position or has_broker_position):
             return PrimeStocksExecutionFailure("exit_requires_open_position", "exit_requires_open_position")
@@ -2711,6 +2763,8 @@ def _build_strategy_reasoning(
         primary_reason = "Awaiting latest 15M close."
     elif candidate_action in PRIME_DIAGNOSTIC_ACTIONS:
         primary_reason = _prime_diagnostic_summary(candidate_action) or "Non-executable review signal observed. Prime closes only by take profit."
+    elif candidate_action == "take_profit":
+        primary_reason = "Take-profit close submitted after fresh market confirmation."
     elif latest_signal.hit_regime:
         primary_reason = "Non-executable review signal: regime condition observed. Prime closes only by take profit."
     elif latest_signal.hit_atr_trail:
@@ -2946,9 +3000,126 @@ def _extract_order_time(raw_response: dict[str, Any] | None, key: str) -> str | 
 
 
 def _build_client_order_id(*, run_id: str, candidate_action: str) -> str:
-    action_slug = candidate_action.lower().replace("_", "-")
+    action_slug = "tp" if candidate_action == "take_profit" else candidate_action.lower().replace("_", "-")
     run_slug = run_id.replace("dryrun-", "").replace("run-", "")
     return f"prime-{action_slug}-{run_slug}"[:47]
+
+
+def _resolve_prime_take_profit_candidate(
+    *,
+    runtime_config: PrimeStocksRuntimeConfigRecord,
+    strategy_result: PrimeStocksStrategyResult,
+    broker_state: AlpacaPaperSubmissionState,
+    latest_signal_time: datetime | None,
+    latest_execution_bar: Any | None,
+) -> dict[str, Any] | None:
+    position = broker_state.position
+    if position is None:
+        return None
+    qty = _maybe_float(getattr(position, "qty", None))
+    entry_price = _maybe_float(getattr(position, "avg_entry_price", None))
+    if qty is None or qty <= 0 or entry_price is None or entry_price <= 0:
+        return None
+
+    threshold = _resolve_prime_take_profit_threshold(
+        runtime_config=runtime_config,
+        strategy_result=strategy_result,
+        entry_price=entry_price,
+    )
+    if threshold is None or threshold <= entry_price:
+        return None
+
+    confirmation = _resolve_prime_take_profit_confirmation(
+        latest_execution_bar=latest_execution_bar,
+        latest_signal_time=latest_signal_time,
+        threshold=threshold,
+    )
+    if confirmation is None:
+        return None
+
+    return {
+        "product": "prime_stocks",
+        "request_action": "close",
+        "close_reason": "take_profit",
+        "symbol": runtime_config.symbol.upper(),
+        "qty": qty,
+        "entry_price": entry_price,
+        "tp_mode": runtime_config.tp_mode,
+        "tp_atr_mult": runtime_config.tp_atr_mult,
+        "tp_percent": runtime_config.tp_percent,
+        "tp_threshold": threshold,
+        **confirmation,
+    }
+
+
+def _resolve_prime_take_profit_threshold(
+    *,
+    runtime_config: PrimeStocksRuntimeConfigRecord,
+    strategy_result: PrimeStocksStrategyResult,
+    entry_price: float,
+) -> float | None:
+    mode = (runtime_config.tp_mode or "atr").strip().lower()
+    atr_value = _latest_series_float(strategy_result, "atr_val")
+    if mode == "atr":
+        if atr_value is not None and atr_value > 0 and runtime_config.tp_atr_mult > 0:
+            return entry_price + (atr_value * runtime_config.tp_atr_mult)
+        if runtime_config.tp_percent > 0:
+            return entry_price * (1.0 + (runtime_config.tp_percent / 100.0))
+        return None
+    if mode in {"percent", "pct"}:
+        if runtime_config.tp_percent <= 0:
+            return None
+        return entry_price * (1.0 + (runtime_config.tp_percent / 100.0))
+    if mode in {"off", "none", "disabled"}:
+        return None
+    if atr_value is not None and atr_value > 0 and runtime_config.tp_atr_mult > 0:
+        return entry_price + (atr_value * runtime_config.tp_atr_mult)
+    return entry_price * (1.0 + (runtime_config.tp_percent / 100.0)) if runtime_config.tp_percent > 0 else None
+
+
+def _resolve_prime_take_profit_confirmation(
+    *,
+    latest_execution_bar: Any | None,
+    latest_signal_time: datetime | None,
+    threshold: float,
+) -> dict[str, Any] | None:
+    if latest_execution_bar is None:
+        return None
+    bar_high = _maybe_float(getattr(latest_execution_bar, "high", None))
+    bar_close = _maybe_float(getattr(latest_execution_bar, "close", None))
+    confirmation_price = None
+    confirmation_source = None
+    if bar_high is not None and bar_high >= threshold:
+        confirmation_price = bar_high
+        confirmation_source = "bar_high"
+    elif bar_close is not None and bar_close >= threshold:
+        confirmation_price = bar_close
+        confirmation_source = "bar_close"
+    if confirmation_price is None:
+        return None
+    confirmation_at = latest_signal_time
+    if confirmation_at is None:
+        raw_at = getattr(latest_execution_bar, "ends_at", None) or getattr(latest_execution_bar, "starts_at", None)
+        confirmation_at = raw_at if isinstance(raw_at, datetime) else None
+    return {
+        "market_confirmation_source": confirmation_source,
+        "market_confirmation_price": confirmation_price,
+        "market_confirmation_at": None if confirmation_at is None else confirmation_at.astimezone(UTC).isoformat(),
+        "market_confirmation_fresh": True,
+    }
+
+
+def _latest_series_float(strategy_result: PrimeStocksStrategyResult, name: str) -> float | None:
+    values = getattr(strategy_result.series, name, None)
+    if not isinstance(values, list) or not values:
+        return None
+    index = len(values) - 1
+    latest_bar = getattr(strategy_result, "latest_bar", None)
+    if latest_bar is not None and isinstance(getattr(latest_bar, "bar_index", None), int):
+        index = latest_bar.bar_index
+    if index < 0 or index >= len(values):
+        return None
+    return _maybe_float(values[index])
 
 
 def _validate_prime_close_order_metadata(*, candidate_action: str, client_order_id: str) -> str | None:
@@ -3121,6 +3292,15 @@ def _parse_iso_utc(value: str) -> datetime:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def _maybe_float(value: object) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _parse_add_tier(candidate_action: str) -> int | None:

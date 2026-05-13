@@ -94,6 +94,9 @@ class PrimeStocksRuntimeConfigRecord:
     total_add_exposure_cap_pct: float = 70.0
     global_kill_switch_enabled: bool = False
     account_kill_switch_enabled: bool = False
+    tp_mode: str = "atr"
+    tp_atr_mult: float = 2.3
+    tp_percent: float = 3.1
     selected_symbols: list[str] = field(default_factory=list)
     symbol_states: list[dict[str, Any]] = field(default_factory=list)
     strategy_mode: str = "scalper"
@@ -260,6 +263,8 @@ def _build_strategy_reasoning_payload(
         primary_reason = "Awaiting latest 15M close."
     elif candidate_action in PRIME_DIAGNOSTIC_ACTIONS:
         primary_reason = _prime_diagnostic_summary(candidate_action) or "Non-executable review signal observed. Prime closes only by take profit."
+    elif candidate_action == "take_profit":
+        primary_reason = "Take-profit close submitted after fresh market confirmation."
     elif latest_signal.hit_regime:
         primary_reason = "Non-executable review signal: regime condition observed. Prime closes only by take profit."
     elif latest_signal.hit_atr_trail:
@@ -716,6 +721,9 @@ class PrimeStocksFirestoreRuntimeStore:
             account_kill_switch_enabled=bool(
                 payload.get("account_kill_switch_enabled", default_config.account_kill_switch_enabled)
             ),
+            tp_mode=str(payload.get("tp_mode", default_config.tp_mode)).strip().lower() or default_config.tp_mode,
+            tp_atr_mult=max(0.0, float(payload.get("tp_atr_mult", default_config.tp_atr_mult))),
+            tp_percent=max(0.0, float(payload.get("tp_percent", default_config.tp_percent))),
             selected_symbols=[
                 str(symbol).strip().upper()
                 for symbol in selected_symbols_source
@@ -1318,6 +1326,9 @@ class PrimeStocksFirestoreRuntimeStore:
             "broker_error_code": serialized_execution["broker_error_code"],
             "broker_error_message": serialized_execution["broker_error_message"],
             "exit_reason": serialized_execution["exit_reason"],
+            "request_action": serialized_execution["request_action"],
+            "close_reason": serialized_execution["close_reason"],
+            "market_confirmation": serialized_execution["market_confirmation"],
             "last_error_code": failure_markers["last_error_code"],
             "last_error_message": failure_markers["last_error_message"],
             "recovery_action": failure_markers["recovery_action"],
@@ -2310,6 +2321,9 @@ def build_default_runtime_config(settings: AppConfig) -> PrimeStocksRuntimeConfi
         total_entry_exposure_cap_pct=settings.prime_stocks_total_entry_exposure_cap_pct,
         total_add_exposure_cap_pct=settings.prime_stocks_total_add_exposure_cap_pct,
         global_kill_switch_enabled=settings.prime_stocks_global_kill_switch_enabled,
+        tp_mode=settings.prime_stocks_tp_mode,
+        tp_atr_mult=settings.prime_stocks_tp_atr_mult,
+        tp_percent=settings.prime_stocks_tp_percent,
         account_kill_switch_enabled=False,
         selected_symbols=[],
         symbol_states=[],
@@ -2647,6 +2661,8 @@ def _serialize_execution(
     )
     if ai_decision is not None and ai_decision.Ai_blocked_reason is not None and blocked_reason is None:
         blocked_reason = ai_decision.Ai_blocked_reason
+    raw_response = execution_result.raw_response if execution_result is not None and isinstance(execution_result.raw_response, dict) else {}
+    market_confirmation = raw_response.get("market_confirmation") or raw_response.get("bismel1_market_confirmation")
     return {
         "execution_key": execution_key,
         "execution_mode": execution_mode,
@@ -2666,6 +2682,9 @@ def _serialize_execution(
         "broker_error_code": execution_result.broker_error_code if execution_result is not None else broker_error_code,
         "broker_error_message": execution_result.broker_error_message if execution_result is not None else broker_error_message,
         "exit_reason": _resolve_exit_reason(candidate_action=candidate_action, execution_decision=execution_decision),
+        "request_action": "close" if execution_decision == "submitted_exit" else "open" if execution_decision == "submitted_buy" else None,
+        "close_reason": "take_profit" if candidate_action == "take_profit" and execution_decision == "submitted_exit" else None,
+        "market_confirmation": market_confirmation if isinstance(market_confirmation, dict) else None,
     }
 
 
@@ -2739,6 +2758,8 @@ def _serialize_ai_cache_record(record: AiCacheRecord) -> dict[str, Any]:
 def _resolve_exit_reason(*, candidate_action: str, execution_decision: str) -> str | None:
     if execution_decision != "submitted_exit":
         return None
+    if candidate_action == "take_profit":
+        return "take_profit"
     if candidate_action == "EXIT_REGIME":
         return "d1_structure_confirmed"
     if candidate_action == "EXIT_ATR":
