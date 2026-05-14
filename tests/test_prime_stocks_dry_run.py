@@ -2007,6 +2007,93 @@ def test_runtime_service_routes_live_account_credentials_into_market_data_and_ex
     assert result.execution_allowed is True
 
 
+def test_runtime_service_uses_live_broker_environment_without_extra_live_execution_flag() -> None:
+    settings = _settings(
+        prime_stocks_dry_run=False,
+        prime_stocks_paper_execution_enabled=False,
+        prime_stocks_live_execution_enabled=False,
+    )
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=FakeFirestoreClient())
+    paper_trading = FakePaperTrading()
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(context=_account_context(environment="live", trade_enabled=True)),
+        strategy_runner=lambda **_: _strategy_result("FirstLot"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.mode == "live"
+    assert result.execution_decision == "submitted_buy"
+    assert result.order_submitted is True
+    assert paper_trading.calls[0]["credential_context"].environment == "live"
+
+
+def test_runtime_service_blocks_live_broker_when_entitlement_live_is_not_available() -> None:
+    settings = _settings(
+        prime_stocks_dry_run=False,
+        prime_stocks_paper_execution_enabled=True,
+        prime_stocks_live_execution_enabled=True,
+    )
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=FakeFirestoreClient())
+    paper_trading = FakePaperTrading()
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(
+            context=_account_context(
+                environment="live",
+                trade_enabled=True,
+                entitlement={
+                    "product_key": "stocks.bismel1",
+                    "enabled": True,
+                    "runtime_allowed": True,
+                    "paper_available": True,
+                    "live_available": False,
+                },
+            )
+        ),
+        strategy_runner=lambda **_: _strategy_result("FirstLot"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.mode == "dry-run"
+    assert result.execution_decision == "entitlement_live_unavailable"
+    assert result.order_submitted is False
+    assert paper_trading.calls == []
+
+
+def test_runtime_service_uses_paper_broker_environment_without_extra_paper_execution_flag() -> None:
+    settings = _settings(
+        prime_stocks_dry_run=False,
+        prime_stocks_paper_execution_enabled=False,
+        prime_stocks_live_execution_enabled=False,
+    )
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=FakeFirestoreClient())
+    paper_trading = FakePaperTrading()
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(context=_account_context(environment="paper", trade_enabled=True)),
+        strategy_runner=lambda **_: _strategy_result("FirstLot"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.mode == "paper"
+    assert result.execution_decision == "submitted_buy"
+    assert result.order_submitted is True
+    assert paper_trading.calls[0]["credential_context"].environment == "paper"
+
+
 def test_runtime_service_allows_request_level_account_selector_overrides() -> None:
     settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
     fake_client = FakeFirestoreClient()

@@ -1626,9 +1626,6 @@ class PrimeStocksRuntimeService:
             return None, "credential_trade_access_missing", "credential_trade_access_missing", False, 0, None, None, None
         if not account_context.environment.strip():
             return None, "account_environment_missing", "account_environment_missing", False, 0, None, None, None
-        if execution_mode == "live" and not runtime_config.live_execution_enabled:
-            return None, "live_execution_disabled", "live_execution_disabled", False, 0, None, None, None
-
         pre_broker_execution_key = _build_execution_key(candidate_action, latest_signal_time, symbol=runtime_config.symbol)
         pre_broker_latest_signal_time_value = (
             latest_signal_time.astimezone(UTC).isoformat()
@@ -2825,16 +2822,24 @@ def _resolve_mode(
     account_context: ResolvedAlpacaAccountContext,
     settings: AppConfig,
 ) -> str:
-    if allow_execution is False:
+    if allow_execution is not True:
         return "dry-run"
+
+    entitlement = account_context.entitlement if account_context.entitlement else runtime_config.entitlement
+    if not entitlement or not bool(entitlement.get("runtime_allowed", False)):
+        return "dry-run"
+
     if account_context.environment == "live":
-        if runtime_config.live_execution_enabled and allow_execution is True:
+        if entitlement.get("live_available") is True:
             return "live"
         return "dry-run"
-    if allow_execution is True and runtime_config.paper_execution_enabled:
+
+    if entitlement.get("paper_available") is False:
+        return "dry-run"
+
+    if account_context.environment == "paper":
         return "paper"
-    if runtime_config.paper_execution_enabled and not runtime_config.dry_run:
-        return "paper"
+
     return "dry-run"
 
 
