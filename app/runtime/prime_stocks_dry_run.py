@@ -20,6 +20,7 @@ from uuid import uuid4
 from app.brokers.alpaca_market_data import AlpacaMarketDataAdapter
 from app.brokers.alpaca_paper_trading import (
     AlpacaPaperExecutionResult,
+    AlpacaPaperPositionState,
     AlpacaPaperSubmissionState,
     AlpacaPaperTradingAdapter,
     AlpacaPaperTradingError,
@@ -1507,6 +1508,8 @@ class PrimeStocksRuntimeService:
             )
             if execution_result is not None and execution_result.action == "take_profit":
                 candidate_action = "take_profit"
+            elif skipped_reason == "tp_high_touched_not_executable":
+                candidate_action = "HOLD"
         except Exception as exc:
             logger.exception(
                 "Prime Stocks runtime failed during candidate execution trigger_type=%s trigger_source=%s run_id=%s",
@@ -1836,6 +1839,7 @@ class PrimeStocksRuntimeService:
             latest_signal_time=latest_signal_time,
             latest_execution_bar=latest_execution_bar,
         )
+        take_profit_skip_reason = "tp_not_reached" if broker_state.position is not None else "no_action_candidate"
         if tp_candidate is not None:
             candidate_action = "take_profit"
             logger.info(
@@ -1845,9 +1849,21 @@ class PrimeStocksRuntimeService:
                 tp_candidate["market_confirmation_price"],
                 tp_candidate["tp_threshold"],
             )
+        elif broker_state.position is not None and _prime_take_profit_high_touched_without_executable_confirmation(
+            runtime_config=runtime_config,
+            strategy_result=strategy_result,
+            latest_execution_bar=latest_execution_bar,
+            position=broker_state.position,
+        ):
+            candidate_action = "HOLD"
+            take_profit_skip_reason = "tp_high_touched_not_executable"
+            logger.info(
+                "Prime Stocks take-profit high touched but executable confirmation missing symbol=%s",
+                runtime_config.symbol,
+            )
 
         if candidate_action not in {"FirstLot", "EXIT_ATR", "EXIT_REGIME", "take_profit"} and not candidate_action.startswith("MULTI-"):
-            return None, "no_op", "tp_not_reached" if broker_state.position is not None else "no_action_candidate", False, state_retry_count, None, None, current_total_exposure_pct
+            return None, "no_op", take_profit_skip_reason, False, state_retry_count, None, None, current_total_exposure_pct
 
         execution_key = _build_execution_key(candidate_action, latest_signal_time, symbol=runtime_config.symbol)
         if latest_execution.execution_key == execution_key and latest_execution.order_status in ACTIVE_ORDER_STATUSES:
@@ -3270,14 +3286,10 @@ def _resolve_prime_take_profit_confirmation(
 ) -> dict[str, Any] | None:
     if latest_execution_bar is None:
         return None
-    bar_high = _maybe_float(getattr(latest_execution_bar, "high", None))
     bar_close = _maybe_float(getattr(latest_execution_bar, "close", None))
     confirmation_price = None
     confirmation_source = None
-    if bar_high is not None and bar_high >= threshold:
-        confirmation_price = bar_high
-        confirmation_source = "bar_high"
-    elif bar_close is not None and bar_close >= threshold:
+    if bar_close is not None and bar_close >= threshold:
         confirmation_price = bar_close
         confirmation_source = "bar_close"
     if confirmation_price is None:
@@ -3292,6 +3304,30 @@ def _resolve_prime_take_profit_confirmation(
         "market_confirmation_at": None if confirmation_at is None else confirmation_at.astimezone(UTC).isoformat(),
         "market_confirmation_fresh": True,
     }
+
+
+def _prime_take_profit_high_touched_without_executable_confirmation(
+    *,
+    runtime_config: PrimeStocksRuntimeConfigRecord,
+    strategy_result: PrimeStocksStrategyResult,
+    latest_execution_bar: Any | None,
+    position: AlpacaPaperPositionState,
+) -> bool:
+    if latest_execution_bar is None:
+        return False
+    entry_price = _maybe_float(getattr(position, "avg_entry_price", None))
+    if entry_price is None or entry_price <= 0:
+        return False
+    threshold = _resolve_prime_take_profit_threshold(
+        runtime_config=runtime_config,
+        strategy_result=strategy_result,
+        entry_price=entry_price,
+    )
+    if threshold is None or threshold <= entry_price:
+        return False
+    bar_high = _maybe_float(getattr(latest_execution_bar, "high", None))
+    bar_close = _maybe_float(getattr(latest_execution_bar, "close", None))
+    return bool(bar_high is not None and bar_high >= threshold and (bar_close is None or bar_close < threshold))
 
 
 def _latest_series_float(strategy_result: PrimeStocksStrategyResult, name: str) -> float | None:

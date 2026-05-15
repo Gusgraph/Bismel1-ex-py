@@ -129,7 +129,7 @@ def test_runtime_service_submits_residual_cleanup_after_bismel1_full_close() -> 
         runtime_store=runtime_store,
         paper_trading=paper_trading,
         account_resolver=FakeAccountResolver(),
-        strategy_runner=lambda **_: _strategy_result("HOLD"),
+        strategy_runner=lambda **_: _strategy_result("FirstLot"),
     )
 
     result = service.run_once(symbol="NBIS", allow_execution=True)
@@ -251,6 +251,44 @@ def test_runtime_service_submits_take_profit_when_fresh_bar_confirms_threshold()
     assert execution["close_reason"] == "take_profit"
     assert execution["request_action"] == "close"
     assert execution["market_confirmation"]["market_confirmation_fresh"] is True
+    assert execution["market_confirmation"]["market_confirmation_source"] == "bar_close"
+
+
+def test_runtime_service_does_not_submit_take_profit_from_bar_high_only() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading(
+        submission_state=AlpacaPaperSubmissionState(
+            account=AlpacaPaperAccountState(
+                buying_power=1000.0,
+                open_positions_count=1,
+                equity=10000.0,
+                total_exposure=101.0,
+            ),
+            asset=AlpacaPaperAssetState(symbol="AAPL", tradable=True, status="active"),
+            position=AlpacaPaperPositionState(symbol="AAPL", qty=1.0, market_value=101.0, avg_entry_price=100.0),
+        )
+    )
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketDataWithBars(
+            execution_bars=_bars_with_latest_price(high=108.0, close=101.0),
+            trend_bars=_bars(),
+        ),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("FirstLot"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.candidate_action == "HOLD"
+    assert result.execution_decision == "no_op"
+    assert result.skipped_reason == "tp_high_touched_not_executable"
+    assert result.order_submitted is False
+    assert not any(call["action"] == "take_profit" for call in paper_trading.calls)
 
 
 def test_runtime_service_does_not_submit_take_profit_below_threshold() -> None:
@@ -3020,6 +3058,43 @@ class FakeMarketData:
         )
 
 
+class FakeMarketDataWithBars(FakeMarketData):
+    def __init__(self, *, execution_bars: list[PriceBar], trend_bars: list[PriceBar]) -> None:
+        super().__init__()
+        self.execution_bars = execution_bars
+        self.trend_bars = trend_bars
+
+    def fetch_prime_stocks_bars(
+        self,
+        *,
+        symbol: str,
+        asset_type: str,
+        product_key: str,
+        execution_timeframe: str | None = None,
+        trend_timeframe: str | None = None,
+        execution_limit: int | None = None,
+        trend_limit: int | None = None,
+        credential_context: ResolvedAlpacaAccountContext | None = None,
+    ) -> PrimeStocksBarSet:
+        self.calls.append(
+            {
+                "symbol": symbol,
+                "asset_type": asset_type,
+                "product_key": product_key,
+                "execution_timeframe": execution_timeframe,
+                "trend_timeframe": trend_timeframe,
+                "execution_limit": execution_limit,
+                "trend_limit": trend_limit,
+                "credential_context": credential_context,
+            }
+        )
+        return PrimeStocksBarSet(
+            symbol=symbol,
+            execution_bars=self.execution_bars,
+            trend_bars=self.trend_bars,
+        )
+
+
 class FailingMarketData:
     def fetch_prime_stocks_bars(self, **kwargs) -> PrimeStocksBarSet:
         del kwargs
@@ -3253,6 +3328,21 @@ def _bars(*, age_hours: int = 11) -> list[PriceBar]:
         )
         for index, close in enumerate(closes)
     ]
+
+
+def _bars_with_latest_price(*, high: float, close: float) -> list[PriceBar]:
+    bars = _bars()
+    latest = bars[-1]
+    bars[-1] = PriceBar(
+        starts_at=latest.starts_at,
+        ends_at=latest.ends_at,
+        open=close,
+        high=high,
+        low=min(close, high) - 1.0,
+        close=close,
+        volume=latest.volume,
+    )
+    return bars
 
 
 def _strategy_result(
