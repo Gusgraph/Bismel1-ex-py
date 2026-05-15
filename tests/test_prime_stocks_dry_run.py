@@ -33,7 +33,7 @@ from app.products.stocks.bismel1.models import (
     PriceBar,
     PrimeStocksStrategyResult,
 )
-from app.runtime.prime_stocks_dry_run import PrimeStocksRuntimeService, _validate_prime_close_order_metadata
+from app.runtime.prime_stocks_dry_run import PrimeStocksRuntimeService, _position_has_broker_quantity, _position_is_residual, _position_is_strategy_managed_open, _validate_prime_close_order_metadata
 from app.services.alpaca_account_resolver import AlpacaAccountResolutionError, ResolvedAlpacaAccountContext
 from app.services.firestore_runtime_store import (
     PrimeStocksFirestoreRuntimeStore,
@@ -92,6 +92,123 @@ def test_prime_final_close_guard_allows_take_profit_only() -> None:
     assert _validate_prime_close_order_metadata(candidate_action="EXIT_REGIME", client_order_id="prime-exit-regime-run") == "prime_non_tp_close_blocked"
     assert _validate_prime_close_order_metadata(candidate_action="unknown", client_order_id="prime-unknown-run") == "prime_non_tp_close_blocked"
     assert _validate_prime_close_order_metadata(candidate_action="take_profit", client_order_id="broker-generated") == "prime_close_metadata_invalid"
+
+
+def test_prime_runtime_treats_fractional_residual_as_broker_open_but_not_strategy_managed() -> None:
+    position = AlpacaPaperPositionState(symbol="NBIS", qty=0.000000004, market_value=0.000001, avg_entry_price=187.70)
+
+    assert _position_has_broker_quantity(position) is True
+    assert _position_is_residual(position) is True
+    assert _position_is_strategy_managed_open(position) is False
+
+
+def test_runtime_service_submits_residual_cleanup_after_bismel1_full_close() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading(
+        submission_state=AlpacaPaperSubmissionState(
+            account=AlpacaPaperAccountState(buying_power=1000.0, open_positions_count=1, equity=10000.0, total_exposure=0.000001),
+            asset=AlpacaPaperAssetState(symbol="NBIS", tradable=True, status="active"),
+            position=AlpacaPaperPositionState(symbol="NBIS", qty=0.000000004, market_value=0.000001, avg_entry_price=187.70),
+        ),
+        recent_orders=[
+            {
+                "symbol": "NBIS",
+                "side": "sell",
+                "status": "filled",
+                "client_order_id": "prime-tp-existing",
+                "close_scope": "full_position",
+                "submitted_at": "2026-05-15T14:00:00Z",
+            }
+        ],
+    )
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("HOLD"),
+    )
+
+    result = service.run_once(symbol="NBIS", allow_execution=True)
+
+    assert result.execution_decision == "submitted_residual_cleanup"
+    assert result.order_submitted is True
+    assert result.client_order_id is not None
+    assert result.client_order_id.startswith("prime-cleanup-")
+    cleanup_call = paper_trading.calls[-1]
+    assert cleanup_call["action"] == "fractional_residual_cleanup"
+    assert cleanup_call["side"] == "sell"
+    assert cleanup_call["qty"] == 0.000000004
+    execution = fake_client.storage["runtime_products"]["prime_stocks"]["execution"]["current"]
+    assert execution["close_reason"] == "fractional_residual_cleanup"
+    assert execution["close_scope"] == "residual_cleanup"
+    assert execution["requested_close_qty"] == "0.000000004"
+
+
+def test_runtime_service_skips_residual_cleanup_without_bismel1_close_history() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading(
+        submission_state=AlpacaPaperSubmissionState(
+            account=AlpacaPaperAccountState(buying_power=1000.0, open_positions_count=1, equity=10000.0, total_exposure=0.000001),
+            asset=AlpacaPaperAssetState(symbol="NBIS", tradable=True, status="active"),
+            position=AlpacaPaperPositionState(symbol="NBIS", qty=0.000000004, market_value=0.000001, avg_entry_price=187.70),
+        )
+    )
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("HOLD"),
+    )
+
+    result = service.run_once(symbol="NBIS", allow_execution=True)
+
+    assert result.execution_decision == "residual_cleanup_not_eligible"
+    assert result.order_submitted is False
+    assert not any(call["action"] == "fractional_residual_cleanup" for call in paper_trading.calls)
+
+
+def test_runtime_service_skips_residual_cleanup_when_cleanup_pending() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading(
+        submission_state=AlpacaPaperSubmissionState(
+            account=AlpacaPaperAccountState(buying_power=1000.0, open_positions_count=1, equity=10000.0, total_exposure=0.000001),
+            asset=AlpacaPaperAssetState(symbol="NBIS", tradable=True, status="active"),
+            position=AlpacaPaperPositionState(symbol="NBIS", qty=0.000000004, market_value=0.000001, avg_entry_price=187.70),
+        ),
+        recent_orders=[
+            {
+                "symbol": "NBIS",
+                "side": "sell",
+                "status": "accepted",
+                "client_order_id": "prime-cleanup-existing",
+                "submitted_at": "2026-05-15T14:00:00Z",
+            }
+        ],
+    )
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("HOLD"),
+    )
+
+    result = service.run_once(symbol="NBIS", allow_execution=True)
+
+    assert result.execution_decision == "skipped_residual_cleanup_pending"
+    assert result.order_submitted is False
+    assert not any(call["action"] == "fractional_residual_cleanup" for call in paper_trading.calls)
 
 
 def test_runtime_service_submits_take_profit_when_fresh_bar_confirms_threshold() -> None:

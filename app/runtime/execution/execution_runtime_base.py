@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 import logging
 from typing import Any, Callable, Protocol, TypeVar
@@ -53,10 +53,134 @@ ADMIN_CRYPTO_MONITOR_UIDS = frozenset({"admin-runtime-monitor-prime", "admin-run
 ADMIN_CRYPTO_MONITOR_SYMBOLS = frozenset({"UNI/USD", "LINK/USD"})
 AUTO_DISABLE_MIN_TRADES_FLOOR = 5
 RECENT_BUY_DUPLICATE_GUARD_MINUTES = 45
+POSITION_RESIDUAL_QTY_THRESHOLD = 0.000001
+POSITION_RESIDUAL_MARKET_VALUE_THRESHOLD = 0.01
+RESIDUAL_CLEANUP_ACTIVE_STATUSES = frozenset({"accepted", "new", "partially_filled", "submitted", "pending_new"})
+RESIDUAL_CLEANUP_MAX_ATTEMPTS = 3
+RESIDUAL_CLEANUP_COOLDOWN_MINUTES = 15
 
 
 class ExecutionRuntimeStoreError(RuntimeError):
     """Raised when Firestore-backed execution runtime reads or writes fail."""
+
+
+def _position_has_broker_quantity(position: Any | None) -> bool:
+    qty = _maybe_float(getattr(position, "qty", None)) if position is not None else None
+    return qty is not None and qty > 0
+
+
+def _position_is_residual(position: Any | None) -> bool:
+    if position is None:
+        return False
+    qty = _maybe_float(getattr(position, "qty", None))
+    if qty is None or qty <= 0:
+        return False
+    if abs(qty) <= POSITION_RESIDUAL_QTY_THRESHOLD:
+        return True
+    market_value = _maybe_float(getattr(position, "market_value", None))
+    return market_value is not None and abs(market_value) <= POSITION_RESIDUAL_MARKET_VALUE_THRESHOLD
+
+
+def _position_is_strategy_managed_open(position: Any | None) -> bool:
+    return _position_has_broker_quantity(position) and not _position_is_residual(position)
+
+
+def _effective_open_positions_count(submission_state: AlpacaPaperSubmissionState) -> int:
+    count = submission_state.account.open_positions_count
+    if count is None:
+        return 0
+    if _position_is_residual(submission_state.position):
+        return max(0, int(count) - 1)
+    return int(count)
+
+
+def _normalized_order_symbol(order: dict[str, Any]) -> str:
+    return str(order.get("symbol") or "").strip().upper()
+
+
+def _normalized_order_side(order: dict[str, Any]) -> str:
+    return str(order.get("side") or "").strip().lower()
+
+
+def _normalized_order_status(order: dict[str, Any]) -> str:
+    return str(order.get("status") or "").strip().lower()
+
+
+def _normalized_order_client_id(order: dict[str, Any]) -> str:
+    return str(order.get("client_order_id") or "").strip()
+
+
+def _format_qty(value: float) -> str:
+    return format(float(value), ".9f").rstrip("0").rstrip(".")
+
+
+def _parse_order_time(order: dict[str, Any]) -> datetime | None:
+    for key in ("submitted_at", "created_at", "updated_at", "filled_at"):
+        value = order.get(key)
+        if not isinstance(value, str) or value.strip() == "":
+            continue
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+        except ValueError:
+            continue
+    return None
+
+
+def _residual_cleanup_attempt_count(*, recent_orders: list[dict[str, Any]], symbol: str, prefix: str) -> int:
+    symbol = symbol.strip().upper()
+    return sum(
+        1
+        for order in recent_orders
+        if _normalized_order_symbol(order) == symbol
+        and _normalized_order_side(order) == "sell"
+        and _normalized_order_client_id(order).startswith(prefix)
+    )
+
+
+def _has_recent_residual_cleanup_attempt(*, recent_orders: list[dict[str, Any]], symbol: str, prefix: str, now: datetime) -> bool:
+    symbol = symbol.strip().upper()
+    cooldown_started_after = now.astimezone(UTC) - timedelta(minutes=RESIDUAL_CLEANUP_COOLDOWN_MINUTES)
+    for order in recent_orders:
+        if (
+            _normalized_order_symbol(order) != symbol
+            or _normalized_order_side(order) != "sell"
+            or not _normalized_order_client_id(order).startswith(prefix)
+        ):
+            continue
+        order_time = _parse_order_time(order)
+        if order_time is not None and order_time >= cooldown_started_after:
+            return True
+    return False
+
+
+def _has_pending_residual_cleanup_order(*, recent_orders: list[dict[str, Any]], symbol: str, prefix: str) -> bool:
+    symbol = symbol.strip().upper()
+    for order in recent_orders:
+        client_order_id = _normalized_order_client_id(order)
+        if (
+            _normalized_order_symbol(order) == symbol
+            and _normalized_order_side(order) == "sell"
+            and client_order_id.startswith(prefix)
+            and _normalized_order_status(order) in RESIDUAL_CLEANUP_ACTIVE_STATUSES
+        ):
+            return True
+    return False
+
+
+def _has_recent_bismel1_full_close(*, recent_orders: list[dict[str, Any]], symbol: str, prefixes: tuple[str, ...]) -> bool:
+    symbol = symbol.strip().upper()
+    close_reasons = {"take_profit", "strategy_exit", "stop_loss", "manual_close", "fractional_residual_cleanup"}
+    for order in recent_orders:
+        client_order_id = _normalized_order_client_id(order)
+        if _normalized_order_symbol(order) != symbol or _normalized_order_side(order) != "sell":
+            continue
+        if not any(client_order_id.startswith(prefix) for prefix in prefixes):
+            continue
+        close_scope = str(order.get("close_scope") or order.get("request_action") or "").strip().lower()
+        close_reason = str(order.get("close_reason") or order.get("exit_reason") or "").strip().lower()
+        if close_scope == "full_position" or close_reason in close_reasons or client_order_id:
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -1482,7 +1606,7 @@ class ExecutionRuntimeService:
 
         if action == "sell":
             position = submission_state.position
-            if position is None or position.qty <= 0:
+            if not _position_has_broker_quantity(position):
                 return AlpacaPaperExecutionResult(
                     action=action,
                     submitted=False,
@@ -1521,7 +1645,7 @@ class ExecutionRuntimeService:
 
         if action == "close":
             position = submission_state.position
-            if position is None or position.qty <= 0:
+            if not _position_has_broker_quantity(position):
                 return AlpacaPaperExecutionResult(
                     action=action,
                     submitted=False,
@@ -1778,7 +1902,7 @@ class ExecutionRuntimeService:
             return None
 
         position = submission_state.position
-        if position is not None and position.qty > 0:
+        if _position_is_strategy_managed_open(position):
             return AlpacaPaperExecutionResult(
                 action=runtime_config.action,
                 submitted=False,
@@ -1805,7 +1929,7 @@ class ExecutionRuntimeService:
             return duplicate_order_decision
 
         max_positions = _maybe_int(risk_settings.get("max_positions"))
-        open_positions_count = submission_state.account.open_positions_count
+        open_positions_count = _effective_open_positions_count(submission_state)
         if max_positions is not None and max_positions > 0 and open_positions_count >= max_positions:
             return AlpacaPaperExecutionResult(
                 action=runtime_config.action,
@@ -2030,7 +2154,8 @@ class ExecutionRuntimeService:
             )
 
         max_open_positions_total = runtime_config.max_open_positions_total
-        if max_open_positions_total is not None and max_open_positions_total > 0 and submission_state.account.open_positions_count >= max_open_positions_total:
+        open_positions_count = _effective_open_positions_count(submission_state)
+        if max_open_positions_total is not None and max_open_positions_total > 0 and open_positions_count >= max_open_positions_total:
             return AlpacaPaperExecutionResult(
                 action=runtime_config.action,
                 submitted=False,
@@ -2046,7 +2171,7 @@ class ExecutionRuntimeService:
                     "guardrail_status": "blocked",
                     "guardrail_reason": "open_positions",
                     "guardrail_metric_snapshot": snapshot,
-                    "open_positions_count": submission_state.account.open_positions_count,
+                    "open_positions_count": open_positions_count,
                     "last_guardrail_check_at": self._now_provider().isoformat(),
                 },
             )
@@ -2127,7 +2252,7 @@ class ExecutionRuntimeService:
         if (
             max_open_positions_total is not None
             and max_open_positions_total > 0
-            and submission_state.account.open_positions_count >= max_open_positions_total
+            and _effective_open_positions_count(submission_state) >= max_open_positions_total
         ):
             return self._build_result(
                 runtime_config=runtime_config,
@@ -2139,7 +2264,7 @@ class ExecutionRuntimeService:
                 action="evaluate",
                 guardrail_status="blocked",
                 guardrail_reason="open_positions",
-                open_positions_count=submission_state.account.open_positions_count,
+                open_positions_count=_effective_open_positions_count(submission_state),
                 guardrail_metric_snapshot=metric_snapshot,
                 last_guardrail_check_at=check_at,
             )
@@ -2900,6 +3025,160 @@ class ExecutionRuntimeService:
                 raw_response={"strategy_key": strategy_key},
             )
         try:
+            residual_state = self._paper_trading.get_submission_state(
+                symbol=symbol,
+                credential_context=account_context,
+            )
+        except AlpacaPaperTradingError as exc:
+            return self._build_result(
+                runtime_config=runtime_config,
+                run_id=run_id,
+                execution_status="skipped_broker_state_unavailable",
+                message=_normalize_execution_error_message(exc.message),
+                account_context=account_context,
+                symbol=symbol,
+                action="evaluate",
+                broker_error_code=exc.code,
+                broker_error_message=_normalize_execution_error_message(exc.message),
+                raw_response=exc.raw_response,
+            )
+        if _position_is_residual(residual_state.position):
+            try:
+                recent_orders = self._paper_trading.list_recent_orders(credential_context=account_context)
+            except Exception as exc:
+                return self._build_result(
+                    runtime_config=runtime_config,
+                    run_id=run_id,
+                    execution_status="residual_cleanup_history_unavailable",
+                    message=f"Execution residual cleanup skipped for {symbol} because recent order history was unavailable: {exc}",
+                    account_context=account_context,
+                    symbol=symbol,
+                    action="evaluate",
+                    raw_response={"broker_residual_open": True, "cleanup_required": True},
+                )
+            if _has_pending_residual_cleanup_order(recent_orders=recent_orders, symbol=symbol, prefix="execution-cleanup-"):
+                return self._build_result(
+                    runtime_config=runtime_config,
+                    run_id=run_id,
+                    execution_status="skipped_residual_cleanup_pending",
+                    message=f"Execution residual cleanup skipped for {symbol} because a cleanup order is already pending.",
+                    account_context=account_context,
+                    symbol=symbol,
+                    action="evaluate",
+                    raw_response={"broker_residual_open": True, "cleanup_required": True, "residual_cleanup_pending": True},
+                )
+            if _residual_cleanup_attempt_count(recent_orders=recent_orders, symbol=symbol, prefix="execution-cleanup-") >= RESIDUAL_CLEANUP_MAX_ATTEMPTS:
+                return self._build_result(
+                    runtime_config=runtime_config,
+                    run_id=run_id,
+                    execution_status="residual_cleanup_attempt_limit",
+                    message=f"Execution residual cleanup skipped for {symbol} because the cleanup attempt limit was reached.",
+                    account_context=account_context,
+                    symbol=symbol,
+                    action="evaluate",
+                    raw_response={"broker_residual_open": True, "cleanup_required": True, "cleanup_attempt_limit": True},
+                )
+            if _has_recent_residual_cleanup_attempt(recent_orders=recent_orders, symbol=symbol, prefix="execution-cleanup-", now=self._now_provider()):
+                return self._build_result(
+                    runtime_config=runtime_config,
+                    run_id=run_id,
+                    execution_status="residual_cleanup_cooldown",
+                    message=f"Execution residual cleanup skipped for {symbol} because a cleanup attempt was made recently.",
+                    account_context=account_context,
+                    symbol=symbol,
+                    action="evaluate",
+                    raw_response={"broker_residual_open": True, "cleanup_required": True, "cleanup_cooldown": True},
+                )
+            if not _has_recent_bismel1_full_close(recent_orders=recent_orders, symbol=symbol, prefixes=("execution-close-", "execution-cleanup-", "bismel1-close-")):
+                return self._build_result(
+                    runtime_config=runtime_config,
+                    run_id=run_id,
+                    execution_status="residual_cleanup_not_eligible",
+                    message=f"Execution residual cleanup skipped for {symbol} because no recent Bismel1 full close history was found.",
+                    account_context=account_context,
+                    symbol=symbol,
+                    action="evaluate",
+                    raw_response={"broker_residual_open": True, "cleanup_required": True, "reason": "missing_bismel1_close_history"},
+                )
+            if not bool(getattr(residual_state.asset, "tradable", False)):
+                return self._build_result(
+                    runtime_config=runtime_config,
+                    run_id=run_id,
+                    execution_status="residual_cleanup_not_tradable",
+                    message=f"Execution residual cleanup skipped for {symbol} because the symbol is not tradable.",
+                    account_context=account_context,
+                    symbol=symbol,
+                    action="evaluate",
+                    raw_response={"broker_residual_open": True, "cleanup_required": True},
+                )
+            position_qty = _maybe_float(getattr(residual_state.position, "qty", None))
+            if position_qty is None or position_qty <= 0:
+                return self._build_result(
+                    runtime_config=runtime_config,
+                    run_id=run_id,
+                    execution_status="residual_cleanup_position_unavailable",
+                    message=f"Execution residual cleanup skipped for {symbol} because the broker residual quantity was unavailable.",
+                    account_context=account_context,
+                    symbol=symbol,
+                    action="evaluate",
+                )
+            client_order_id = f"execution-cleanup-{uuid4().hex[:15]}"
+            try:
+                execution_result = self._paper_trading.submit_market_order_qty(
+                    symbol=symbol,
+                    side="sell",
+                    qty=position_qty,
+                    client_order_id=client_order_id,
+                    action="fractional_residual_cleanup",
+                    credential_context=account_context,
+                )
+            except AlpacaPaperTradingError as exc:
+                return self._build_result(
+                    runtime_config=runtime_config,
+                    run_id=run_id,
+                    execution_status="failed",
+                    message=_normalize_execution_error_message(exc.message),
+                    account_context=account_context,
+                    symbol=symbol,
+                    action="close",
+                    broker_error_code=exc.code,
+                    broker_error_message=_normalize_execution_error_message(exc.message),
+                    raw_response=exc.raw_response,
+                )
+            raw_response = execution_result.raw_response if isinstance(execution_result.raw_response, dict) else {}
+            raw_response = {
+                **raw_response,
+                "product": "execution",
+                "request_action": "close",
+                "close_reason": "fractional_residual_cleanup",
+                "exit_reason": "fractional_residual_cleanup",
+                "close_scope": "residual_cleanup",
+                "broker_position_qty_source": "broker_current_position",
+                "requested_close_qty": _format_qty(position_qty),
+                "source": "runtime_reconciliation",
+                "broker_residual_open": True,
+                "below_residual_threshold": True,
+                "strategy_manage": False,
+                "cleanup_required": True,
+            }
+            execution_result = replace(execution_result, raw_response=raw_response)
+            return self._build_result(
+                runtime_config=runtime_config,
+                run_id=run_id,
+                execution_status="submitted_residual_cleanup",
+                message=f"Execution residual cleanup submitted for {symbol}.",
+                account_context=account_context,
+                symbol=symbol,
+                action="close",
+                order_id=execution_result.order_id,
+                client_order_id=execution_result.client_order_id,
+                side=execution_result.side,
+                qty=position_qty,
+                broker_error_code=execution_result.broker_error_code,
+                broker_error_message=execution_result.broker_error_message,
+                raw_response=raw_response,
+            )
+        try:
             if strategy_key == "breakout":
                 strategy_config = BreakoutStrategyConfig.from_payload(assignment.get("strategy_settings"))
             elif strategy_key == "vwap":
@@ -3215,7 +3494,7 @@ class ExecutionRuntimeService:
             )
 
         position = submission_state.position
-        if position is None or position.qty <= 0:
+        if not _position_is_strategy_managed_open(position):
             return None
 
         entry_price = _maybe_float(getattr(position, "avg_entry_price", None))
@@ -3665,7 +3944,7 @@ def _execution_strategy_exit_would_realize_loss(
         return False
 
     position = submission_state.position
-    if position is None or position.qty <= 0:
+    if not _position_is_strategy_managed_open(position):
         return False
 
     entry_price = _maybe_float(getattr(position, "avg_entry_price", None))
@@ -3696,6 +3975,8 @@ def _execution_order_metadata_payload(
     if action == "close" and close_reason:
         resolved["close_reason"] = close_reason
         resolved["exit_reason"] = close_reason
+        resolved["close_scope"] = "full_position"
+        resolved["broker_position_qty_source"] = "broker_current_position"
     return resolved
 
 

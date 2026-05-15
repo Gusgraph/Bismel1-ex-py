@@ -19,7 +19,11 @@ from app.runtime.execution.execution_runtime_base import (
     ExecutionRuntimeResult,
     ExecutionRuntimeService,
     ExecutionRuntimeStore,
+    _effective_open_positions_count,
     _normalize_symbol_assignments,
+    _position_has_broker_quantity,
+    _position_is_residual,
+    _position_is_strategy_managed_open,
 )
 from app.services.alpaca_account_resolver import ResolvedAlpacaAccountContext, RuntimeAccountTarget
 from app.shared.config import get_settings
@@ -67,6 +71,118 @@ class ExecutionFakeFirestoreClient:
 
     def collection(self, name: str):
         return FakeCollectionReference(self.storage, [name])
+
+
+def test_execution_runtime_treats_fractional_residual_as_broker_open_but_not_strategy_managed() -> None:
+    submission_state = AlpacaPaperSubmissionState(
+        account=AlpacaPaperAccountState(buying_power=10000.0, open_positions_count=1, equity=10000.0, total_exposure=0.000001),
+        asset=AlpacaPaperAssetState(symbol="AAPL", tradable=True),
+        position=AlpacaPaperPositionState(symbol="AAPL", qty=0.000000004, market_value=0.000001, avg_entry_price=292.79),
+    )
+
+    assert _position_has_broker_quantity(submission_state.position) is True
+    assert _position_is_residual(submission_state.position) is True
+    assert _position_is_strategy_managed_open(submission_state.position) is False
+    assert _effective_open_positions_count(submission_state) == 0
+
+
+def test_execution_runtime_submits_residual_cleanup_after_bismel1_full_close() -> None:
+    store = FakeExecutionRuntimeStore()
+    store.runtime_config_payload = {
+        "enabled": True,
+        "automation_enabled": True,
+        "strategy_key": "ema",
+        "selected_symbols": ["AAPL"],
+    }
+    paper_trading = FakePaperTradingAdapterWithResidualPosition(
+        recent_orders=[
+            {
+                "symbol": "AAPL",
+                "side": "sell",
+                "status": "filled",
+                "client_order_id": "execution-close-existing",
+                "close_scope": "full_position",
+                "submitted_at": "2026-05-15T14:00:00Z",
+            }
+        ]
+    )
+    service = ExecutionRuntimeService(
+        settings=get_settings(),
+        runtime_store=store,
+        account_resolver=FakeAccountResolver(),
+        paper_trading=paper_trading,
+        market_data=FakeMarketDataAdapter({"AAPL": _make_bars([100, 101, 102, 103, 104, 105, 106])}),
+    )
+
+    service.run_once({"user_id": "user-a", "account_id": 101, "slot": 1})
+
+    symbol_result = next(item for item in store.writes if item.symbol == "AAPL")
+    assert symbol_result.execution_status == "submitted_residual_cleanup"
+    assert paper_trading.submitted_qty_orders[-1]["action"] == "fractional_residual_cleanup"
+    assert paper_trading.submitted_qty_orders[-1]["side"] == "sell"
+    assert paper_trading.submitted_qty_orders[-1]["qty"] == 0.000000004
+    assert paper_trading.submitted_qty_orders[-1]["client_order_id"].startswith("execution-cleanup-")
+    assert symbol_result.raw_response["close_reason"] == "fractional_residual_cleanup"
+    assert symbol_result.raw_response["close_scope"] == "residual_cleanup"
+    assert symbol_result.raw_response["requested_close_qty"] == "0.000000004"
+
+
+def test_execution_runtime_skips_residual_cleanup_without_bismel1_close_history() -> None:
+    store = FakeExecutionRuntimeStore()
+    store.runtime_config_payload = {
+        "enabled": True,
+        "automation_enabled": True,
+        "strategy_key": "ema",
+        "selected_symbols": ["AAPL"],
+    }
+    paper_trading = FakePaperTradingAdapterWithResidualPosition()
+    service = ExecutionRuntimeService(
+        settings=get_settings(),
+        runtime_store=store,
+        account_resolver=FakeAccountResolver(),
+        paper_trading=paper_trading,
+        market_data=FakeMarketDataAdapter({"AAPL": _make_bars([100, 101, 102, 103, 104, 105, 106])}),
+    )
+
+    service.run_once({"user_id": "user-a", "account_id": 101, "slot": 1})
+
+    symbol_result = next(item for item in store.writes if item.symbol == "AAPL")
+    assert symbol_result.execution_status == "residual_cleanup_not_eligible"
+    assert paper_trading.submitted_qty_orders == []
+
+
+def test_execution_runtime_skips_residual_cleanup_when_cleanup_pending() -> None:
+    store = FakeExecutionRuntimeStore()
+    store.runtime_config_payload = {
+        "enabled": True,
+        "automation_enabled": True,
+        "strategy_key": "ema",
+        "selected_symbols": ["AAPL"],
+    }
+    paper_trading = FakePaperTradingAdapterWithResidualPosition(
+        recent_orders=[
+            {
+                "symbol": "AAPL",
+                "side": "sell",
+                "status": "accepted",
+                "client_order_id": "execution-cleanup-existing",
+                "submitted_at": "2026-05-15T14:00:00Z",
+            }
+        ]
+    )
+    service = ExecutionRuntimeService(
+        settings=get_settings(),
+        runtime_store=store,
+        account_resolver=FakeAccountResolver(),
+        paper_trading=paper_trading,
+        market_data=FakeMarketDataAdapter({"AAPL": _make_bars([100, 101, 102, 103, 104, 105, 106])}),
+    )
+
+    service.run_once({"user_id": "user-a", "account_id": 101, "slot": 1})
+
+    symbol_result = next(item for item in store.writes if item.symbol == "AAPL")
+    assert symbol_result.execution_status == "skipped_residual_cleanup_pending"
+    assert paper_trading.submitted_qty_orders == []
 
 
 def _resolve_payload(storage: dict, path: list[str]):
@@ -373,6 +489,22 @@ class FakePaperTradingAdapterWithTrackedEntryPosition(FakePaperTradingAdapterWit
             client_order_id=client_order_id,
             credential_context=credential_context,
         )
+
+
+class FakePaperTradingAdapterWithResidualPosition(FakePaperTradingAdapterWithTrackedEntryPosition):
+    def __init__(self, *, recent_orders: list[dict[str, object]] | None = None) -> None:
+        super().__init__(avg_entry_price=292.79, qty=0.000000004)
+        self.recent_orders = recent_orders or []
+
+    def get_submission_state(self, *, symbol: str, credential_context):
+        return AlpacaPaperSubmissionState(
+            account=AlpacaPaperAccountState(buying_power=10000.0, open_positions_count=1, equity=10000.0, total_exposure=0.000001),
+            asset=AlpacaPaperAssetState(symbol=symbol, tradable=True, status="active"),
+            position=AlpacaPaperPositionState(symbol=symbol, qty=0.000000004, market_value=0.000001, avg_entry_price=self.avg_entry_price),
+        )
+
+    def list_recent_orders(self, *, credential_context=None, limit: int = 50):
+        return list(self.recent_orders)
 
 
 class FakePaperTradingAdapterWithFilledHistory(FakePaperTradingAdapter):

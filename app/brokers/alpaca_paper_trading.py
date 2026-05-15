@@ -544,7 +544,7 @@ def _maybe_float(value: object) -> float | None:
 
 
 def _format_qty(value: float) -> str:
-    return format(float(value), ".8f").rstrip("0").rstrip(".")
+    return format(float(value), ".9f").rstrip("0").rstrip(".")
 
 
 def _sum_position_market_value(payload: dict[str, object] | list[object]) -> float | None:

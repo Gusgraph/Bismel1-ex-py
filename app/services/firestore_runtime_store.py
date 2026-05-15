@@ -1328,6 +1328,13 @@ class PrimeStocksFirestoreRuntimeStore:
             "exit_reason": serialized_execution["exit_reason"],
             "request_action": serialized_execution["request_action"],
             "close_reason": serialized_execution["close_reason"],
+            "close_scope": serialized_execution["close_scope"],
+            "broker_position_qty_source": serialized_execution["broker_position_qty_source"],
+            "requested_close_qty": serialized_execution["requested_close_qty"],
+            "broker_residual_open": serialized_execution["broker_residual_open"],
+            "below_residual_threshold": serialized_execution["below_residual_threshold"],
+            "strategy_manage": serialized_execution["strategy_manage"],
+            "cleanup_required": serialized_execution["cleanup_required"],
             "market_confirmation": serialized_execution["market_confirmation"],
             "last_error_code": failure_markers["last_error_code"],
             "last_error_message": failure_markers["last_error_message"],
@@ -2663,6 +2670,9 @@ def _serialize_execution(
         blocked_reason = ai_decision.Ai_blocked_reason
     raw_response = execution_result.raw_response if execution_result is not None and isinstance(execution_result.raw_response, dict) else {}
     market_confirmation = raw_response.get("market_confirmation") or raw_response.get("bismel1_market_confirmation")
+    raw_request_action = raw_response.get("request_action")
+    raw_close_reason = raw_response.get("close_reason") or raw_response.get("exit_reason")
+    submitted_close_decisions = {"submitted_exit", "submitted_residual_cleanup"}
     return {
         "execution_key": execution_key,
         "execution_mode": execution_mode,
@@ -2673,17 +2683,24 @@ def _serialize_execution(
         "client_order_id": execution_result.client_order_id if execution_result is not None else None,
         "side": execution_result.side if execution_result is not None else None,
         "notional": execution_result.notional if execution_result is not None else None,
-        "qty": None,
+        "qty": raw_response.get("requested_close_qty") or raw_response.get("qty"),
         "add_tier": execution_result.add_tier if execution_result is not None else _parse_add_tier(candidate_action),
-        "execution_allowed": execution_result.submitted if execution_result is not None else execution_decision in {"submitted_buy", "submitted_exit"},
+        "execution_allowed": execution_result.submitted if execution_result is not None else execution_decision in {"submitted_buy", "submitted_exit", "submitted_residual_cleanup"},
         "skipped_reason": skipped_reason if execution_result is None else execution_result.skipped_reason,
         "blocked_reason": blocked_reason,
         "retry_count": execution_result.retry_count if execution_result is not None else retry_count,
         "broker_error_code": execution_result.broker_error_code if execution_result is not None else broker_error_code,
         "broker_error_message": execution_result.broker_error_message if execution_result is not None else broker_error_message,
-        "exit_reason": _resolve_exit_reason(candidate_action=candidate_action, execution_decision=execution_decision),
-        "request_action": "close" if execution_decision == "submitted_exit" else "open" if execution_decision == "submitted_buy" else None,
-        "close_reason": "take_profit" if candidate_action == "take_profit" and execution_decision == "submitted_exit" else None,
+        "exit_reason": raw_close_reason or _resolve_exit_reason(candidate_action=candidate_action, execution_decision=execution_decision),
+        "request_action": raw_request_action or ("close" if execution_decision in submitted_close_decisions else "open" if execution_decision == "submitted_buy" else None),
+        "close_reason": raw_close_reason or ("take_profit" if candidate_action == "take_profit" and execution_decision == "submitted_exit" else None),
+        "close_scope": raw_response.get("close_scope"),
+        "broker_position_qty_source": raw_response.get("broker_position_qty_source"),
+        "requested_close_qty": raw_response.get("requested_close_qty"),
+        "broker_residual_open": raw_response.get("broker_residual_open"),
+        "below_residual_threshold": raw_response.get("below_residual_threshold"),
+        "strategy_manage": raw_response.get("strategy_manage"),
+        "cleanup_required": raw_response.get("cleanup_required"),
         "market_confirmation": market_confirmation if isinstance(market_confirmation, dict) else None,
     }
 

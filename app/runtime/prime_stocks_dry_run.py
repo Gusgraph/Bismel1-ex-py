@@ -15,6 +15,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 import logging
 from typing import Any, Callable
+from uuid import uuid4
 
 from app.brokers.alpaca_market_data import AlpacaMarketDataAdapter
 from app.brokers.alpaca_paper_trading import (
@@ -62,10 +63,121 @@ PRIME_DIAGNOSTIC_ACTIONS = {
 }
 ADMIN_CRYPTO_MONITOR_UIDS = frozenset({"admin-runtime-monitor-prime", "admin-runtime-monitor-execution"})
 ADMIN_CRYPTO_MONITOR_SYMBOLS = frozenset({"UNI/USD", "LINK/USD"})
+POSITION_RESIDUAL_QTY_THRESHOLD = 0.000001
+POSITION_RESIDUAL_MARKET_VALUE_THRESHOLD = 0.01
+RESIDUAL_CLEANUP_ACTIVE_STATUSES = frozenset({"accepted", "new", "partially_filled", "submitted", "pending_new"})
+RESIDUAL_CLEANUP_MAX_ATTEMPTS = 3
+RESIDUAL_CLEANUP_COOLDOWN_MINUTES = 15
 
 
 def _is_active_order_status(order_status: str | None) -> bool:
     return order_status in ACTIVE_ORDER_STATUSES
+
+
+def _position_has_broker_quantity(position: Any | None) -> bool:
+    qty = _maybe_float(getattr(position, "qty", None)) if position is not None else None
+    return qty is not None and qty > 0
+
+
+def _position_is_residual(position: Any | None) -> bool:
+    if position is None:
+        return False
+    qty = _maybe_float(getattr(position, "qty", None))
+    if qty is None or qty <= 0:
+        return False
+    if abs(qty) <= POSITION_RESIDUAL_QTY_THRESHOLD:
+        return True
+    market_value = _maybe_float(getattr(position, "market_value", None))
+    return market_value is not None and abs(market_value) <= POSITION_RESIDUAL_MARKET_VALUE_THRESHOLD
+
+
+def _position_is_strategy_managed_open(position: Any | None) -> bool:
+    return _position_has_broker_quantity(position) and not _position_is_residual(position)
+
+
+def _normalized_order_symbol(order: dict[str, Any]) -> str:
+    return str(order.get("symbol") or "").strip().upper()
+
+
+def _normalized_order_side(order: dict[str, Any]) -> str:
+    return str(order.get("side") or "").strip().lower()
+
+
+def _normalized_order_status(order: dict[str, Any]) -> str:
+    return str(order.get("status") or "").strip().lower()
+
+
+def _normalized_order_client_id(order: dict[str, Any]) -> str:
+    return str(order.get("client_order_id") or "").strip()
+
+
+def _parse_order_time(order: dict[str, Any]) -> datetime | None:
+    for key in ("submitted_at", "created_at", "updated_at", "filled_at"):
+        value = order.get(key)
+        if not isinstance(value, str) or value.strip() == "":
+            continue
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+        except ValueError:
+            continue
+    return None
+
+
+def _residual_cleanup_attempt_count(*, recent_orders: list[dict[str, Any]], symbol: str, prefix: str) -> int:
+    symbol = symbol.strip().upper()
+    return sum(
+        1
+        for order in recent_orders
+        if _normalized_order_symbol(order) == symbol
+        and _normalized_order_side(order) == "sell"
+        and _normalized_order_client_id(order).startswith(prefix)
+    )
+
+
+def _has_recent_residual_cleanup_attempt(*, recent_orders: list[dict[str, Any]], symbol: str, prefix: str, now: datetime) -> bool:
+    symbol = symbol.strip().upper()
+    cooldown_started_after = now.astimezone(UTC) - timedelta(minutes=RESIDUAL_CLEANUP_COOLDOWN_MINUTES)
+    for order in recent_orders:
+        if (
+            _normalized_order_symbol(order) != symbol
+            or _normalized_order_side(order) != "sell"
+            or not _normalized_order_client_id(order).startswith(prefix)
+        ):
+            continue
+        order_time = _parse_order_time(order)
+        if order_time is not None and order_time >= cooldown_started_after:
+            return True
+    return False
+
+
+def _has_pending_residual_cleanup_order(*, recent_orders: list[dict[str, Any]], symbol: str, prefix: str) -> bool:
+    symbol = symbol.strip().upper()
+    for order in recent_orders:
+        client_order_id = _normalized_order_client_id(order)
+        if (
+            _normalized_order_symbol(order) == symbol
+            and _normalized_order_side(order) == "sell"
+            and client_order_id.startswith(prefix)
+            and _normalized_order_status(order) in RESIDUAL_CLEANUP_ACTIVE_STATUSES
+        ):
+            return True
+    return False
+
+
+def _has_recent_bismel1_full_close(*, recent_orders: list[dict[str, Any]], symbol: str, prefixes: tuple[str, ...]) -> bool:
+    symbol = symbol.strip().upper()
+    close_reasons = {"take_profit", "strategy_exit", "stop_loss", "manual_close", "fractional_residual_cleanup"}
+    for order in recent_orders:
+        client_order_id = _normalized_order_client_id(order)
+        if _normalized_order_symbol(order) != symbol or _normalized_order_side(order) != "sell":
+            continue
+        if not any(client_order_id.startswith(prefix) for prefix in prefixes):
+            continue
+        close_scope = str(order.get("close_scope") or order.get("request_action") or "").strip().lower()
+        close_reason = str(order.get("close_reason") or order.get("exit_reason") or "").strip().lower()
+        if close_scope == "full_position" or close_reason in close_reasons or client_order_id:
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -1656,6 +1768,67 @@ class PrimeStocksRuntimeService:
             return None, exc.code, exc.code, False, int(getattr(exc, "retry_count", 0)), exc.code, exc.message, None
 
         current_total_exposure_pct = _resolve_total_exposure_pct(broker_state=broker_state)
+        if _position_is_residual(broker_state.position):
+            try:
+                recent_orders = self._paper_trading.list_recent_orders(credential_context=account_context)
+            except Exception as exc:
+                logger.warning("Prime Stocks residual cleanup skipped because recent orders could not be loaded symbol=%s error=%s", runtime_config.symbol, exc)
+                return None, "residual_cleanup_history_unavailable", "residual_cleanup_history_unavailable", False, state_retry_count, "residual_cleanup_history_unavailable", "Prime residual cleanup requires recent Bismel1 close history.", current_total_exposure_pct
+            if _has_pending_residual_cleanup_order(recent_orders=recent_orders, symbol=runtime_config.symbol, prefix="prime-cleanup-"):
+                return None, "skipped_residual_cleanup_pending", "residual_cleanup_pending", False, state_retry_count, None, None, current_total_exposure_pct
+            if _residual_cleanup_attempt_count(recent_orders=recent_orders, symbol=runtime_config.symbol, prefix="prime-cleanup-") >= RESIDUAL_CLEANUP_MAX_ATTEMPTS:
+                return None, "residual_cleanup_attempt_limit", "residual_cleanup_attempt_limit", False, state_retry_count, "residual_cleanup_attempt_limit", "Prime residual cleanup skipped because the cleanup attempt limit was reached.", current_total_exposure_pct
+            if _has_recent_residual_cleanup_attempt(recent_orders=recent_orders, symbol=runtime_config.symbol, prefix="prime-cleanup-", now=datetime.now(UTC)):
+                return None, "residual_cleanup_cooldown", "residual_cleanup_cooldown", False, state_retry_count, "residual_cleanup_cooldown", "Prime residual cleanup skipped because a cleanup attempt was made recently.", current_total_exposure_pct
+            if not _has_recent_bismel1_full_close(recent_orders=recent_orders, symbol=runtime_config.symbol, prefixes=("prime-tp-", "prime-close-", "prime-cleanup-", "bismel1-close-")):
+                return None, "residual_cleanup_not_eligible", "missing_bismel1_close_history", False, state_retry_count, None, None, current_total_exposure_pct
+            if not bool(getattr(broker_state.asset, "tradable", False)):
+                return None, "residual_cleanup_not_tradable", "residual_cleanup_not_tradable", False, state_retry_count, "residual_cleanup_not_tradable", "Prime residual cleanup skipped because the symbol is not tradable.", current_total_exposure_pct
+            position_qty = _maybe_float(getattr(broker_state.position, "qty", None))
+            if position_qty is None or position_qty <= 0:
+                return None, "residual_cleanup_position_unavailable", "residual_cleanup_position_unavailable", False, state_retry_count, "residual_cleanup_position_unavailable", "Prime residual cleanup requires a broker-reported residual position.", current_total_exposure_pct
+            client_order_id = f"prime-cleanup-{uuid4().hex[:15]}"
+            try:
+                logger.info(
+                    "Prime Stocks residual cleanup submit attempted symbol=%s qty=%s client_order_id=%s",
+                    runtime_config.symbol,
+                    _format_qty(position_qty),
+                    client_order_id,
+                )
+                result, submit_retry_count = self._call_broker_with_retry(
+                    operation=lambda: self._paper_trading.submit_market_order_qty(
+                        symbol=runtime_config.symbol,
+                        side="sell",
+                        qty=position_qty,
+                        action="fractional_residual_cleanup",
+                        client_order_id=client_order_id,
+                        credential_context=account_context,
+                    ),
+                    can_retry=False,
+                    max_retries=0,
+                    operation_label="submit residual cleanup",
+                )
+            except AlpacaPaperTradingError as exc:
+                return None, exc.code, exc.code, False, state_retry_count + int(getattr(exc, "retry_count", 0)), exc.code, exc.message, current_total_exposure_pct
+            raw_response = result.raw_response if isinstance(result.raw_response, dict) else {}
+            result = replace(
+                result,
+                retry_count=state_retry_count + submit_retry_count,
+                raw_response={
+                    **raw_response,
+                    "request_action": "close",
+                    "close_reason": "fractional_residual_cleanup",
+                    "close_scope": "residual_cleanup",
+                    "broker_position_qty_source": "broker_current_position",
+                    "requested_close_qty": _format_qty(position_qty),
+                    "source": "runtime_reconciliation",
+                    "broker_residual_open": True,
+                    "below_residual_threshold": True,
+                    "strategy_manage": False,
+                    "cleanup_required": True,
+                },
+            )
+            return result, "submitted_residual_cleanup", None, True, state_retry_count + submit_retry_count, None, None, current_total_exposure_pct
         tp_candidate = _resolve_prime_take_profit_candidate(
             runtime_config=runtime_config,
             strategy_result=strategy_result,
@@ -1816,7 +1989,7 @@ class PrimeStocksRuntimeService:
                 close_guard,
             )
             return None, close_guard, close_guard, False, state_retry_count, close_guard, "Prime Stocks close blocked before broker submission by final product close guard.", current_total_exposure_pct
-        position_qty = _maybe_float(getattr(broker_state.position, "qty", None)) if broker_state.position is not None else None
+        position_qty = _maybe_float(getattr(broker_state.position, "qty", None)) if _position_has_broker_quantity(broker_state.position) else None
         if position_qty is None or position_qty <= 0:
             return None, "take_profit_position_unavailable", "take_profit_position_unavailable", False, state_retry_count, "take_profit_position_unavailable", "Prime Stocks take-profit close requires a current broker position.", current_total_exposure_pct
         try:
@@ -1850,6 +2023,9 @@ class PrimeStocksRuntimeService:
                     **raw_response,
                     "request_action": "close",
                     "close_reason": "take_profit",
+                    "close_scope": "full_position",
+                    "broker_position_qty_source": "broker_current_position",
+                    "requested_close_qty": _format_qty(position_qty),
                     "market_confirmation": tp_candidate,
                     "bismel1_market_confirmation": tp_candidate,
                 },
@@ -1925,7 +2101,7 @@ class PrimeStocksRuntimeService:
             return
 
         position = broker_state.position
-        if position is None or position.qty <= 0:
+        if not _position_is_strategy_managed_open(position):
             logger.info(
                 "Prime Stocks performance tracking skipped because no broker position was available symbol=%s",
                 runtime_config.symbol,
@@ -2069,7 +2245,7 @@ class PrimeStocksRuntimeService:
             (latest_bar is not None and latest_bar.in_position_before)
             or (state_before is not None and state_before.position_size > 0)
         )
-        has_broker_position = bool(broker_state.position is not None and abs(broker_state.position.qty) > 0)
+        has_broker_position = _position_is_strategy_managed_open(broker_state.position)
         requested_notional = _resolve_effective_notional(
             candidate_action=candidate_action,
             runtime_config=runtime_config,
@@ -3010,6 +3186,10 @@ def _build_client_order_id(*, run_id: str, candidate_action: str) -> str:
     return f"prime-{action_slug}-{run_slug}"[:47]
 
 
+def _format_qty(value: float) -> str:
+    return format(float(value), ".9f").rstrip("0").rstrip(".")
+
+
 def _resolve_prime_take_profit_candidate(
     *,
     runtime_config: PrimeStocksRuntimeConfigRecord,
@@ -3019,7 +3199,7 @@ def _resolve_prime_take_profit_candidate(
     latest_execution_bar: Any | None,
 ) -> dict[str, Any] | None:
     position = broker_state.position
-    if position is None:
+    if not _position_is_strategy_managed_open(position):
         return None
     qty = _maybe_float(getattr(position, "qty", None))
     entry_price = _maybe_float(getattr(position, "avg_entry_price", None))
