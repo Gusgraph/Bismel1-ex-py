@@ -228,6 +228,32 @@ def test_sdk_submit_order_respects_normalized_gtc_time_in_force() -> None:
     assert client.orders[0].time_in_force.value == "gtc"
 
 
+def test_sdk_adapter_maps_limit_buy_order_request() -> None:
+    client = FakeSdkClient()
+    adapter = AlpacaSdkBrokerAdapter(settings=_settings(), client_factory=FakeSdkFactory(client))
+
+    result = adapter.submit_order(
+        BrokerOrderRequest(
+            account_id=501,
+            symbol="AAPL",
+            side="buy",
+            order_type="limit",
+            time_in_force="day",
+            qty=1.0,
+            limit_price=100.0,
+            client_order_id="sdk-stock-limit-test",
+            metadata={"credential_context": _credential_context(environment="paper")},
+        )
+    )
+
+    assert result.ok is True
+    assert client.orders[0].symbol == "AAPL"
+    assert client.orders[0].type.value == "limit"
+    assert client.orders[0].time_in_force.value == "day"
+    assert client.orders[0].limit_price == 100.0
+    assert client.orders[0].client_order_id == "sdk-stock-limit-test"
+
+
 def test_sdk_adapter_retries_submit_with_same_client_order_id() -> None:
     client = FakeSdkClient(fail_once=_api_error(status=500, message="server error"))
     sleeps = []

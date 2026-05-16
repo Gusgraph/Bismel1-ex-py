@@ -51,6 +51,43 @@ def test_broker_order_request_validates_market_order_shape() -> None:
             client_order_id=" ",
         )
 
+    limit_request = BrokerOrderRequest(
+        account_id=501,
+        symbol=" aapl ",
+        side="BUY",
+        order_type="limit",
+        time_in_force="day",
+        qty=1.0,
+        limit_price=100.0,
+        client_order_id="sdk-stock-limit-test",
+    )
+    assert limit_request.order_type == "limit"
+    assert limit_request.limit_price == 100.0
+
+    with pytest.raises(ValueError, match="limit_price"):
+        BrokerOrderRequest(
+            account_id=501,
+            symbol="AAPL",
+            side="buy",
+            order_type="limit",
+            time_in_force="day",
+            qty=1.0,
+            client_order_id="bad-limit-request",
+        )
+
+    with pytest.raises(ValueError, match="does not support notional"):
+        BrokerOrderRequest(
+            account_id=501,
+            symbol="AAPL",
+            side="buy",
+            order_type="limit",
+            time_in_force="day",
+            qty=1.0,
+            notional=100.0,
+            limit_price=100.0,
+            client_order_id="bad-limit-notional",
+        )
+
 
 def test_alpaca_adapter_converts_qty_order_through_internal_broker_request_model() -> None:
     http = FakeHttpClient(
@@ -534,6 +571,46 @@ def test_alpaca_adapter_uses_crypto_compatible_time_in_force_for_admin_crypto_no
         "time_in_force": "gtc",
         "notional": 1.0,
         "client_order_id": "sdk-crypto-validation-rest",
+    }
+
+
+def test_alpaca_adapter_maps_limit_order_payload_without_changing_market_paths() -> None:
+    http = FakeHttpClient(
+        {
+            "id": "limit-order",
+            "client_order_id": "sdk-stock-limit-rest",
+            "symbol": "AAPL",
+            "side": "buy",
+            "status": "new",
+            "qty": "1",
+            "limit_price": "100.00",
+        }
+    )
+    adapter = AlpacaPaperTradingAdapter(settings=_settings(), http_client=http)
+
+    result = adapter.submit_order(
+        BrokerOrderRequest(
+            account_id="paper-1",
+            symbol="AAPL",
+            side="buy",
+            order_type="limit",
+            time_in_force="day",
+            qty=1.0,
+            limit_price=100.0,
+            client_order_id="sdk-stock-limit-rest",
+        )
+    )
+
+    assert result.ok is True
+    assert result.status == "new"
+    assert http.calls[0]["payload"] == {
+        "symbol": "AAPL",
+        "side": "buy",
+        "type": "limit",
+        "time_in_force": "day",
+        "client_order_id": "sdk-stock-limit-rest",
+        "qty": "1",
+        "limit_price": 100.0,
     }
 
 

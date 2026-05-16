@@ -22,7 +22,7 @@ from urllib.error import URLError
 from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, OrderType, QueryOrderStatus, TimeInForce
-from alpaca.trading.requests import ClosePositionRequest, GetOrdersRequest, MarketOrderRequest
+from alpaca.trading.requests import ClosePositionRequest, GetOrdersRequest, LimitOrderRequest, MarketOrderRequest
 
 from app.brokers.alpaca_paper_trading import (
     AlpacaBrokerRetryPolicy,
@@ -67,7 +67,7 @@ logger = logging.getLogger(__name__)
 
 
 class AlpacaTradingClientProtocol(Protocol):
-    def submit_order(self, order_data: MarketOrderRequest) -> Any:
+    def submit_order(self, order_data: MarketOrderRequest | LimitOrderRequest) -> Any:
         ...
 
     def close_position(self, symbol_or_asset_id: str, close_options: ClosePositionRequest | None = None) -> Any:
@@ -252,7 +252,7 @@ class AlpacaSdkBrokerAdapter:
         sdk_context = self._resolve_sdk_context(request.metadata.get("credential_context") if isinstance(request.metadata, dict) else None)
         try:
             payload = self._sdk_call(
-                lambda: sdk_context.client.submit_order(order_data=_market_order_request_from_broker_request(request)),
+                lambda: sdk_context.client.submit_order(order_data=_order_request_from_broker_request(request)),
                 operation="submit_order",
                 symbol=request.symbol,
                 side=request.side,
@@ -721,9 +721,15 @@ class AlpacaSdkBrokerAdapter:
         raise ValueError(f"Prime Stocks paper execution accepts stock/equity symbols only outside admin monitors. Received asset_type={asset_type!r}.")
 
 
+def _order_request_from_broker_request(request: BrokerOrderRequest) -> MarketOrderRequest | LimitOrderRequest:
+    if request.order_type == "market":
+        return _market_order_request_from_broker_request(request)
+    if request.order_type == "limit":
+        return _limit_order_request_from_broker_request(request)
+    raise ValueError("Alpaca SDK adapter currently supports normalized market and limit orders only.")
+
+
 def _market_order_request_from_broker_request(request: BrokerOrderRequest) -> MarketOrderRequest:
-    if request.order_type != "market":
-        raise ValueError("Alpaca SDK adapter currently supports normalized market orders only.")
     return MarketOrderRequest(
         symbol=request.symbol,
         qty=request.qty,
@@ -731,6 +737,22 @@ def _market_order_request_from_broker_request(request: BrokerOrderRequest) -> Ma
         side=OrderSide.BUY if request.side == "buy" else OrderSide.SELL,
         type=OrderType.MARKET,
         time_in_force=_sdk_time_in_force(request.time_in_force),
+        client_order_id=request.client_order_id,
+    )
+
+
+def _limit_order_request_from_broker_request(request: BrokerOrderRequest) -> LimitOrderRequest:
+    if request.limit_price is None:
+        raise ValueError("Alpaca SDK limit orders require limit_price.")
+    if request.qty is None:
+        raise ValueError("Alpaca SDK limit orders require qty.")
+    return LimitOrderRequest(
+        symbol=request.symbol,
+        qty=request.qty,
+        side=OrderSide.BUY if request.side == "buy" else OrderSide.SELL,
+        type=OrderType.LIMIT,
+        time_in_force=_sdk_time_in_force(request.time_in_force),
+        limit_price=round(float(request.limit_price), 2),
         client_order_id=request.client_order_id,
     )
 

@@ -50,6 +50,8 @@ class BrokerOrderRequest:
             raise ValueError("Broker order request side must be buy or sell.")
         if normalized_order_type == "":
             raise ValueError("Broker order request requires an order_type.")
+        if normalized_order_type not in {"market", "limit"}:
+            raise ValueError("Broker order request order_type must be market or limit.")
         if normalized_time_in_force == "":
             raise ValueError("Broker order request requires time_in_force.")
         if normalized_client_order_id == "":
@@ -58,8 +60,17 @@ class BrokerOrderRequest:
             raise ValueError("Broker order request qty must be greater than zero.")
         if self.notional is not None and self.notional <= 0:
             raise ValueError("Broker order request notional must be greater than zero.")
+        if self.limit_price is not None and self.limit_price <= 0:
+            raise ValueError("Broker order request limit_price must be greater than zero.")
         if normalized_order_type == "market" and (self.qty is None) == (self.notional is None):
             raise ValueError("Broker market order request requires exactly one of qty or notional.")
+        if normalized_order_type == "limit":
+            if self.limit_price is None:
+                raise ValueError("Broker limit order request requires limit_price.")
+            if self.qty is None:
+                raise ValueError("Broker limit order request requires qty.")
+            if self.notional is not None:
+                raise ValueError("Broker limit order request does not support notional.")
 
         object.__setattr__(self, "symbol", normalized_symbol)
         object.__setattr__(self, "side", normalized_side)
