@@ -8,6 +8,7 @@ from app.brokers.streaming import (
     BrokerStreamMonitor,
     InMemoryBrokerStreamEventSink,
     normalize_broker_stream_message,
+    summarize_stream_message,
 )
 from app.brokers.alpaca_streaming import (
     AlpacaStreamRuntimeScope,
@@ -140,6 +141,27 @@ def test_canceled_event_normalizes() -> None:
     assert event.event_type == "order_canceled"
     assert event.order_status == "canceled"
     assert event.reconciliation_needed is True
+
+
+def test_alpaca_array_wrapped_message_normalizes() -> None:
+    event = normalize_broker_stream_message(
+        broker="alpaca",
+        account_ref="acct-internal",
+        message=[
+            {
+                "stream": "trade_updates",
+                "data": {
+                    "event": "new",
+                    "order": {"symbol": "AAPL", "side": "buy", "status": "new"},
+                },
+            }
+        ],
+    )
+
+    assert event.event_type == "order_new"
+    assert event.symbol == "AAPL"
+    assert event.order_status == "new"
+    assert event.reconciliation_needed is False
 
 
 def test_alpaca_pending_and_cancel_rejected_events_normalize() -> None:
@@ -280,6 +302,55 @@ def test_planned_validation_window_marks_idle_connected_not_disconnected() -> No
     assert sink.health[-1].safe_user_message == (
         "Broker stream connected. No trade update was received during the validation window."
     )
+
+
+def test_stream_monitor_tracks_sanitized_diagnostics() -> None:
+    sink = InMemoryBrokerStreamEventSink()
+    monitor = BrokerStreamMonitor(broker="alpaca", account_ref="acct-internal", sink=sink)
+
+    monitor.mark_auth_acknowledged()
+    monitor.mark_subscribed({"stream": "authorization", "data": {"streams": ["trade_updates"]}})
+    event = monitor.handle_message([
+        {
+            "stream": "trade_updates",
+            "data": {"event": "canceled", "order": {"symbol": "AAPL", "status": "canceled"}},
+        }
+    ])
+
+    diagnostics = sink.health[-1].to_runtime_metadata()["diagnostics"]
+    rendered = str(diagnostics).lower()
+    assert event.event_type == "order_canceled"
+    assert diagnostics["auth_acknowledged"] is True
+    assert diagnostics["subscription_acknowledged"] is True
+    assert diagnostics["message_count"] == 1
+    assert diagnostics["event_count"] == 1
+    assert diagnostics["last_event_type"] == "order_canceled"
+    assert "client_order_id" not in rendered
+    assert "broker_order" not in rendered
+
+
+def test_summarize_stream_message_excludes_raw_payload_and_ids() -> None:
+    summary = summarize_stream_message(
+        {
+            "stream": "trade_updates",
+            "data": {
+                "event": "fill",
+                "order": {
+                    "id": "broker-order-secret",
+                    "client_order_id": "client-secret",
+                    "symbol": "AAPL",
+                    "status": "filled",
+                },
+            },
+        }
+    )
+
+    rendered = str(summary)
+    assert summary["top_level_keys"] == ["data", "stream"]
+    assert summary["event"] == "fill"
+    assert summary["stream"] == "trade_updates"
+    assert "broker-order-secret" not in rendered
+    assert "client-secret" not in rendered
 
 
 def test_alpaca_stream_builds_auth_and_subscribe_messages_without_logging_secret() -> None:

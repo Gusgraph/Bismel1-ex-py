@@ -208,12 +208,14 @@ class AlpacaWebsocketTransport:
                 if self._is_auth_failure(auth_message):
                     self._monitor.mark_auth_failed()
                     return message_count
+                self._monitor.mark_auth_acknowledged()
 
                 await websocket.send(json.dumps(build_alpaca_subscribe_message(self._streams)))
                 subscribe_message = await websocket.recv()
                 if self._is_auth_failure(subscribe_message):
                     self._monitor.mark_auth_failed()
                     return message_count
+                self._monitor.mark_subscribed(subscribe_message)
 
                 self._monitor.mark_connected()
                 while not self._monitor.closed:

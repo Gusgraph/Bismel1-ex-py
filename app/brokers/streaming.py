@@ -101,6 +101,7 @@ class BrokerStreamHealth:
     reconnect_attempt: int = 0
     reason_code: str | None = None
     safe_user_message: str = "Broker stream status updated."
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def is_stale(self, *, now: datetime | None = None) -> bool:
         if self.last_event_at is None:
@@ -120,6 +121,7 @@ class BrokerStreamHealth:
             "reconnect_attempt": self.reconnect_attempt,
             "reason_code": "stream_stale" if status == "stream_stale" else self.reason_code,
             "safe_user_message": "Broker stream is stale." if status == "stream_stale" else self.safe_user_message,
+            "diagnostics": self.diagnostics,
         }
 
 
@@ -168,6 +170,17 @@ class BrokerStreamMonitor:
         self._max_reconnect_attempts = max(1, max_reconnect_attempts)
         self._closed = False
         self._reconnect_attempt = 0
+        self._diagnostics: dict[str, Any] = {
+            "message_count": 0,
+            "event_count": 0,
+            "unknown_message_count": 0,
+            "parse_error_count": 0,
+            "subscription_acknowledged": False,
+            "auth_acknowledged": False,
+            "last_message_at": None,
+            "last_message_keys": [],
+            "last_event_type": None,
+        }
 
     def mark_connected(self) -> BrokerStreamEvent:
         event = BrokerStreamEvent(
@@ -186,10 +199,34 @@ class BrokerStreamMonitor:
                 connected_at=event.received_at,
                 last_event_at=event.received_at,
                 stale_after_seconds=self._stale_after_seconds,
+                diagnostics=dict(self._diagnostics),
                 safe_user_message="Broker stream connected.",
             )
         )
         return event
+
+    def mark_auth_acknowledged(self) -> None:
+        self._diagnostics["auth_acknowledged"] = True
+        self._diagnostics["auth_acknowledged_at"] = datetime.now(UTC).isoformat()
+
+    def mark_subscribed(self, message: str | bytes | Mapping[str, Any] | list[Any] | None = None) -> None:
+        self._diagnostics["subscription_acknowledged"] = True
+        self._diagnostics["subscribed_at"] = datetime.now(UTC).isoformat()
+        if message is not None:
+            summary = summarize_stream_message(message)
+            self._diagnostics["subscription_message_keys"] = summary.get("top_level_keys", [])
+            self._diagnostics["subscription_streams"] = summary.get("streams", [])
+        self._sink.write_stream_health(
+            BrokerStreamHealth(
+                broker=self._broker,
+                account_ref=self._account_ref,
+                status="stream_connected",
+                stale_after_seconds=self._stale_after_seconds,
+                reason_code="trade_updates_subscribed",
+                safe_user_message="Broker stream subscribed to trade updates.",
+                diagnostics=dict(self._diagnostics),
+            )
+        )
 
     def mark_idle_connected(self) -> BrokerStreamEvent:
         event = BrokerStreamEvent(
@@ -207,6 +244,7 @@ class BrokerStreamMonitor:
                 status="stream_idle_connected",
                 last_event_at=event.received_at,
                 stale_after_seconds=self._stale_after_seconds,
+                diagnostics=dict(self._diagnostics),
                 safe_user_message=event.safe_user_message,
             )
         )
@@ -228,6 +266,7 @@ class BrokerStreamMonitor:
                 status="stream_disconnected",
                 stale_after_seconds=self._stale_after_seconds,
                 reason_code=reason_code,
+                diagnostics=dict(self._diagnostics),
                 safe_user_message="Broker stream disconnected.",
             )
         )
@@ -251,6 +290,7 @@ class BrokerStreamMonitor:
                 stale_after_seconds=self._stale_after_seconds,
                 reconnect_attempt=self._reconnect_attempt,
                 reason_code=reason_code,
+                diagnostics=dict(self._diagnostics),
                 safe_user_message="Broker stream reconnect scheduled.",
             )
         )
@@ -272,17 +312,26 @@ class BrokerStreamMonitor:
                 status="stream_auth_failed",
                 stale_after_seconds=self._stale_after_seconds,
                 reason_code="stream_auth_failed",
+                diagnostics=dict(self._diagnostics),
                 safe_user_message="Broker stream authentication failed.",
             )
         )
         return event
 
-    def handle_message(self, message: str | Mapping[str, Any] | BrokerStreamEvent) -> BrokerStreamEvent:
+    def handle_message(self, message: str | bytes | Mapping[str, Any] | list[Any] | BrokerStreamEvent) -> BrokerStreamEvent:
+        self._record_message_diagnostics(message)
         event = normalize_broker_stream_message(
             broker=self._broker,
             account_ref=self._account_ref,
             message=message,
         )
+        if event.event_type == "parse_error":
+            self._diagnostics["parse_error_count"] = int(self._diagnostics.get("parse_error_count") or 0) + 1
+        elif event.event_type == "unknown_event":
+            self._diagnostics["unknown_message_count"] = int(self._diagnostics.get("unknown_message_count") or 0) + 1
+        else:
+            self._diagnostics["event_count"] = int(self._diagnostics.get("event_count") or 0) + 1
+        self._diagnostics["last_event_type"] = event.event_type
         self._sink.write_stream_event(event)
         self._sink.write_stream_health(
             BrokerStreamHealth(
@@ -292,6 +341,7 @@ class BrokerStreamMonitor:
                 last_event_at=event.received_at,
                 stale_after_seconds=self._stale_after_seconds,
                 reason_code=event.reason_code,
+                diagnostics=dict(self._diagnostics),
                 safe_user_message="Broker stream status updated.",
             )
         )
@@ -311,15 +361,25 @@ class BrokerStreamMonitor:
     def closed(self) -> bool:
         return self._closed
 
+    def _record_message_diagnostics(self, message: str | bytes | Mapping[str, Any] | list[Any] | BrokerStreamEvent) -> None:
+        summary = summarize_stream_message(message)
+        self._diagnostics["message_count"] = int(self._diagnostics.get("message_count") or 0) + 1
+        self._diagnostics["last_message_at"] = datetime.now(UTC).isoformat()
+        self._diagnostics["last_message_keys"] = summary.get("top_level_keys", [])
+        self._diagnostics["last_message_event"] = summary.get("event")
+        self._diagnostics["last_message_stream"] = summary.get("stream")
+
 
 def normalize_broker_stream_message(
     *,
     broker: str,
     account_ref: str | int | None,
-    message: str | Mapping[str, Any] | BrokerStreamEvent,
+    message: str | bytes | Mapping[str, Any] | list[Any] | BrokerStreamEvent,
 ) -> BrokerStreamEvent:
     if isinstance(message, BrokerStreamEvent):
         return message
+    if isinstance(message, bytes):
+        message = message.decode("utf-8", errors="ignore")
     if isinstance(message, str):
         try:
             payload = json.loads(message)
@@ -331,11 +391,68 @@ def normalize_broker_stream_message(
                 reason_code="stream_parse_error",
                 safe_user_message="Broker stream message could not be read.",
             )
+    elif isinstance(message, list):
+        payload = _first_mapping_from_list(message)
+        if payload is None:
+            return BrokerStreamEvent(
+                broker=broker,
+                account_ref=account_ref,
+                event_type="unknown_event",
+                reason_code="unknown_event",
+                safe_user_message="Broker stream event requires review.",
+            )
     else:
         payload = dict(message)
+    if isinstance(payload, list):
+        resolved_payload = _first_mapping_from_list(payload)
+        if resolved_payload is None:
+            return BrokerStreamEvent(
+                broker=broker,
+                account_ref=account_ref,
+                event_type="unknown_event",
+                reason_code="unknown_event",
+                safe_user_message="Broker stream event requires review.",
+            )
+        payload = resolved_payload
     if broker.strip().lower() == "alpaca":
         return normalize_alpaca_trade_update(payload=payload, account_ref=account_ref)
     return _unknown_event(broker=broker, account_ref=account_ref, payload=payload)
+
+
+def summarize_stream_message(message: str | bytes | Mapping[str, Any] | list[Any] | BrokerStreamEvent) -> dict[str, Any]:
+    payload: Any
+    if isinstance(message, BrokerStreamEvent):
+        payload = message.to_customer_payload()
+    elif isinstance(message, bytes):
+        payload = message.decode("utf-8", errors="ignore")
+    else:
+        payload = message
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            return {"top_level_keys": [], "event": "parse_error", "stream": None, "streams": []}
+    if isinstance(payload, list):
+        payload = _first_mapping_from_list(payload) or {}
+    if not isinstance(payload, Mapping):
+        return {"top_level_keys": [], "event": None, "stream": None, "streams": []}
+    data = payload.get("data") if isinstance(payload.get("data"), Mapping) else payload
+    order = data.get("order") if isinstance(data.get("order"), Mapping) else {}
+    listen = payload.get("data") if isinstance(payload.get("data"), Mapping) else {}
+    streams = listen.get("streams") if isinstance(listen.get("streams"), list) else []
+    return {
+        "top_level_keys": sorted(str(key) for key in payload.keys()),
+        "event": _safe_string(data.get("event") or data.get("T") or data.get("type") or order.get("status")),
+        "stream": _safe_string(payload.get("stream") or data.get("stream")),
+        "streams": [_safe_string(item) for item in streams if _safe_string(item) is not None],
+    }
+
+
+def _first_mapping_from_list(payload: list[Any]) -> Mapping[str, Any] | None:
+    for item in payload:
+        if isinstance(item, Mapping):
+            return item
+    return None
 
 
 def normalize_alpaca_trade_update(*, payload: Mapping[str, Any], account_ref: str | int | None = None) -> BrokerStreamEvent:
