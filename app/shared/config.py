@@ -86,7 +86,7 @@ class AppConfig:
     cloud_run_revision: str | None = None
     alpaca_transport: str = "rest"
     admin_runtime_monitor_crypto_order_test_symbol: str = "BTC/USD"
-    admin_runtime_monitor_order_test_notional: float = 1.0
+    admin_runtime_monitor_order_test_notional: float = 10.0
     admin_runtime_monitor_order_test_enabled: bool = False
 
 
@@ -196,7 +196,7 @@ def get_settings() -> AppConfig:
         ).strip().upper()
         or "BTC/USD",
         admin_runtime_monitor_order_test_notional=float(
-            os.getenv("ADMIN_RUNTIME_MONITOR_ORDER_TEST_NOTIONAL", "1.0")
+            os.getenv("ADMIN_RUNTIME_MONITOR_ORDER_TEST_NOTIONAL", "10.0")
         ),
         admin_runtime_monitor_order_test_enabled=_env_flag("ADMIN_RUNTIME_MONITOR_ORDER_TEST_ENABLED", False),
     )
