@@ -105,6 +105,7 @@ def test_prime_runtime_treats_fractional_residual_as_broker_open_but_not_strateg
 def test_runtime_service_submits_residual_cleanup_after_bismel1_full_close() -> None:
     settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
     fake_client = FakeFirestoreClient()
+    _seed_ai_cache(fake_client, symbol="NBIS")
     runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
     paper_trading = FakePaperTrading(
         submission_state=AlpacaPaperSubmissionState(
@@ -3686,6 +3687,7 @@ def _seed_ping_runtime_config(
 def _seed_ai_cache(
     fake_client: FakeFirestoreClient,
     *,
+    symbol: str = "AAPL",
     age_hours: int = 1,
     market_regime: str = "risk_on",
     market_sentiment: str = "neutral",
@@ -3712,10 +3714,11 @@ def _seed_ai_cache(
             "Ai_blocked_reason": "ai_safety_unsafe" if market_safety == "unsafe" else None,
         }
     )
-    fake_client.collection("runtime_products").document("prime_stocks").collection("ai_symbols").document("AAPL").set(
+    normalized_symbol = symbol.strip().upper()
+    fake_client.collection("runtime_products").document("prime_stocks").collection("ai_symbols").document(normalized_symbol).set(
         {
             "scope": "symbol",
-            "symbol": "AAPL",
+            "symbol": normalized_symbol,
             "Ai_regime_label": symbol_regime,
             "Ai_sentiment_label": symbol_sentiment,
             "Ai_safety_label": symbol_safety,
