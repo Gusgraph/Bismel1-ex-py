@@ -78,6 +78,9 @@ These rules protect the recovered/stabilized Bismel1 runtime state. Read this be
 - REST remains the only order submission path.
 - Websocket events must never submit or cancel broker orders.
 - Reconciliation remains the broker truth checker after fills, rejects, cancels, and partial fills.
+- SDK transport remains opt-in behind `ALPACA_TRANSPORT=sdk`; REST remains the production default until a separate rollout approval.
+- SDK paper validation is currently proven for read-only account/position/asset reads and admin-only 24/7 crypto order validation.
+- SDK stock/equity paper order validation must wait for regular market hours and must remain paper-only.
 - Stream writeback must store sanitized event summaries only:
   - no API keys or secrets
   - no raw broker payloads
