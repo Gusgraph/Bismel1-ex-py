@@ -763,7 +763,7 @@ def _sdk_scalar(value: Any) -> Any:
 
 def _normalize_sdk_api_error(exc: APIError) -> AlpacaPaperTradingError:
     status_code = _maybe_int(getattr(exc, "status_code", None))
-    message = str(getattr(exc, "message", None) or exc)
+    message = _safe_sdk_error_message(exc)
     lowered = message.lower()
     raw_response = _safe_sdk_error_payload(exc)
     retryable = status_code in {429, 500, 502, 503, 504}
@@ -871,8 +871,8 @@ def _normalize_sdk_api_error(exc: APIError) -> AlpacaPaperTradingError:
 
 def _safe_sdk_error_payload(exc: APIError) -> dict[str, object] | None:
     payload: dict[str, object] = {}
-    code = getattr(exc, "code", None)
-    message = getattr(exc, "message", None)
+    code = _safe_sdk_error_attr(exc, "code")
+    message = _safe_sdk_error_attr(exc, "message")
     status_code = getattr(exc, "status_code", None)
     if code is not None:
         payload["code"] = str(code)
@@ -881,6 +881,20 @@ def _safe_sdk_error_payload(exc: APIError) -> dict[str, object] | None:
     if status_code is not None:
         payload["status_code"] = status_code
     return payload or None
+
+
+def _safe_sdk_error_message(exc: APIError) -> str:
+    message = _safe_sdk_error_attr(exc, "message")
+    if message is not None:
+        return str(message)
+    return str(exc)
+
+
+def _safe_sdk_error_attr(exc: APIError, name: str) -> object | None:
+    try:
+        return getattr(exc, name)
+    except Exception:
+        return None
 
 
 def _maybe_int(value: object) -> int | None:
@@ -930,4 +944,3 @@ def _log_sdk_request(
         status_code,
         elapsed_ms,
     )
-

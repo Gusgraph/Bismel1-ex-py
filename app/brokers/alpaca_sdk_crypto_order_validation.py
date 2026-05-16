@@ -29,6 +29,7 @@ from app.shared.config import get_settings
 
 
 MINIMUM_NOTIONAL_RETRY = 2.0
+VALIDATION_CLIENT_ORDER_PREFIX = "sdk-crypto-validation-"
 
 
 def run_crypto_order_validation(
@@ -79,52 +80,63 @@ def run_crypto_order_validation(
             reconciliation_status="not_run",
         )
 
-    effective_notional = max(0.01, float(notional))
-    result = _submit_once(
-        adapter=adapter,
-        symbol=normalized_symbol,
-        notional=effective_notional,
-        product_id=product_id,
-        context=context,
-    )
-    if (
-        not result.submitted
-        and result.broker_error_message is not None
-        and "minimum" in result.broker_error_message.lower()
-        and effective_notional < MINIMUM_NOTIONAL_RETRY
-    ):
+    recent_orders = adapter.list_recent_orders(credential_context=context, limit=20)
+    existing_validation_order = _find_existing_validation_order(recent_orders=recent_orders, symbol=normalized_symbol)
+    result = None
+    if existing_validation_order is None:
+        effective_notional = max(0.01, float(notional))
         result = _submit_once(
             adapter=adapter,
             symbol=normalized_symbol,
-            notional=MINIMUM_NOTIONAL_RETRY,
+            notional=effective_notional,
             product_id=product_id,
             context=context,
         )
+        if (
+            not result.submitted
+            and result.broker_error_message is not None
+            and "minimum" in result.broker_error_message.lower()
+            and effective_notional < MINIMUM_NOTIONAL_RETRY
+        ):
+            result = _submit_once(
+                adapter=adapter,
+                symbol=normalized_symbol,
+                notional=MINIMUM_NOTIONAL_RETRY,
+                product_id=product_id,
+                context=context,
+            )
 
     if wait_seconds > 0:
         time.sleep(min(wait_seconds, 10.0))
 
     recent_orders = adapter.list_recent_orders(credential_context=context, limit=20)
-    position = adapter.get_position(str(context.alpaca_account_id), normalized_symbol)
+    validation_order = existing_validation_order or _find_existing_validation_order(recent_orders=recent_orders, symbol=normalized_symbol)
+    broker_read_error = None
+    try:
+        position = adapter.get_position(str(context.alpaca_account_id), normalized_symbol)
+    except Exception:
+        position = None
+        broker_read_error = "broker_position_read_failed"
     reconciliation = reconcile_broker_state(
         expectation=BrokerReconciliationExpectation(
             symbol=normalized_symbol,
             expected_action="buy",
             product_key=product_id,
             runtime_source="sdk_crypto_paper_validation",
-            client_order_id=result.client_order_id,
-            local_order_status=result.order_status,
+            client_order_id=_order_client_id(validation_order) if validation_order is not None else (None if result is None else result.client_order_id),
+            local_order_status=_order_status(validation_order) if validation_order is not None else (None if result is None else result.order_status),
         ),
         broker_orders=recent_orders,
         broker_position=position,
+        broker_read_error=broker_read_error,
     )
 
     return _safe_result(
         product_id=product_id,
         symbol=normalized_symbol,
-        submitted=result.submitted,
-        normalized_status=result.order_status,
-        blocker=result.skipped_reason or result.broker_error_code,
+        submitted=True if validation_order is not None else (False if result is None else result.submitted),
+        normalized_status=_order_status(validation_order) or ("not_submitted" if result is None else result.order_status),
+        blocker=None if validation_order is not None else (None if result is None else result.skipped_reason or result.broker_error_code),
         reconciliation_status=reconciliation.status,
         reconciliation_reason=reconciliation.reason_code,
         stream_status="not_observed",
@@ -143,10 +155,35 @@ def _submit_once(
         symbol=symbol,
         side="buy",
         notional=notional,
-        client_order_id=f"sdk-crypto-validation-{uuid4().hex[:12]}",
+        client_order_id=f"{VALIDATION_CLIENT_ORDER_PREFIX}{uuid4().hex[:12]}",
         action="SdkCryptoPaperValidation",
         credential_context=context,
     )
+
+
+def _find_existing_validation_order(*, recent_orders: list[dict[str, Any]], symbol: str) -> dict[str, Any] | None:
+    for order in recent_orders:
+        if not isinstance(order, dict):
+            continue
+        client_order_id = str(order.get("client_order_id") or "")
+        order_symbol = str(order.get("symbol") or "").strip().upper()
+        if order_symbol == symbol and client_order_id.startswith(VALIDATION_CLIENT_ORDER_PREFIX):
+            return order
+    return None
+
+
+def _order_client_id(order: dict[str, Any] | None) -> str | None:
+    if order is None:
+        return None
+    value = order.get("client_order_id")
+    return None if value is None else str(value)
+
+
+def _order_status(order: dict[str, Any] | None) -> str | None:
+    if order is None:
+        return None
+    value = order.get("status")
+    return None if value is None else str(value)
 
 
 def _safe_result(
@@ -208,4 +245,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
-
