@@ -22,9 +22,11 @@ from typing import Any, Iterable, Mapping
 
 from app.brokers.streaming import (
     BrokerStreamEvent,
+    BrokerStreamContextKey,
     BrokerStreamEventSink,
     BrokerStreamHealth,
     BrokerStreamMonitor,
+    hashed_broker_account_ref,
 )
 from app.services.alpaca_account_resolver import (
     AlpacaAccountResolutionError,
@@ -74,12 +76,26 @@ class AlpacaStreamRuntimeScope:
     product_id: str
     slot_number: int = 1
     account_ref: str | int | None = None
+    broker_provider: str = "alpaca"
+    environment: str = "paper"
+    broker_account_hash: str | None = None
 
     @property
     def base_path(self) -> str:
         return (
             f"users/{self.uid}/accounts/{self.account_id}/{self.product_id}"
             f"/current/slots/slot_{self.slot_number}"
+        )
+
+    @property
+    def context_key(self) -> BrokerStreamContextKey:
+        return BrokerStreamContextKey(
+            broker_provider=self.broker_provider,
+            environment=self.environment,
+            broker_account_hash=self.broker_account_hash
+            or hashed_broker_account_ref(self.uid, self.account_id, self.product_id, self.slot_number),
+            product_code=self.product_id,
+            slot_number=self.slot_number,
         )
 
 
@@ -96,6 +112,7 @@ class FirestoreBrokerStreamEventSink:
             {
                 "account_ref": self._scope.account_ref,
                 "product_id": self._scope.product_id,
+                "stream_context": self._scope.context_key.to_safe_metadata(),
                 "stream_health": {
                     "stream_status": "stream_connected",
                     "last_event_at": event.received_at.isoformat(),
@@ -112,6 +129,7 @@ class FirestoreBrokerStreamEventSink:
             "broker": health.broker,
             "account_ref": self._scope.account_ref,
             "product_id": self._scope.product_id,
+            "stream_context": self._scope.context_key.to_safe_metadata(),
             "stream_health": health.to_runtime_metadata(),
             "last_event_at": health.last_event_at.isoformat() if health.last_event_at else None,
             "safe_user_message": health.safe_user_message,
@@ -319,6 +337,16 @@ def _build_runner(argv: list[str] | None = None) -> AlpacaWebsocketTransport:
         product_id=args.product_id,
         slot_number=args.slot_number,
         account_ref=args.account_ref,
+        environment=account_context.environment if account_context is not None else args.environment,
+        broker_account_hash=(
+            hashed_broker_account_ref(
+                account_context.broker_credential_id,
+                account_context.alpaca_account_id,
+                account_context.environment,
+            )
+            if account_context is not None
+            else hashed_broker_account_ref(resolved_uid, args.account_id, args.product_id, args.slot_number)
+        ),
     )
     sink = FirestoreBrokerStreamEventSink(firestore_client=_firestore_client(), scope=scope)
     if account_context is not None:

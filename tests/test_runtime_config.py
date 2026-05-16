@@ -50,16 +50,25 @@ def test_runtime_config_loads_prime_stocks_dry_run_defaults(monkeypatch) -> None
     assert settings.prime_stocks_ping_scheduler_schedule == "*/1 * * * *"
     assert settings.prime_stocks_ping_scheduler_header_value is None
     assert settings.alpaca_transport == "rest"
+    assert settings.alpaca_transport_primary == "sdk"
+    assert settings.alpaca_transport_fallback == "rest"
+    assert settings.alpaca_transport_rollout == "admin_monitor"
     assert settings.admin_runtime_monitor_alpaca_transport == "rest"
     assert settings.admin_runtime_monitor_order_test_notional == 10.0
 
 
 def test_runtime_config_loads_admin_monitor_transport_override(monkeypatch) -> None:
     monkeypatch.setenv("ALPACA_TRANSPORT", "rest")
+    monkeypatch.setenv("ALPACA_TRANSPORT_PRIMARY", "sdk")
+    monkeypatch.setenv("ALPACA_TRANSPORT_FALLBACK", "rest")
+    monkeypatch.setenv("ALPACA_TRANSPORT_ROLLOUT", "all_paper")
     monkeypatch.setenv("ADMIN_RUNTIME_MONITOR_ALPACA_TRANSPORT", "sdk")
 
     get_settings.cache_clear()
     settings = get_settings()
 
     assert settings.alpaca_transport == "rest"
+    assert settings.alpaca_transport_primary == "sdk"
+    assert settings.alpaca_transport_fallback == "rest"
+    assert settings.alpaca_transport_rollout == "all_paper"
     assert settings.admin_runtime_monitor_alpaca_transport == "sdk"

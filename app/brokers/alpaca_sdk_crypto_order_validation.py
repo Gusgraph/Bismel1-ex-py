@@ -23,6 +23,7 @@ from uuid import uuid4
 from app.brokers.alpaca_streaming import AlpacaStreamRuntimeScope, _firestore_client
 from app.brokers.alpaca_sdk_trading import AlpacaSdkBrokerAdapter
 from app.brokers.reconciliation import BrokerReconciliationExpectation, reconcile_broker_state
+from app.brokers.streaming import hashed_broker_account_ref
 from app.services.alpaca_account_resolver import (
     AlpacaAccountResolutionError,
     LaravelAlpacaAccountResolver,
@@ -277,9 +278,17 @@ def _persist_validation_status(
             product_id=product_id,
             slot_number=slot_number,
             account_ref=None,
+            environment=context.environment,
+            broker_account_hash=hashed_broker_account_ref(
+                context.broker_credential_id,
+                context.alpaca_account_id,
+                context.environment,
+            ),
         )
         payload = {
             "product_id": product_id,
+            "transport": "sdk",
+            "stream_context": scope.context_key.to_safe_metadata(),
             "safe_user_message": _order_validation_message(result),
             "order_validation": {
                 "status": result.get("normalized_status"),

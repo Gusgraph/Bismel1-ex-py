@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Iterable, Mapping, Protocol
@@ -31,6 +32,78 @@ STREAM_RECONCILIATION_EVENT_TYPES = frozenset(
 STREAM_HEALTHY_STATES = frozenset({"stream_connected", "stream_idle_connected"})
 STREAM_DEGRADED_STATES = frozenset({"stream_disconnected", "stream_reconnect_scheduled", "stream_stale"})
 STREAM_FAILED_STATES = frozenset({"stream_auth_failed", "parse_error"})
+
+
+@dataclass(frozen=True)
+class BrokerStreamContextKey:
+    broker_provider: str
+    environment: str
+    broker_account_hash: str
+    product_code: str
+    slot_number: int = 1
+
+    @property
+    def key(self) -> str:
+        return (
+            f"{self.broker_provider}:{self.environment}:{self.broker_account_hash}:"
+            f"{self.product_code}:slot_{self.slot_number}"
+        )
+
+    def to_safe_metadata(self) -> dict[str, Any]:
+        return {
+            "key": self.key,
+            "broker_provider": self.broker_provider,
+            "environment": self.environment,
+            "product_code": self.product_code,
+            "slot_number": self.slot_number,
+            "scope": "broker_account_product_slot",
+            "shared": True,
+        }
+
+
+class SharedBrokerStreamRegistry:
+    """Tracks shared stream contexts in-process so duplicate runners can be rejected early."""
+
+    def __init__(self) -> None:
+        self._active: set[str] = set()
+
+    def acquire(self, context_key: BrokerStreamContextKey) -> bool:
+        if context_key.key in self._active:
+            return False
+        self._active.add(context_key.key)
+        return True
+
+    def release(self, context_key: BrokerStreamContextKey) -> None:
+        self._active.discard(context_key.key)
+
+    def is_active(self, context_key: BrokerStreamContextKey) -> bool:
+        return context_key.key in self._active
+
+
+def hashed_broker_account_ref(*parts: object) -> str:
+    material = ":".join(str(part).strip() for part in parts if part is not None and str(part).strip())
+    if not material:
+        material = "unknown"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+def should_run_stream_for_context(
+    *,
+    product_code: str,
+    asset_class: str = "stock",
+    environment: str = "paper",
+    admin_monitor: bool = False,
+    market_open: bool = False,
+) -> tuple[bool, str]:
+    normalized_asset = asset_class.strip().lower()
+    normalized_product = product_code.strip().lower()
+    if normalized_asset == "crypto" and admin_monitor:
+        return True, "admin_crypto_24_7"
+    if normalized_product in {"prime_stocks", "execution"} and market_open:
+        return True, "market_hours_active"
+    if normalized_product in {"prime_stocks", "execution"}:
+        return False, "market_closed"
+    return environment.strip().lower() == "paper", "paper_context_active"
 
 
 @dataclass(frozen=True)

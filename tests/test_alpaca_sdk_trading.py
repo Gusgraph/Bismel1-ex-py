@@ -15,6 +15,7 @@ from app.brokers.factory import (
     resolve_alpaca_transport,
 )
 from app.brokers.models import BrokerOrderRequest
+from app.brokers.transport_policy import resolve_alpaca_transport_decision
 from app.services.alpaca_account_resolver import ResolvedAlpacaAccountContext
 from app.shared.config import AppConfig
 
@@ -348,7 +349,7 @@ def test_alpaca_transport_factory_defaults_to_rest_and_selects_sdk() -> None:
     sdk_settings = replace(rest_settings, alpaca_transport="sdk")
 
     assert resolve_alpaca_transport(rest_settings) == "rest"
-    assert isinstance(build_alpaca_broker_adapter(rest_settings), AlpacaPaperTradingAdapter)
+    assert isinstance(build_alpaca_broker_adapter(rest_settings), ScopedAlpacaBrokerAdapter)
     assert resolve_alpaca_transport(sdk_settings) == "sdk"
     assert isinstance(build_alpaca_broker_adapter(sdk_settings), AlpacaSdkBrokerAdapter)
 
@@ -370,6 +371,29 @@ def test_alpaca_transport_factory_routes_admin_monitor_contexts_to_sdk_only() ->
     assert isinstance(adapter._adapter_for_context(admin_context), AlpacaSdkBrokerAdapter)
     assert isinstance(adapter._adapter_for_context(customer_context), AlpacaPaperTradingAdapter)
     assert isinstance(adapter._adapter_for_context(live_admin_context), AlpacaPaperTradingAdapter)
+
+
+def test_alpaca_transport_policy_supports_all_paper_sdk_rollout_with_live_rest_fallback() -> None:
+    settings = replace(
+        _settings(),
+        alpaca_transport="rest",
+        alpaca_transport_primary="sdk",
+        alpaca_transport_fallback="rest",
+        alpaca_transport_rollout="all_paper",
+    )
+    paper_context = _credential_context(environment="paper")
+    live_context = _credential_context(environment="live")
+
+    paper_decision = resolve_alpaca_transport_decision(settings=settings, context=paper_context)
+    live_decision = resolve_alpaca_transport_decision(settings=settings, context=live_context)
+    fallback_decision = resolve_alpaca_transport_decision(settings=settings, context=paper_context, sdk_error=True)
+
+    assert paper_decision.selected == "sdk"
+    assert paper_decision.reason == "sdk_primary"
+    assert live_decision.selected == "rest"
+    assert live_decision.reason == "sdk_disabled_for_context"
+    assert fallback_decision.selected == "rest"
+    assert fallback_decision.reason == "sdk_error_fallback_rest"
 
 
 def _api_error(*, status: int, message: str) -> APIError:
@@ -450,4 +474,9 @@ def _settings() -> AppConfig:
         prime_stocks_ping_scheduler_schedule="*/1 * * * *",
         prime_stocks_ping_scheduler_timezone="Etc/UTC",
         prime_stocks_ping_scheduler_header_value=None,
+        alpaca_transport="rest",
+        alpaca_transport_primary="sdk",
+        alpaca_transport_fallback="rest",
+        alpaca_transport_rollout="admin_monitor",
+        admin_runtime_monitor_alpaca_transport="rest",
     )

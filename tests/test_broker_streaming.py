@@ -3,11 +3,15 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from app.brokers.streaming import (
+    BrokerStreamContextKey,
     BrokerStreamEvent,
     BrokerStreamHealth,
     BrokerStreamMonitor,
     InMemoryBrokerStreamEventSink,
+    SharedBrokerStreamRegistry,
+    hashed_broker_account_ref,
     normalize_broker_stream_message,
+    should_run_stream_for_context,
     summarize_stream_message,
 )
 from app.brokers.alpaca_streaming import (
@@ -91,6 +95,60 @@ def test_order_filled_event_normalizes_and_marks_reconciliation_needed() -> None
     assert event.avg_fill_price == 101.25
     assert event.reconciliation_needed is True
     assert event.safe_user_message == "Broker order filled."
+
+
+def test_shared_stream_context_key_is_scoped_and_sanitized() -> None:
+    account_hash = hashed_broker_account_ref("credential-1", "alpaca-account-1", "paper")
+    key = BrokerStreamContextKey(
+        broker_provider="alpaca",
+        environment="paper",
+        broker_account_hash=account_hash,
+        product_code="prime_stocks",
+        slot_number=1,
+    )
+    metadata = key.to_safe_metadata()
+
+    assert key.key == f"alpaca:paper:{account_hash}:prime_stocks:slot_1"
+    assert metadata["shared"] is True
+    assert metadata["scope"] == "broker_account_product_slot"
+    assert "credential-1" not in key.key
+    assert "alpaca-account-1" not in key.key
+
+
+def test_shared_stream_registry_prevents_duplicate_contexts() -> None:
+    registry = SharedBrokerStreamRegistry()
+    key = BrokerStreamContextKey(
+        broker_provider="alpaca",
+        environment="paper",
+        broker_account_hash="accthash",
+        product_code="execution",
+        slot_number=1,
+    )
+
+    assert registry.acquire(key) is True
+    assert registry.acquire(key) is False
+    assert registry.is_active(key) is True
+    registry.release(key)
+    assert registry.acquire(key) is True
+
+
+def test_market_hours_stream_policy_keeps_stock_stream_cost_bounded() -> None:
+    assert should_run_stream_for_context(
+        product_code="prime_stocks",
+        asset_class="stock",
+        market_open=True,
+    ) == (True, "market_hours_active")
+    assert should_run_stream_for_context(
+        product_code="prime_stocks",
+        asset_class="stock",
+        market_open=False,
+    ) == (False, "market_closed")
+    assert should_run_stream_for_context(
+        product_code="prime_stocks",
+        asset_class="crypto",
+        admin_monitor=True,
+        market_open=False,
+    ) == (True, "admin_crypto_24_7")
 
 
 def test_partial_fill_event_normalizes() -> None:
@@ -409,6 +467,10 @@ def test_firestore_stream_sink_writes_only_sanitized_public_state() -> None:
     assert payload["safe_user_message"] == "Broker order filled."
     assert payload["reconciliation_needed"] is True
     assert payload["account_ref"] == "hashed-account-ref"
+    assert payload["stream_context"]["shared"] is True
+    assert payload["stream_context"]["product_code"] == "prime_stocks"
+    assert payload["stream_context"]["slot_number"] == 2
+    assert payload["stream_context"]["key"].startswith("alpaca:paper:")
     assert "client_order_id" not in payload
     assert "broker_order_id" not in payload
     assert "raw_payload" not in payload

@@ -22,34 +22,20 @@ from app.brokers.models import (
     BrokerOrderResult,
     BrokerPositionState,
 )
-from app.services.alpaca_account_resolver import ResolvedAlpacaAccountContext
+from app.brokers.transport_policy import (
+    is_admin_runtime_monitor_context,
+    normalize_transport,
+    resolve_alpaca_transport_decision,
+)
 from app.shared.config import AppConfig
 
 
-ADMIN_RUNTIME_MONITOR_UIDS = {
-    "admin-runtime-monitor-prime",
-    "admin-runtime-monitor-execution",
-}
-
-
 def resolve_alpaca_transport(settings: AppConfig) -> str:
-    transport = (settings.alpaca_transport or "rest").strip().lower()
-    if transport == "sdk":
-        return "sdk"
-    return "rest"
+    return normalize_transport(settings.alpaca_transport)
 
 
 def resolve_admin_runtime_monitor_alpaca_transport(settings: AppConfig) -> str:
-    transport = (settings.admin_runtime_monitor_alpaca_transport or "rest").strip().lower()
-    if transport == "sdk":
-        return "sdk"
-    return "rest"
-
-
-def is_admin_runtime_monitor_context(context: object | None) -> bool:
-    if not isinstance(context, ResolvedAlpacaAccountContext):
-        return False
-    return context.uid in ADMIN_RUNTIME_MONITOR_UIDS and context.environment.lower() == "paper"
+    return normalize_transport(settings.admin_runtime_monitor_alpaca_transport)
 
 
 class ScopedAlpacaBrokerAdapter:
@@ -67,10 +53,8 @@ class ScopedAlpacaBrokerAdapter:
         self._settings = settings
 
     def _adapter_for_context(self, credential_context: object | None) -> AlpacaPaperTradingAdapter | AlpacaSdkBrokerAdapter:
-        if (
-            resolve_admin_runtime_monitor_alpaca_transport(self._settings) == "sdk"
-            and is_admin_runtime_monitor_context(credential_context)
-        ):
+        decision = resolve_alpaca_transport_decision(settings=self._settings, context=credential_context)
+        if decision.selected == "sdk":
             return self.sdk_adapter
         return self.rest_adapter
 
@@ -137,7 +121,7 @@ def build_alpaca_broker_adapter(
 ) -> AlpacaPaperTradingAdapter | AlpacaSdkBrokerAdapter | ScopedAlpacaBrokerAdapter:
     if resolve_alpaca_transport(settings) == "sdk":
         return AlpacaSdkBrokerAdapter(settings=settings)
-    if resolve_admin_runtime_monitor_alpaca_transport(settings) == "sdk":
+    if normalize_transport(settings.alpaca_transport_primary, default="sdk") == "sdk":
         return ScopedAlpacaBrokerAdapter(
             rest_adapter=AlpacaPaperTradingAdapter(settings=settings),
             sdk_adapter=AlpacaSdkBrokerAdapter(settings=settings),
