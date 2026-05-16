@@ -49,4 +49,17 @@ def test_runtime_config_loads_prime_stocks_dry_run_defaults(monkeypatch) -> None
     assert settings.prime_stocks_ping_scheduler_job_name == "prime-stocks-ping"
     assert settings.prime_stocks_ping_scheduler_schedule == "*/1 * * * *"
     assert settings.prime_stocks_ping_scheduler_header_value is None
+    assert settings.alpaca_transport == "rest"
+    assert settings.admin_runtime_monitor_alpaca_transport == "rest"
     assert settings.admin_runtime_monitor_order_test_notional == 10.0
+
+
+def test_runtime_config_loads_admin_monitor_transport_override(monkeypatch) -> None:
+    monkeypatch.setenv("ALPACA_TRANSPORT", "rest")
+    monkeypatch.setenv("ADMIN_RUNTIME_MONITOR_ALPACA_TRANSPORT", "sdk")
+
+    get_settings.cache_clear()
+    settings = get_settings()
+
+    assert settings.alpaca_transport == "rest"
+    assert settings.admin_runtime_monitor_alpaca_transport == "sdk"

@@ -7,7 +7,13 @@ from alpaca.common.exceptions import APIError
 from app.brokers.alpaca_paper_trading import AlpacaBrokerRetryPolicy, AlpacaPaperTradingAdapter
 from app.brokers.alpaca_sdk_trading import AlpacaSdkBrokerAdapter
 from app.brokers.contracts import BrokerAdapter
-from app.brokers.factory import build_alpaca_broker_adapter, resolve_alpaca_transport
+from app.brokers.factory import (
+    ScopedAlpacaBrokerAdapter,
+    build_alpaca_broker_adapter,
+    is_admin_runtime_monitor_context,
+    resolve_admin_runtime_monitor_alpaca_transport,
+    resolve_alpaca_transport,
+)
 from app.brokers.models import BrokerOrderRequest
 from app.services.alpaca_account_resolver import ResolvedAlpacaAccountContext
 from app.shared.config import AppConfig
@@ -345,6 +351,25 @@ def test_alpaca_transport_factory_defaults_to_rest_and_selects_sdk() -> None:
     assert isinstance(build_alpaca_broker_adapter(rest_settings), AlpacaPaperTradingAdapter)
     assert resolve_alpaca_transport(sdk_settings) == "sdk"
     assert isinstance(build_alpaca_broker_adapter(sdk_settings), AlpacaSdkBrokerAdapter)
+
+
+def test_alpaca_transport_factory_routes_admin_monitor_contexts_to_sdk_only() -> None:
+    settings = replace(_settings(), admin_runtime_monitor_alpaca_transport="sdk")
+    customer_context = _credential_context(environment="paper")
+    admin_context = replace(_credential_context(environment="paper"), uid="admin-runtime-monitor-prime")
+    live_admin_context = replace(_credential_context(environment="live"), uid="admin-runtime-monitor-execution")
+
+    adapter = build_alpaca_broker_adapter(settings)
+
+    assert resolve_alpaca_transport(settings) == "rest"
+    assert resolve_admin_runtime_monitor_alpaca_transport(settings) == "sdk"
+    assert isinstance(adapter, ScopedAlpacaBrokerAdapter)
+    assert is_admin_runtime_monitor_context(admin_context) is True
+    assert is_admin_runtime_monitor_context(customer_context) is False
+    assert is_admin_runtime_monitor_context(live_admin_context) is False
+    assert isinstance(adapter._adapter_for_context(admin_context), AlpacaSdkBrokerAdapter)
+    assert isinstance(adapter._adapter_for_context(customer_context), AlpacaPaperTradingAdapter)
+    assert isinstance(adapter._adapter_for_context(live_admin_context), AlpacaPaperTradingAdapter)
 
 
 def _api_error(*, status: int, message: str) -> APIError:
