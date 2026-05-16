@@ -10,5 +10,6 @@
 # ======================================================
 
 fastapi==0.116.1
+alpaca-py==0.43.4
 google-cloud-firestore==2.21.0
 uvicorn[standard]==0.35.0

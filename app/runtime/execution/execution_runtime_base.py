@@ -7,6 +7,7 @@ import logging
 from typing import Any, Callable, Protocol, TypeVar
 from uuid import uuid4
 
+from app.brokers.factory import build_alpaca_broker_adapter
 from app.brokers.alpaca_market_data import AlpacaMarketDataAdapter
 from app.brokers.alpaca_paper_trading import (
     AlpacaPaperExecutionResult,
@@ -1173,7 +1174,7 @@ class ExecutionRuntimeService:
         self._settings = settings
         self._runtime_store = runtime_store or ExecutionRuntimeStore(settings=settings)
         self._account_resolver = account_resolver or LaravelAlpacaAccountResolver(settings=settings)
-        self._paper_trading = paper_trading or AlpacaPaperTradingAdapter(settings=settings)
+        self._paper_trading = paper_trading or build_alpaca_broker_adapter(settings=settings)
         self._market_data = market_data or AlpacaMarketDataAdapter(settings=settings)
         self._now_provider = now_provider or (lambda: datetime.now(tz=UTC))
         self._slot_cycle_bar_cache: dict[tuple[Any, ...], list[Any]] = {}

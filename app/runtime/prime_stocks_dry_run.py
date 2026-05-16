@@ -17,6 +17,7 @@ import logging
 from typing import Any, Callable
 from uuid import uuid4
 
+from app.brokers.factory import build_alpaca_broker_adapter
 from app.brokers.alpaca_market_data import AlpacaMarketDataAdapter
 from app.brokers.alpaca_paper_trading import (
     AlpacaPaperExecutionResult,
@@ -238,7 +239,7 @@ class PrimeStocksRuntimeService:
         self._settings = settings
         self._market_data = market_data
         self._runtime_store = runtime_store
-        self._paper_trading = paper_trading or AlpacaPaperTradingAdapter(settings=settings)
+        self._paper_trading = paper_trading or build_alpaca_broker_adapter(settings=settings)
         self._account_resolver = account_resolver or LaravelAlpacaAccountResolver(settings=settings)
         self._strategy_runner = strategy_runner or run_prime_stocks_strategy
         self._now_provider = now_provider or (lambda: datetime.now(tz=UTC))
@@ -2585,7 +2586,7 @@ def build_prime_stocks_runtime_service(
         settings=settings,
         market_data=market_data or AlpacaMarketDataAdapter(settings=settings),
         runtime_store=runtime_store or PrimeStocksFirestoreRuntimeStore(settings=settings),
-        paper_trading=paper_trading or AlpacaPaperTradingAdapter(settings=settings),
+        paper_trading=paper_trading or build_alpaca_broker_adapter(settings=settings),
         account_resolver=account_resolver or LaravelAlpacaAccountResolver(settings=settings),
     )
 

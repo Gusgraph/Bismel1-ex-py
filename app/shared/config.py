@@ -84,6 +84,7 @@ class AppConfig:
     prime_stocks_notifications_enabled: bool = True
     cloud_run_service_name: str | None = None
     cloud_run_revision: str | None = None
+    alpaca_transport: str = "rest"
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -185,4 +186,5 @@ def get_settings() -> AppConfig:
         prime_stocks_tp_percent=float(os.getenv("PRIME_STOCKS_TP_PERCENT", "3.1")),
         prime_stocks_runtime_api_token=_env_optional("PRIME_STOCKS_RUNTIME_API_TOKEN"),
         prime_stocks_notifications_enabled=_env_flag("PRIME_STOCKS_NOTIFICATIONS_ENABLED", True),
+        alpaca_transport=os.getenv("ALPACA_TRANSPORT", "rest").strip().lower() or "rest",
     )
