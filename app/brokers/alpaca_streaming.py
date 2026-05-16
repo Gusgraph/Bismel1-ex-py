@@ -200,6 +200,7 @@ class AlpacaWebsocketTransport:
 
         message_count = 0
         started_at = datetime.now(UTC)
+        completed_validation_window = False
         try:
             async with websockets.connect(self._url, ping_interval=20, ping_timeout=20) as websocket:
                 await websocket.send(json.dumps(build_alpaca_auth_message(key_id=self._key_id, secret=self._secret)))
@@ -221,6 +222,7 @@ class AlpacaWebsocketTransport:
                         elapsed = (datetime.now(UTC) - started_at).total_seconds()
                         remaining = self._max_run_seconds - elapsed
                         if remaining <= 0:
+                            completed_validation_window = True
                             break
                         receive_timeout = max(0.1, min(5.0, remaining))
                     try:
@@ -238,7 +240,10 @@ class AlpacaWebsocketTransport:
             self._monitor.handle_disconnect(exc)
         finally:
             if not self._monitor.closed:
-                self._monitor.close()
+                if completed_validation_window:
+                    self._monitor.mark_idle_connected()
+                else:
+                    self._monitor.close()
         return message_count
 
     def close(self) -> None:

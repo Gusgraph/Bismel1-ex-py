@@ -269,6 +269,19 @@ def test_stream_health_detects_stale_connected_stream() -> None:
     assert metadata["reason_code"] == "stream_stale"
 
 
+def test_planned_validation_window_marks_idle_connected_not_disconnected() -> None:
+    sink = InMemoryBrokerStreamEventSink()
+    monitor = BrokerStreamMonitor(broker="alpaca", account_ref="acct-internal", sink=sink)
+
+    event = monitor.mark_idle_connected()
+
+    assert event.event_type == "stream_idle_connected"
+    assert sink.health[-1].status == "stream_idle_connected"
+    assert sink.health[-1].safe_user_message == (
+        "Broker stream connected. No trade update was received during the validation window."
+    )
+
+
 def test_alpaca_stream_builds_auth_and_subscribe_messages_without_logging_secret() -> None:
     auth_message = build_alpaca_auth_message(key_id="PKSECRETKEY", secret="super-secret")
     redacted = redact_alpaca_stream_message(auth_message)

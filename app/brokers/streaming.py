@@ -28,7 +28,7 @@ STREAM_RECONCILIATION_EVENT_TYPES = frozenset(
         "order_cancel_rejected",
     }
 )
-STREAM_HEALTHY_STATES = frozenset({"stream_connected"})
+STREAM_HEALTHY_STATES = frozenset({"stream_connected", "stream_idle_connected"})
 STREAM_DEGRADED_STATES = frozenset({"stream_disconnected", "stream_reconnect_scheduled", "stream_stale"})
 STREAM_FAILED_STATES = frozenset({"stream_auth_failed", "parse_error"})
 
@@ -187,6 +187,27 @@ class BrokerStreamMonitor:
                 last_event_at=event.received_at,
                 stale_after_seconds=self._stale_after_seconds,
                 safe_user_message="Broker stream connected.",
+            )
+        )
+        return event
+
+    def mark_idle_connected(self) -> BrokerStreamEvent:
+        event = BrokerStreamEvent(
+            broker=self._broker,
+            account_ref=self._account_ref,
+            event_type="stream_idle_connected",
+            reason_code="stream_idle_connected",
+            safe_user_message="Broker stream connected. No trade update was received during the validation window.",
+        )
+        self._sink.write_stream_event(event)
+        self._sink.write_stream_health(
+            BrokerStreamHealth(
+                broker=self._broker,
+                account_ref=self._account_ref,
+                status="stream_idle_connected",
+                last_event_at=event.received_at,
+                stale_after_seconds=self._stale_after_seconds,
+                safe_user_message=event.safe_user_message,
             )
         )
         return event
