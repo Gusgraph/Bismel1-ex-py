@@ -216,11 +216,17 @@ class AlpacaWebsocketTransport:
 
                 self._monitor.mark_connected()
                 while not self._monitor.closed:
+                    receive_timeout = None
                     if self._max_run_seconds is not None:
                         elapsed = (datetime.now(UTC) - started_at).total_seconds()
-                        if elapsed >= self._max_run_seconds:
+                        remaining = self._max_run_seconds - elapsed
+                        if remaining <= 0:
                             break
-                    message = await websocket.recv()
+                        receive_timeout = max(0.1, min(5.0, remaining))
+                    try:
+                        message = await asyncio.wait_for(websocket.recv(), timeout=receive_timeout)
+                    except TimeoutError:
+                        continue
                     self._monitor.handle_message(message)
                     message_count += 1
                     if self._max_messages is not None and message_count >= self._max_messages:
