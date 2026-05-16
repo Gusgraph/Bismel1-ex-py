@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 
 from app.brokers.alpaca_paper_trading import AlpacaPaperTradingAdapter
@@ -53,8 +53,13 @@ def run_read_only_compare(
     if context.environment != "paper":
         raise RuntimeError("SDK read-only validation is restricted to paper accounts.")
 
-    rest = AlpacaPaperTradingAdapter(settings=settings)
-    sdk = AlpacaSdkBrokerAdapter(settings=settings)
+    read_settings = replace(
+        settings,
+        alpaca_api_key_id=context.key_id,
+        alpaca_api_secret=context.secret,
+    )
+    rest = AlpacaPaperTradingAdapter(settings=read_settings)
+    sdk = AlpacaSdkBrokerAdapter(settings=read_settings)
     account_ref = str(context.alpaca_account_id)
 
     rows: list[ReadComparisonRow] = []
@@ -204,4 +209,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
-
