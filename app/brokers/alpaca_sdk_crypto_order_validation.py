@@ -37,12 +37,18 @@ def run_crypto_order_validation(
     account_id: int,
     product_id: str,
     slot_number: int,
-    symbol: str,
-    notional: float,
+    symbol: str | None,
+    notional: float | None,
     wait_seconds: float,
 ) -> dict[str, Any]:
     _silence_broker_request_logs()
     settings = get_settings()
+    configured_symbol = (symbol or settings.admin_runtime_monitor_crypto_order_test_symbol).strip().upper()
+    configured_notional = (
+        float(notional)
+        if notional is not None
+        else float(settings.admin_runtime_monitor_order_test_notional)
+    )
     context = LaravelAlpacaAccountResolver(settings).resolve_runtime_account_for_slot(
         account_id=account_id,
         slot_number=slot_number,
@@ -58,7 +64,16 @@ def run_crypto_order_validation(
         alpaca_api_secret=context.secret,
     )
     adapter = AlpacaSdkBrokerAdapter(settings=read_settings)
-    normalized_symbol = symbol.strip().upper()
+    normalized_symbol = configured_symbol
+    if "/" not in normalized_symbol:
+        return _safe_result(
+            product_id=product_id,
+            symbol=normalized_symbol,
+            submitted=False,
+            normalized_status="blocked",
+            blocker="crypto_symbol_not_orderable",
+            reconciliation_status="not_run",
+        )
 
     asset = adapter.get_asset(normalized_symbol)
     if asset is None:
@@ -84,7 +99,7 @@ def run_crypto_order_validation(
     existing_validation_order = _find_existing_validation_order(recent_orders=recent_orders, symbol=normalized_symbol)
     result = None
     if existing_validation_order is None:
-        effective_notional = max(0.01, float(notional))
+        effective_notional = max(0.01, configured_notional)
         result = _submit_once(
             adapter=adapter,
             symbol=normalized_symbol,
@@ -223,8 +238,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--account-id", required=True, type=int)
     parser.add_argument("--product-id", required=True)
     parser.add_argument("--slot-number", type=int, default=1)
-    parser.add_argument("--symbol", required=True)
-    parser.add_argument("--notional", type=float, default=1.0)
+    parser.add_argument("--symbol")
+    parser.add_argument("--notional", type=float)
     parser.add_argument("--wait-seconds", type=float, default=3.0)
     args = parser.parse_args(argv)
     try:

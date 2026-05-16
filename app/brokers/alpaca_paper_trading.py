@@ -36,7 +36,7 @@ from app.shared.config import AppConfig
 
 SUPPORTED_STOCK_ASSET_TYPES = frozenset({"stock", "stocks", "equity", "equities"})
 SUPPORTED_CRYPTO_ASSET_TYPES = frozenset({"crypto"})
-SUPPORTED_ADMIN_CRYPTO_MONITOR_SYMBOLS = frozenset({"UNI/USD", "LINK/USD"})
+SUPPORTED_ADMIN_CRYPTO_MONITOR_SYMBOLS = frozenset({"UNI/USD", "LINK/USD", "BTC/USD", "ETH/USD"})
 SUPPORTED_ADMIN_CRYPTO_MONITOR_UIDS = frozenset({"admin-runtime-monitor-prime", "admin-runtime-monitor-execution"})
 SUPPORTED_PRODUCT_KEYS = frozenset({"stocks.bismel1"})
 RETRYABLE_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
@@ -240,7 +240,7 @@ class AlpacaPaperTradingAdapter:
             symbol=symbol,
             side=normalized_side,
             order_type="market",
-            time_in_force="day",
+            time_in_force=_resolve_market_order_time_in_force(symbol),
             qty=qty,
             client_order_id=client_order_id,
             execution_mode=None if credential_context is None else credential_context.environment,
@@ -271,7 +271,7 @@ class AlpacaPaperTradingAdapter:
             symbol=symbol,
             side=normalized_side,
             order_type="market",
-            time_in_force="day",
+            time_in_force=_resolve_market_order_time_in_force(symbol),
             notional=round(notional, 2),
             client_order_id=client_order_id,
             execution_mode=None if credential_context is None else credential_context.environment,
@@ -639,7 +639,7 @@ class AlpacaPaperTradingAdapter:
             symbol=symbol,
             side="buy",
             order_type="market",
-            time_in_force="day",
+            time_in_force=_resolve_market_order_time_in_force(symbol),
             notional=round(notional, 2),
             client_order_id=client_order_id,
             execution_mode=None if credential_context is None else credential_context.environment,
@@ -856,6 +856,18 @@ def _alpaca_order_payload_from_broker_request(request: BrokerOrderRequest) -> di
     if request.stop_price is not None:
         payload["stop_price"] = request.stop_price
     return payload
+
+
+def _resolve_market_order_time_in_force(symbol: str, requested: str = "day") -> str:
+    normalized_requested = (requested or "day").strip().lower()
+    normalized_symbol = (symbol or "").strip().upper()
+    if _looks_like_crypto_pair(normalized_symbol) and normalized_requested == "day":
+        return "gtc"
+    return normalized_requested
+
+
+def _looks_like_crypto_pair(symbol: str) -> bool:
+    return "/" in (symbol or "").strip()
 
 
 def _broker_order_result_from_alpaca_payload(

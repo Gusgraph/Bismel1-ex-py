@@ -504,6 +504,39 @@ def test_alpaca_adapter_converts_notional_order_through_internal_broker_request_
     }
 
 
+def test_alpaca_adapter_uses_crypto_compatible_time_in_force_for_admin_crypto_notional_order() -> None:
+    http = FakeHttpClient(
+        {
+            "id": "crypto-order",
+            "client_order_id": "sdk-crypto-validation-rest",
+            "symbol": "BTC/USD",
+            "side": "buy",
+            "status": "accepted",
+            "notional": "1.00",
+        }
+    )
+    adapter = AlpacaPaperTradingAdapter(settings=_settings(), http_client=http)
+
+    result = adapter.submit_market_order_notional(
+        symbol="BTC/USD",
+        side="buy",
+        notional=1.0,
+        client_order_id="sdk-crypto-validation-rest",
+        action="SdkCryptoPaperValidation",
+        credential_context=_account_context(environment="paper"),
+    )
+
+    assert result.submitted is True
+    assert http.calls[0]["payload"] == {
+        "symbol": "BTC/USD",
+        "side": "buy",
+        "type": "market",
+        "time_in_force": "gtc",
+        "notional": 1.0,
+        "client_order_id": "sdk-crypto-validation-rest",
+    }
+
+
 def test_alpaca_runtime_notional_path_uses_protocol_submit_and_preserves_runtime_result() -> None:
     http = FakeHttpClient(
         {

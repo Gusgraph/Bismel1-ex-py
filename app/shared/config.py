@@ -85,6 +85,9 @@ class AppConfig:
     cloud_run_service_name: str | None = None
     cloud_run_revision: str | None = None
     alpaca_transport: str = "rest"
+    admin_runtime_monitor_crypto_order_test_symbol: str = "BTC/USD"
+    admin_runtime_monitor_order_test_notional: float = 1.0
+    admin_runtime_monitor_order_test_enabled: bool = False
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -187,4 +190,13 @@ def get_settings() -> AppConfig:
         prime_stocks_runtime_api_token=_env_optional("PRIME_STOCKS_RUNTIME_API_TOKEN"),
         prime_stocks_notifications_enabled=_env_flag("PRIME_STOCKS_NOTIFICATIONS_ENABLED", True),
         alpaca_transport=os.getenv("ALPACA_TRANSPORT", "rest").strip().lower() or "rest",
+        admin_runtime_monitor_crypto_order_test_symbol=os.getenv(
+            "ADMIN_RUNTIME_MONITOR_CRYPTO_ORDER_TEST_SYMBOL",
+            "BTC/USD",
+        ).strip().upper()
+        or "BTC/USD",
+        admin_runtime_monitor_order_test_notional=float(
+            os.getenv("ADMIN_RUNTIME_MONITOR_ORDER_TEST_NOTIONAL", "1.0")
+        ),
+        admin_runtime_monitor_order_test_enabled=_env_flag("ADMIN_RUNTIME_MONITOR_ORDER_TEST_ENABLED", False),
     )

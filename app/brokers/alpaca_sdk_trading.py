@@ -47,6 +47,7 @@ from app.brokers.alpaca_paper_trading import (
     _maybe_float,
     _maybe_string,
     _paper_execution_result_from_broker_order_result,
+    _resolve_market_order_time_in_force,
     _resolve_retry_delay,
     _submission_state_from_broker_models,
     _sum_position_market_value,
@@ -205,7 +206,7 @@ class AlpacaSdkBrokerAdapter:
             symbol=symbol,
             side=normalized_side,
             order_type="market",
-            time_in_force="day",
+            time_in_force=_resolve_market_order_time_in_force(symbol),
             qty=qty,
             client_order_id=client_order_id,
             execution_mode=None if credential_context is None else credential_context.environment,
@@ -236,7 +237,7 @@ class AlpacaSdkBrokerAdapter:
             symbol=symbol,
             side=normalized_side,
             order_type="market",
-            time_in_force="day",
+            time_in_force=_resolve_market_order_time_in_force(symbol),
             notional=round(notional, 2),
             client_order_id=client_order_id,
             execution_mode=None if credential_context is None else credential_context.environment,
@@ -573,7 +574,7 @@ class AlpacaSdkBrokerAdapter:
             symbol=symbol,
             side="buy",
             order_type="market",
-            time_in_force="day",
+            time_in_force=_resolve_market_order_time_in_force(symbol),
             notional=round(notional, 2),
             client_order_id=client_order_id,
             execution_mode=None if credential_context is None else credential_context.environment,
@@ -729,9 +730,20 @@ def _market_order_request_from_broker_request(request: BrokerOrderRequest) -> Ma
         notional=None if request.notional is None else round(request.notional, 2),
         side=OrderSide.BUY if request.side == "buy" else OrderSide.SELL,
         type=OrderType.MARKET,
-        time_in_force=TimeInForce.DAY,
+        time_in_force=_sdk_time_in_force(request.time_in_force),
         client_order_id=request.client_order_id,
     )
+
+
+def _sdk_time_in_force(value: str) -> TimeInForce:
+    normalized = (value or "day").strip().lower()
+    if normalized == "gtc":
+        return TimeInForce.GTC
+    if normalized == "ioc":
+        return TimeInForce.IOC
+    if normalized == "day":
+        return TimeInForce.DAY
+    raise ValueError(f"Unsupported Alpaca SDK time_in_force: {value!r}.")
 
 
 def _sdk_payload(payload: Any) -> dict[str, object] | list[object]:

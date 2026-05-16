@@ -171,6 +171,63 @@ def test_sdk_adapter_runtime_qty_sell_path_preserves_client_order_id_and_result_
     assert client.orders[0].qty == 0.000000004
 
 
+def test_sdk_adapter_uses_crypto_compatible_time_in_force_for_crypto_notional_order() -> None:
+    client = FakeSdkClient()
+    adapter = AlpacaSdkBrokerAdapter(settings=_settings(), client_factory=FakeSdkFactory(client))
+
+    result = adapter.submit_market_order_notional(
+        symbol="BTC/USD",
+        side="buy",
+        notional=1.0,
+        client_order_id="sdk-crypto-validation-test",
+        action="SdkCryptoPaperValidation",
+        credential_context=_credential_context(environment="paper"),
+    )
+
+    assert result.submitted is True
+    assert client.orders[0].symbol == "BTC/USD"
+    assert client.orders[0].time_in_force.value == "gtc"
+
+
+def test_sdk_adapter_preserves_day_time_in_force_for_stock_notional_order() -> None:
+    client = FakeSdkClient()
+    adapter = AlpacaSdkBrokerAdapter(settings=_settings(), client_factory=FakeSdkFactory(client))
+
+    result = adapter.submit_market_order_notional(
+        symbol="AAPL",
+        side="buy",
+        notional=1.0,
+        client_order_id="sdk-stock-validation-test",
+        action="SdkStockValidation",
+        credential_context=_credential_context(environment="paper"),
+    )
+
+    assert result.submitted is True
+    assert client.orders[0].symbol == "AAPL"
+    assert client.orders[0].time_in_force.value == "day"
+
+
+def test_sdk_submit_order_respects_normalized_gtc_time_in_force() -> None:
+    client = FakeSdkClient()
+    adapter = AlpacaSdkBrokerAdapter(settings=_settings(), client_factory=FakeSdkFactory(client))
+
+    result = adapter.submit_order(
+        BrokerOrderRequest(
+            account_id=501,
+            symbol="BTC/USD",
+            side="buy",
+            order_type="market",
+            time_in_force="gtc",
+            notional=1.0,
+            client_order_id="sdk-submit-order-gtc",
+            metadata={"credential_context": _credential_context(environment="paper")},
+        )
+    )
+
+    assert result.ok is True
+    assert client.orders[0].time_in_force.value == "gtc"
+
+
 def test_sdk_adapter_retries_submit_with_same_client_order_id() -> None:
     client = FakeSdkClient(fail_once=_api_error(status=500, message="server error"))
     sleeps = []
