@@ -323,6 +323,7 @@ def test_sdk_adapter_maps_account_positions_assets_close_and_cancel() -> None:
     missing_asset = adapter.get_asset("MISSING")
     close = adapter.broker_close_position(account_id="501", symbol="AAPL", metadata={"client_order_id": "close-id"})
     cancel = adapter.broker_cancel_order(account_id="501", order_id="order-123", metadata={"client_order_id": "cancel-id"})
+    recent_orders = adapter.list_recent_orders(credential_context=_credential_context(environment="paper"), limit=10)
 
     assert account.buying_power == 1800.75
     assert positions[0].symbol == "AAPL"
@@ -332,6 +333,8 @@ def test_sdk_adapter_maps_account_positions_assets_close_and_cancel() -> None:
     assert missing_asset is None
     assert close.ok is True and close.status == "accepted"
     assert cancel.ok is True and cancel.status == "canceled"
+    assert recent_orders[0]["status"] == "filled"
+    assert recent_orders[0]["symbol"] == "AAPL"
 
 
 def test_alpaca_transport_factory_defaults_to_rest_and_selects_sdk() -> None:
