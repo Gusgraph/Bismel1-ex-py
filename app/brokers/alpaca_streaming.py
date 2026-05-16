@@ -26,6 +26,11 @@ from app.brokers.streaming import (
     BrokerStreamHealth,
     BrokerStreamMonitor,
 )
+from app.services.alpaca_account_resolver import (
+    AlpacaAccountResolutionError,
+    LaravelAlpacaAccountResolver,
+    ResolvedAlpacaAccountContext,
+)
 from app.shared.config import get_settings
 
 ALPACA_PAPER_STREAM_URL = "wss://paper-api.alpaca.markets/stream"
@@ -122,6 +127,40 @@ class FirestoreBrokerStreamEventSink:
         for index, segment in enumerate(segments):
             ref = ref.collection(segment) if index % 2 == 0 else ref.document(segment)
         return ref
+
+
+def write_missing_credentials_health(*, sink: BrokerStreamEventSink, account_ref: str | int | None = None) -> None:
+    sink.write_stream_health(
+        BrokerStreamHealth(
+            broker="alpaca",
+            status="broker_stream_credentials_missing",
+            account_ref=account_ref,
+            reason_code="broker_stream_credentials_missing",
+            safe_user_message="Broker stream credentials are missing for this linked account.",
+        )
+    )
+
+
+def build_alpaca_stream_transport_from_context(
+    *,
+    account_context: ResolvedAlpacaAccountContext,
+    sink: BrokerStreamEventSink,
+    account_ref: str | int | None = None,
+    max_messages: int | None = None,
+    max_run_seconds: float | None = None,
+) -> AlpacaWebsocketTransport:
+    if not account_context.key_id or not account_context.secret:
+        write_missing_credentials_health(sink=sink, account_ref=account_ref)
+        raise AlpacaStreamConfigurationError("Alpaca stream credentials are missing for the linked broker account.")
+    return AlpacaWebsocketTransport(
+        key_id=account_context.key_id,
+        secret=account_context.secret,
+        environment=account_context.environment,
+        account_ref=account_ref,
+        sink=sink,
+        max_messages=max_messages,
+        max_run_seconds=max_run_seconds,
+    )
 
 
 class AlpacaWebsocketTransport:
@@ -226,32 +265,59 @@ def _firestore_client() -> Any:
 def _build_runner(argv: list[str] | None = None) -> AlpacaWebsocketTransport:
     parser = argparse.ArgumentParser(description="Run sanitized Alpaca trade_updates stream monitoring.")
     parser.add_argument("--environment", choices=["paper", "live"], default=os.getenv("ALPACA_STREAM_ENVIRONMENT", "paper"))
-    parser.add_argument("--uid", required=True)
+    parser.add_argument("--uid")
     parser.add_argument("--account-id", required=True)
     parser.add_argument("--product-id", required=True)
     parser.add_argument("--slot-number", type=int, default=1)
     parser.add_argument("--account-ref")
     parser.add_argument("--max-messages", type=int)
     parser.add_argument("--max-run-seconds", type=float)
+    parser.add_argument("--use-env-credentials", action="store_true")
     args = parser.parse_args(argv)
     settings = get_settings()
-    key_id = settings.alpaca_api_key_id
-    secret = settings.alpaca_api_secret
-    if not key_id or not secret:
-        raise AlpacaStreamConfigurationError("Alpaca stream credentials are not configured.")
+    account_context: ResolvedAlpacaAccountContext | None = None
+    if not args.use_env_credentials:
+        try:
+            account_context = LaravelAlpacaAccountResolver(settings).resolve_runtime_account_for_slot(
+                account_id=int(args.account_id),
+                slot_number=max(1, int(args.slot_number)),
+                product_id=str(args.product_id),
+            )
+        except (AlpacaAccountResolutionError, ValueError) as exc:
+            if not args.uid:
+                raise AlpacaStreamConfigurationError(
+                    "Linked Alpaca account credentials could not be resolved and no uid was provided for stream health writeback."
+                ) from exc
+    resolved_uid = account_context.uid if account_context is not None else args.uid
+    if not resolved_uid:
+        raise AlpacaStreamConfigurationError("A uid is required for broker stream health writeback.")
     scope = AlpacaStreamRuntimeScope(
-        uid=args.uid,
+        uid=resolved_uid,
         account_id=args.account_id,
         product_id=args.product_id,
         slot_number=args.slot_number,
         account_ref=args.account_ref,
     )
+    sink = FirestoreBrokerStreamEventSink(firestore_client=_firestore_client(), scope=scope)
+    if account_context is not None:
+        return build_alpaca_stream_transport_from_context(
+            account_context=account_context,
+            sink=sink,
+            account_ref=args.account_ref,
+            max_messages=args.max_messages,
+            max_run_seconds=args.max_run_seconds,
+        )
+    key_id = settings.alpaca_api_key_id
+    secret = settings.alpaca_api_secret
+    if not key_id or not secret:
+        write_missing_credentials_health(sink=sink, account_ref=args.account_ref)
+        raise AlpacaStreamConfigurationError("Alpaca stream credentials are not configured.")
     return AlpacaWebsocketTransport(
         key_id=key_id,
         secret=secret,
         environment=args.environment,
         account_ref=args.account_ref,
-        sink=FirestoreBrokerStreamEventSink(firestore_client=_firestore_client(), scope=scope),
+        sink=sink,
         max_messages=args.max_messages,
         max_run_seconds=args.max_run_seconds,
     )

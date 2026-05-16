@@ -11,12 +11,16 @@ from app.brokers.streaming import (
 )
 from app.brokers.alpaca_streaming import (
     AlpacaStreamRuntimeScope,
+    AlpacaStreamConfigurationError,
     FirestoreBrokerStreamEventSink,
     alpaca_stream_url,
     build_alpaca_auth_message,
     build_alpaca_subscribe_message,
+    build_alpaca_stream_transport_from_context,
     redact_alpaca_stream_message,
+    write_missing_credentials_health,
 )
+from app.services.alpaca_account_resolver import ResolvedAlpacaAccountContext
 
 
 class _FakeDocument:
@@ -323,3 +327,75 @@ def test_firestore_stream_sink_writes_only_sanitized_public_state() -> None:
     assert "client_order_id" not in payload
     assert "broker_order_id" not in payload
     assert "raw_payload" not in payload
+
+
+def test_alpaca_stream_transport_uses_resolved_rest_credential_context() -> None:
+    sink = InMemoryBrokerStreamEventSink()
+    context = ResolvedAlpacaAccountContext(
+        uid="uid-1",
+        account_id=73,
+        alpaca_account_id=11,
+        broker_connection_id=201,
+        broker_credential_id=401,
+        environment="paper",
+        data_feed="iex",
+        access_mode="trade",
+        trade_enabled=True,
+        key_id="paper-key-from-rest-context",
+        secret="paper-secret-from-rest-context",
+        slot_number=2,
+        product_id="prime_stocks",
+    )
+
+    transport = build_alpaca_stream_transport_from_context(
+        account_context=context,
+        sink=sink,
+        account_ref="safe-account-ref",
+        max_messages=1,
+    )
+
+    assert transport._url == "wss://paper-api.alpaca.markets/stream"
+    assert transport._key_id == "paper-key-from-rest-context"
+    assert transport._secret == "paper-secret-from-rest-context"
+
+
+def test_alpaca_stream_missing_resolved_credentials_writes_safe_health() -> None:
+    sink = InMemoryBrokerStreamEventSink()
+    context = ResolvedAlpacaAccountContext(
+        uid="uid-1",
+        account_id=73,
+        alpaca_account_id=11,
+        broker_connection_id=201,
+        broker_credential_id=401,
+        environment="paper",
+        data_feed="iex",
+        access_mode="trade",
+        trade_enabled=True,
+        key_id="",
+        secret="",
+        slot_number=2,
+        product_id="prime_stocks",
+    )
+
+    try:
+        build_alpaca_stream_transport_from_context(account_context=context, sink=sink)
+    except AlpacaStreamConfigurationError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("Expected missing credentials to block stream transport startup.")
+
+    assert sink.health[-1].status == "broker_stream_credentials_missing"
+    assert sink.health[-1].reason_code == "broker_stream_credentials_missing"
+    assert sink.health[-1].safe_user_message == "Broker stream credentials are missing for this linked account."
+
+
+def test_missing_credentials_health_does_not_expose_credential_material() -> None:
+    sink = InMemoryBrokerStreamEventSink()
+
+    write_missing_credentials_health(sink=sink, account_ref="safe-ref")
+
+    payload = sink.health[-1].to_runtime_metadata()
+    rendered = str(payload)
+    assert payload["stream_status"] == "broker_stream_credentials_missing"
+    assert "secret" not in rendered.lower()
+    assert "api" not in rendered.lower()
