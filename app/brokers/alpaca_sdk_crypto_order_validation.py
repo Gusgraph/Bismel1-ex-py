@@ -30,7 +30,7 @@ from app.services.alpaca_account_resolver import (
 from app.shared.config import get_settings
 
 
-MINIMUM_NOTIONAL_RETRY = 2.0
+MINIMUM_NOTIONAL_RETRY = 10.0
 VALIDATION_CLIENT_ORDER_PREFIX = "sdk-crypto-validation-"
 
 

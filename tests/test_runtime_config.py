@@ -49,3 +49,4 @@ def test_runtime_config_loads_prime_stocks_dry_run_defaults(monkeypatch) -> None
     assert settings.prime_stocks_ping_scheduler_job_name == "prime-stocks-ping"
     assert settings.prime_stocks_ping_scheduler_schedule == "*/1 * * * *"
     assert settings.prime_stocks_ping_scheduler_header_value is None
+    assert settings.admin_runtime_monitor_order_test_notional == 10.0
