@@ -25,6 +25,7 @@ STREAM_RECONCILIATION_EVENT_TYPES = frozenset(
         "order_rejected",
         "order_expired",
         "order_replaced",
+        "order_cancel_rejected",
     }
 )
 STREAM_HEALTHY_STATES = frozenset({"stream_connected"})
@@ -351,6 +352,12 @@ def normalize_alpaca_trade_update(*, payload: Mapping[str, Any], account_ref: st
 def _map_alpaca_event_type(*, event_name: str, order: Mapping[str, Any]) -> str:
     if event_name in {"new", "accepted"}:
         return "order_accepted" if event_name == "accepted" else "order_new"
+    if event_name == "pending_new":
+        return "order_pending_new"
+    if event_name == "pending_cancel":
+        return "order_pending_cancel"
+    if event_name == "order_cancel_rejected":
+        return "order_cancel_rejected"
     if event_name in {"fill", "filled"}:
         return "order_filled"
     if event_name in {"partial_fill", "partially_filled"}:
@@ -364,7 +371,19 @@ def _map_alpaca_event_type(*, event_name: str, order: Mapping[str, Any]) -> str:
     if event_name in {"replaced", "replaced_by"}:
         return "order_replaced"
     status = str(order.get("status") or "").strip().lower()
-    if status in {"accepted", "new", "filled", "partially_filled", "canceled", "cancelled", "rejected", "expired", "replaced"}:
+    if status in {
+        "accepted",
+        "new",
+        "pending_new",
+        "pending_cancel",
+        "filled",
+        "partially_filled",
+        "canceled",
+        "cancelled",
+        "rejected",
+        "expired",
+        "replaced",
+    }:
         return _map_alpaca_event_type(event_name=status, order={})
     return "unknown_event"
 
@@ -376,12 +395,15 @@ def _status_from_event_type(*, event_type: str, order: Mapping[str, Any]) -> str
     mapping = {
         "order_accepted": "accepted",
         "order_new": "new",
+        "order_pending_new": "pending_new",
+        "order_pending_cancel": "pending_cancel",
         "order_filled": "filled",
         "order_partially_filled": "partially_filled",
         "order_canceled": "canceled",
         "order_rejected": "rejected",
         "order_expired": "expired",
         "order_replaced": "replaced",
+        "order_cancel_rejected": "cancel_rejected",
     }
     return mapping.get(event_type)
 
@@ -394,12 +416,15 @@ def _safe_message_for_event(event_type: str) -> str:
         "stream_auth_failed": "Broker stream authentication failed.",
         "order_accepted": "Broker order accepted.",
         "order_new": "Broker order accepted.",
+        "order_pending_new": "Broker order is pending broker acceptance.",
+        "order_pending_cancel": "Broker order cancel is pending.",
         "order_partially_filled": "Broker order partially filled.",
         "order_filled": "Broker order filled.",
         "order_canceled": "Broker order canceled.",
         "order_rejected": "Order rejected by broker.",
         "order_expired": "Broker order expired.",
         "order_replaced": "Broker order updated.",
+        "order_cancel_rejected": "Broker could not cancel the order.",
         "parse_error": "Broker stream message could not be read.",
         "unknown_event": "Broker stream event requires review.",
     }.get(event_type, "Broker stream event requires review.")

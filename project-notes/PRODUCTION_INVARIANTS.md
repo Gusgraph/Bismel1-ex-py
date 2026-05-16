@@ -1,6 +1,6 @@
 # Production Invariants
 
-Last updated: 2026-05-13
+Last updated: 2026-05-16
 
 These rules protect the recovered/stabilized Bismel1 runtime state. Read this before changing account discovery, market-data routing, history fetching, order/position monitoring, or Cloud Run release flow.
 
@@ -73,13 +73,26 @@ These rules protect the recovered/stabilized Bismel1 runtime state. Read this be
 - Bismel1-submitted close orders must carry structured metadata and controlled client order IDs.
 - Broker-reconciled sells without local metadata must be treated as broker reconcile, not strategy close.
 
-## 9. Laravel UI / Notification Boundary
+## 9. Broker Stream Monitoring Boundary
+- Alpaca websocket `trade_updates` support is monitoring-only.
+- REST remains the only order submission path.
+- Websocket events must never submit or cancel broker orders.
+- Reconciliation remains the broker truth checker after fills, rejects, cancels, and partial fills.
+- Stream writeback must store sanitized event summaries only:
+  - no API keys or secrets
+  - no raw broker payloads
+  - no customer-visible broker order IDs
+  - no customer-visible client order IDs
+  - no raw broker account numbers
+- Stream failures must degrade stream health and must not stop Prime or Execution runtime cycles.
+
+## 10. Laravel UI / Notification Boundary
 - Laravel homepage and admin email notification changes must not alter Python runtime strategy logic.
 - Affiliate request and product purchase admin notifications are web-app operational emails only.
 - Python Cloud Run runtime remains the automated strategy/runtime authority.
 - Runtime code must not emit or depend on Laravel admin notification email side effects.
 
-## 10. Git / Release Rule
+## 11. Git / Release Rule
 - No recovery from zip/tag may overwrite live changes without:
   - git status check
   - branch check

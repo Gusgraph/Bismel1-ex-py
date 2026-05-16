@@ -9,6 +9,48 @@ from app.brokers.streaming import (
     InMemoryBrokerStreamEventSink,
     normalize_broker_stream_message,
 )
+from app.brokers.alpaca_streaming import (
+    AlpacaStreamRuntimeScope,
+    FirestoreBrokerStreamEventSink,
+    alpaca_stream_url,
+    build_alpaca_auth_message,
+    build_alpaca_subscribe_message,
+    redact_alpaca_stream_message,
+)
+
+
+class _FakeDocument:
+    def __init__(self, root: "_FakeFirestoreClient", path: tuple[str, ...]) -> None:
+        self._root = root
+        self._path = path
+        self.payloads: list[dict] = []
+
+    def collection(self, name: str) -> "_FakeRef":
+        return _FakeRef(self._root, self._path + (name,))
+
+    def set(self, payload: dict, merge: bool = False) -> None:
+        self.payloads.append({"payload": payload, "merge": merge})
+
+
+class _FakeRef:
+    def __init__(self, root: "_FakeFirestoreClient", path: tuple[str, ...] = ()) -> None:
+        self._root = root
+        self._path = path
+
+    def collection(self, name: str) -> "_FakeRef":
+        return _FakeRef(self._root, self._path + (name,))
+
+    def document(self, name: str) -> _FakeDocument:
+        path = self._path + (name,)
+        return self._root.documents.setdefault(path, _FakeDocument(self._root, path))
+
+
+class _FakeFirestoreClient:
+    def __init__(self) -> None:
+        self.documents: dict[tuple[str, ...], _FakeDocument] = {}
+
+    def collection(self, name: str) -> _FakeRef:
+        return _FakeRef(self, (name,))
 
 
 def test_order_filled_event_normalizes_and_marks_reconciliation_needed() -> None:
@@ -94,6 +136,31 @@ def test_canceled_event_normalizes() -> None:
     assert event.event_type == "order_canceled"
     assert event.order_status == "canceled"
     assert event.reconciliation_needed is True
+
+
+def test_alpaca_pending_and_cancel_rejected_events_normalize() -> None:
+    pending_new = normalize_broker_stream_message(
+        broker="alpaca",
+        account_ref="acct-internal",
+        message={"event": "pending_new", "order": {"symbol": "AAPL", "status": "pending_new"}},
+    )
+    pending_cancel = normalize_broker_stream_message(
+        broker="alpaca",
+        account_ref="acct-internal",
+        message={"event": "pending_cancel", "order": {"symbol": "AAPL", "status": "pending_cancel"}},
+    )
+    cancel_rejected = normalize_broker_stream_message(
+        broker="alpaca",
+        account_ref="acct-internal",
+        message={"event": "order_cancel_rejected", "order": {"symbol": "AAPL"}},
+    )
+
+    assert pending_new.event_type == "order_pending_new"
+    assert pending_new.reconciliation_needed is False
+    assert pending_cancel.event_type == "order_pending_cancel"
+    assert pending_cancel.reconciliation_needed is False
+    assert cancel_rejected.event_type == "order_cancel_rejected"
+    assert cancel_rejected.reconciliation_needed is True
 
 
 def test_unknown_event_becomes_unknown_event() -> None:
@@ -196,3 +263,63 @@ def test_stream_health_detects_stale_connected_stream() -> None:
 
     assert metadata["stream_status"] == "stream_stale"
     assert metadata["reason_code"] == "stream_stale"
+
+
+def test_alpaca_stream_builds_auth_and_subscribe_messages_without_logging_secret() -> None:
+    auth_message = build_alpaca_auth_message(key_id="PKSECRETKEY", secret="super-secret")
+    redacted = redact_alpaca_stream_message(auth_message)
+    subscribe_message = build_alpaca_subscribe_message()
+
+    assert alpaca_stream_url("paper") == "wss://paper-api.alpaca.markets/stream"
+    assert alpaca_stream_url("live") == "wss://api.alpaca.markets/stream"
+    assert auth_message["key"] == "PKSECRETKEY"
+    assert auth_message["secret"] == "super-secret"
+    assert redacted["key"] == "***"
+    assert redacted["secret"] == "***"
+    assert subscribe_message == {"action": "listen", "data": {"streams": ["trade_updates"]}}
+
+
+def test_firestore_stream_sink_writes_only_sanitized_public_state() -> None:
+    client = _FakeFirestoreClient()
+    scope = AlpacaStreamRuntimeScope(
+        uid="uid-1",
+        account_id=73,
+        product_id="prime_stocks",
+        slot_number=2,
+        account_ref="hashed-account-ref",
+    )
+    sink = FirestoreBrokerStreamEventSink(firestore_client=client, scope=scope)
+    event = BrokerStreamEvent(
+        broker="alpaca",
+        account_ref="raw-account-id",
+        event_type="order_filled",
+        symbol="AAPL",
+        order_status="filled",
+        client_order_id="prime-tp-secret",
+        broker_order_id="broker-order-secret",
+        safe_user_message="Broker order filled.",
+        reconciliation_needed=True,
+    )
+
+    sink.write_stream_event(event)
+
+    path = (
+        "users",
+        "uid-1",
+        "accounts",
+        "73",
+        "prime_stocks",
+        "current",
+        "slots",
+        "slot_2",
+        "broker_stream",
+        "current",
+    )
+    payload = client.documents[path].payloads[-1]["payload"]
+    assert payload["event_type"] == "order_filled"
+    assert payload["safe_user_message"] == "Broker order filled."
+    assert payload["reconciliation_needed"] is True
+    assert payload["account_ref"] == "hashed-account-ref"
+    assert "client_order_id" not in payload
+    assert "broker_order_id" not in payload
+    assert "raw_payload" not in payload
