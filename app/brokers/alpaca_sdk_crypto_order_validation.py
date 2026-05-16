@@ -16,9 +16,11 @@ import json
 import logging
 import time
 from dataclasses import replace
+from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+from app.brokers.alpaca_streaming import AlpacaStreamRuntimeScope, _firestore_client
 from app.brokers.alpaca_sdk_trading import AlpacaSdkBrokerAdapter
 from app.brokers.reconciliation import BrokerReconciliationExpectation, reconcile_broker_state
 from app.services.alpaca_account_resolver import (
@@ -66,7 +68,7 @@ def run_crypto_order_validation(
     adapter = AlpacaSdkBrokerAdapter(settings=read_settings)
     normalized_symbol = configured_symbol
     if "/" not in normalized_symbol:
-        return _safe_result(
+        result = _safe_result(
             product_id=product_id,
             symbol=normalized_symbol,
             submitted=False,
@@ -74,10 +76,18 @@ def run_crypto_order_validation(
             blocker="crypto_symbol_not_orderable",
             reconciliation_status="not_run",
         )
+        _persist_validation_status(
+            context=context,
+            account_id=account_id,
+            product_id=product_id,
+            slot_number=slot_number,
+            result=result,
+        )
+        return result
 
     asset = adapter.get_asset(normalized_symbol)
     if asset is None:
-        return _safe_result(
+        result = _safe_result(
             product_id=product_id,
             symbol=normalized_symbol,
             submitted=False,
@@ -85,8 +95,16 @@ def run_crypto_order_validation(
             blocker="asset_not_found",
             reconciliation_status="not_run",
         )
+        _persist_validation_status(
+            context=context,
+            account_id=account_id,
+            product_id=product_id,
+            slot_number=slot_number,
+            result=result,
+        )
+        return result
     if not asset.tradable:
-        return _safe_result(
+        result = _safe_result(
             product_id=product_id,
             symbol=normalized_symbol,
             submitted=False,
@@ -94,6 +112,14 @@ def run_crypto_order_validation(
             blocker="asset_not_tradable",
             reconciliation_status="not_run",
         )
+        _persist_validation_status(
+            context=context,
+            account_id=account_id,
+            product_id=product_id,
+            slot_number=slot_number,
+            result=result,
+        )
+        return result
 
     recent_orders = adapter.list_recent_orders(credential_context=context, limit=20)
     existing_validation_order = _find_existing_validation_order(recent_orders=recent_orders, symbol=normalized_symbol)
@@ -146,7 +172,7 @@ def run_crypto_order_validation(
         broker_read_error=broker_read_error,
     )
 
-    return _safe_result(
+    result = _safe_result(
         product_id=product_id,
         symbol=normalized_symbol,
         submitted=True if validation_order is not None else (False if result is None else result.submitted),
@@ -156,6 +182,14 @@ def run_crypto_order_validation(
         reconciliation_reason=reconciliation.reason_code,
         stream_status="not_observed",
     )
+    _persist_validation_status(
+        context=context,
+        account_id=account_id,
+        product_id=product_id,
+        slot_number=slot_number,
+        result=result,
+    )
+    return result
 
 
 def _submit_once(
@@ -226,6 +260,63 @@ def _safe_result(
         "live_account_used": False,
         "production_sdk_default_changed": False,
     }
+
+
+def _persist_validation_status(
+    *,
+    context: Any,
+    account_id: int,
+    product_id: str,
+    slot_number: int,
+    result: dict[str, Any],
+) -> None:
+    try:
+        scope = AlpacaStreamRuntimeScope(
+            uid=str(context.uid),
+            account_id=account_id,
+            product_id=product_id,
+            slot_number=slot_number,
+            account_ref=None,
+        )
+        payload = {
+            "product_id": product_id,
+            "safe_user_message": _order_validation_message(result),
+            "order_validation": {
+                "status": result.get("normalized_status"),
+                "symbol": result.get("symbol"),
+                "transport": result.get("transport"),
+                "paper": True,
+                "submitted": bool(result.get("submitted")),
+                "blocker": result.get("blocker"),
+                "reconciliation_status": result.get("reconciliation_status"),
+                "reconciliation_reason": result.get("reconciliation_reason"),
+                "stream_status": result.get("stream_status"),
+                "last_checked_at": datetime.now(UTC).isoformat(),
+            },
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+        _document_ref(_firestore_client(), f"{scope.base_path}/broker_stream/current").set(payload, merge=True)
+    except Exception:
+        logging.getLogger(__name__).warning("SDK crypto validation status writeback failed.", exc_info=False)
+
+
+def _document_ref(client: Any, path: str) -> Any:
+    segments = [segment for segment in path.strip("/").split("/") if segment]
+    if len(segments) % 2 != 0:
+        raise ValueError(f"Firestore document path must have an even segment count: {path}")
+    ref = client
+    for index, segment in enumerate(segments):
+        ref = ref.collection(segment) if index % 2 == 0 else ref.document(segment)
+    return ref
+
+
+def _order_validation_message(result: dict[str, Any]) -> str:
+    if result.get("submitted"):
+        return "SDK paper crypto order validation submitted through the broker adapter."
+    blocker = result.get("blocker")
+    if blocker:
+        return f"SDK paper crypto order validation blocked: {blocker}."
+    return "SDK paper crypto order validation did not submit an order."
 
 
 def _silence_broker_request_logs() -> None:
