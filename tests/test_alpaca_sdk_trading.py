@@ -344,39 +344,43 @@ def test_sdk_adapter_maps_account_positions_assets_close_and_cancel() -> None:
     assert recent_orders[0]["symbol"] == "AAPL"
 
 
-def test_alpaca_transport_factory_defaults_to_rest_and_selects_sdk() -> None:
-    rest_settings = _settings()
+def test_alpaca_transport_factory_defaults_to_sdk_policy_and_selects_legacy_overrides() -> None:
+    default_settings = _settings()
+    rest_settings = replace(default_settings, alpaca_transport="rest")
     sdk_settings = replace(rest_settings, alpaca_transport="sdk")
 
+    assert resolve_alpaca_transport(default_settings) == "auto"
+    assert isinstance(build_alpaca_broker_adapter(default_settings), ScopedAlpacaBrokerAdapter)
+    assert isinstance(build_alpaca_broker_adapter(default_settings)._adapter_for_context(None), AlpacaSdkBrokerAdapter)
     assert resolve_alpaca_transport(rest_settings) == "rest"
-    assert isinstance(build_alpaca_broker_adapter(rest_settings), ScopedAlpacaBrokerAdapter)
+    assert isinstance(build_alpaca_broker_adapter(rest_settings), AlpacaPaperTradingAdapter)
     assert resolve_alpaca_transport(sdk_settings) == "sdk"
     assert isinstance(build_alpaca_broker_adapter(sdk_settings), AlpacaSdkBrokerAdapter)
 
 
-def test_alpaca_transport_factory_routes_admin_monitor_contexts_to_sdk_only() -> None:
-    settings = replace(_settings(), admin_runtime_monitor_alpaca_transport="sdk")
+def test_alpaca_transport_factory_routes_all_alpaca_contexts_to_sdk_by_default() -> None:
+    settings = _settings()
     customer_context = _credential_context(environment="paper")
     admin_context = replace(_credential_context(environment="paper"), uid="admin-runtime-monitor-prime")
-    live_admin_context = replace(_credential_context(environment="live"), uid="admin-runtime-monitor-execution")
+    live_context = _credential_context(environment="live")
 
     adapter = build_alpaca_broker_adapter(settings)
 
-    assert resolve_alpaca_transport(settings) == "rest"
+    assert resolve_alpaca_transport(settings) == "auto"
     assert resolve_admin_runtime_monitor_alpaca_transport(settings) == "sdk"
     assert isinstance(adapter, ScopedAlpacaBrokerAdapter)
     assert is_admin_runtime_monitor_context(admin_context) is True
     assert is_admin_runtime_monitor_context(customer_context) is False
-    assert is_admin_runtime_monitor_context(live_admin_context) is False
+    assert is_admin_runtime_monitor_context(live_context) is False
     assert isinstance(adapter._adapter_for_context(admin_context), AlpacaSdkBrokerAdapter)
-    assert isinstance(adapter._adapter_for_context(customer_context), AlpacaPaperTradingAdapter)
-    assert isinstance(adapter._adapter_for_context(live_admin_context), AlpacaPaperTradingAdapter)
+    assert isinstance(adapter._adapter_for_context(customer_context), AlpacaSdkBrokerAdapter)
+    assert isinstance(adapter._adapter_for_context(live_context), AlpacaSdkBrokerAdapter)
 
 
 def test_alpaca_transport_policy_supports_all_paper_sdk_rollout_with_live_rest_fallback() -> None:
     settings = replace(
         _settings(),
-        alpaca_transport="rest",
+        alpaca_transport="auto",
         alpaca_transport_primary="sdk",
         alpaca_transport_fallback="rest",
         alpaca_transport_rollout="all_paper",
@@ -394,6 +398,19 @@ def test_alpaca_transport_policy_supports_all_paper_sdk_rollout_with_live_rest_f
     assert live_decision.reason == "sdk_disabled_for_context"
     assert fallback_decision.selected == "rest"
     assert fallback_decision.reason == "sdk_error_fallback_rest"
+
+
+def test_alpaca_transport_policy_uses_sdk_for_live_when_rollout_is_all() -> None:
+    settings = _settings()
+    live_context = _credential_context(environment="live")
+
+    decision = resolve_alpaca_transport_decision(settings=settings, context=live_context)
+
+    assert decision.primary == "sdk"
+    assert decision.fallback == "rest"
+    assert decision.rollout == "all"
+    assert decision.selected == "sdk"
+    assert decision.reason == "sdk_primary"
 
 
 def _api_error(*, status: int, message: str) -> APIError:
@@ -474,9 +491,9 @@ def _settings() -> AppConfig:
         prime_stocks_ping_scheduler_schedule="*/1 * * * *",
         prime_stocks_ping_scheduler_timezone="Etc/UTC",
         prime_stocks_ping_scheduler_header_value=None,
-        alpaca_transport="rest",
+        alpaca_transport="auto",
         alpaca_transport_primary="sdk",
         alpaca_transport_fallback="rest",
-        alpaca_transport_rollout="admin_monitor",
-        admin_runtime_monitor_alpaca_transport="rest",
+        alpaca_transport_rollout="all",
+        admin_runtime_monitor_alpaca_transport="sdk",
     )

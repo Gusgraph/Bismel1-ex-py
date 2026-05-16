@@ -21,7 +21,7 @@ ADMIN_RUNTIME_MONITOR_UIDS = {
     "admin-runtime-monitor-prime",
     "admin-runtime-monitor-execution",
 }
-ALLOWED_TRANSPORTS = {"rest", "sdk"}
+ALLOWED_TRANSPORTS = {"auto", "rest", "sdk"}
 ALLOWED_ROLLOUTS = {"admin_monitor", "paper", "all_paper", "all"}
 
 
@@ -34,7 +34,7 @@ class AlpacaTransportDecision:
     rollout: str
 
 
-def normalize_transport(value: str | None, *, default: str = "rest") -> str:
+def normalize_transport(value: str | None, *, default: str = "auto") -> str:
     normalized = (value or default).strip().lower()
     return normalized if normalized in ALLOWED_TRANSPORTS else default
 
@@ -53,7 +53,7 @@ def is_admin_runtime_monitor_context(context: object | None) -> bool:
 def sdk_allowed_for_context(*, settings: AppConfig, context: object | None) -> bool:
     rollout = normalize_rollout(settings.alpaca_transport_rollout)
     if rollout == "all":
-        return isinstance(context, ResolvedAlpacaAccountContext)
+        return True
     if not isinstance(context, ResolvedAlpacaAccountContext):
         return False
     environment = context.environment.strip().lower()
@@ -80,6 +80,14 @@ def resolve_alpaca_transport_decision(
             selected="sdk",
             reason="sdk_primary",
             rollout="all",
+        )
+    if legacy_transport == "rest":
+        return AlpacaTransportDecision(
+            primary=primary,
+            fallback=fallback,
+            selected="rest",
+            reason="rest_legacy_override",
+            rollout=rollout,
         )
     if sdk_error:
         return AlpacaTransportDecision(

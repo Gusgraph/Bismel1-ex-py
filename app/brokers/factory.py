@@ -101,26 +101,29 @@ class ScopedAlpacaBrokerAdapter:
         return self._adapter_for_metadata(request.metadata).submit_order(request)
 
     def get_account(self, account_id: str) -> BrokerAccountState:
-        return self.rest_adapter.get_account(account_id)
+        return self._adapter_for_context(None).get_account(account_id)
 
     def get_positions(self, account_id: str) -> list[BrokerPositionState]:
-        return self.rest_adapter.get_positions(account_id)
+        return self._adapter_for_context(None).get_positions(account_id)
 
     def get_position(self, account_id: str, symbol: str) -> BrokerPositionState | None:
-        return self.rest_adapter.get_position(account_id, symbol)
+        return self._adapter_for_context(None).get_position(account_id, symbol)
 
     def get_asset(self, symbol: str) -> BrokerAssetState | None:
-        return self.rest_adapter.get_asset(symbol)
+        return self._adapter_for_context(None).get_asset(symbol)
 
     def health_check(self, account_id: str | None = None) -> dict[str, Any]:
-        return self.rest_adapter.health_check(account_id)
+        return self._adapter_for_context(None).health_check(account_id)
 
 
 def build_alpaca_broker_adapter(
     settings: AppConfig,
 ) -> AlpacaPaperTradingAdapter | AlpacaSdkBrokerAdapter | ScopedAlpacaBrokerAdapter:
-    if resolve_alpaca_transport(settings) == "sdk":
+    legacy_transport = resolve_alpaca_transport(settings)
+    if legacy_transport == "sdk":
         return AlpacaSdkBrokerAdapter(settings=settings)
+    if legacy_transport == "rest":
+        return AlpacaPaperTradingAdapter(settings=settings)
     if normalize_transport(settings.alpaca_transport_primary, default="sdk") == "sdk":
         return ScopedAlpacaBrokerAdapter(
             rest_adapter=AlpacaPaperTradingAdapter(settings=settings),

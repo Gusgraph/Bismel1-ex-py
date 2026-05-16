@@ -84,11 +84,11 @@ class AppConfig:
     prime_stocks_notifications_enabled: bool = True
     cloud_run_service_name: str | None = None
     cloud_run_revision: str | None = None
-    alpaca_transport: str = "rest"
+    alpaca_transport: str = "auto"
     alpaca_transport_primary: str = "sdk"
     alpaca_transport_fallback: str = "rest"
-    alpaca_transport_rollout: str = "admin_monitor"
-    admin_runtime_monitor_alpaca_transport: str = "rest"
+    alpaca_transport_rollout: str = "all"
+    admin_runtime_monitor_alpaca_transport: str = "sdk"
     admin_runtime_monitor_crypto_order_test_symbol: str = "BTC/USD"
     admin_runtime_monitor_order_test_notional: float = 10.0
     admin_runtime_monitor_order_test_enabled: bool = False
@@ -193,16 +193,15 @@ def get_settings() -> AppConfig:
         prime_stocks_tp_percent=float(os.getenv("PRIME_STOCKS_TP_PERCENT", "3.1")),
         prime_stocks_runtime_api_token=_env_optional("PRIME_STOCKS_RUNTIME_API_TOKEN"),
         prime_stocks_notifications_enabled=_env_flag("PRIME_STOCKS_NOTIFICATIONS_ENABLED", True),
-        alpaca_transport=os.getenv("ALPACA_TRANSPORT", "rest").strip().lower() or "rest",
+        alpaca_transport=os.getenv("ALPACA_TRANSPORT", "auto").strip().lower() or "auto",
         alpaca_transport_primary=os.getenv("ALPACA_TRANSPORT_PRIMARY", "sdk").strip().lower() or "sdk",
         alpaca_transport_fallback=os.getenv("ALPACA_TRANSPORT_FALLBACK", "rest").strip().lower() or "rest",
-        alpaca_transport_rollout=os.getenv("ALPACA_TRANSPORT_ROLLOUT", "admin_monitor").strip().lower()
-        or "admin_monitor",
+        alpaca_transport_rollout=os.getenv("ALPACA_TRANSPORT_ROLLOUT", "all").strip().lower() or "all",
         admin_runtime_monitor_alpaca_transport=os.getenv(
             "ADMIN_RUNTIME_MONITOR_ALPACA_TRANSPORT",
-            "rest",
+            "sdk",
         ).strip().lower()
-        or "rest",
+        or "sdk",
         admin_runtime_monitor_crypto_order_test_symbol=os.getenv(
             "ADMIN_RUNTIME_MONITOR_CRYPTO_ORDER_TEST_SYMBOL",
             "BTC/USD",
