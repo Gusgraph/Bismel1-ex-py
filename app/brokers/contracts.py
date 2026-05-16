@@ -20,6 +20,7 @@ from app.brokers.models import (
     BrokerOrderResult,
     BrokerPositionState,
 )
+from app.brokers.streaming import BrokerStreamEvent
 
 
 @runtime_checkable
@@ -46,4 +47,13 @@ class BrokerAdapter(Protocol):
         ...
 
     def health_check(self, account_id: str | None = None) -> dict[str, Any]:
+        ...
+
+
+@runtime_checkable
+class BrokerEventStream(Protocol):
+    def events(self) -> list[BrokerStreamEvent]:
+        ...
+
+    def close(self) -> None:
         ...
