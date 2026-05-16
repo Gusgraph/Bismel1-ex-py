@@ -320,6 +320,7 @@ def test_stream_monitor_tracks_sanitized_diagnostics() -> None:
     diagnostics = sink.health[-1].to_runtime_metadata()["diagnostics"]
     rendered = str(diagnostics).lower()
     assert event.event_type == "order_canceled"
+    assert monitor.diagnostics == diagnostics
     assert diagnostics["auth_acknowledged"] is True
     assert diagnostics["subscription_acknowledged"] is True
     assert diagnostics["message_count"] == 1

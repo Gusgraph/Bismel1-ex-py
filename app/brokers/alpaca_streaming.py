@@ -246,6 +246,15 @@ class AlpacaWebsocketTransport:
                     self._monitor.mark_idle_connected()
                 else:
                     self._monitor.close()
+            print(
+                json.dumps(
+                    {
+                        "alpaca_stream_diagnostics": self._monitor.diagnostics,
+                        "messages_processed": message_count,
+                    },
+                    sort_keys=True,
+                )
+            )
         return message_count
 
     def close(self) -> None:

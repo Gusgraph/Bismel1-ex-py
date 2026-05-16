@@ -361,6 +361,10 @@ class BrokerStreamMonitor:
     def closed(self) -> bool:
         return self._closed
 
+    @property
+    def diagnostics(self) -> dict[str, Any]:
+        return dict(self._diagnostics)
+
     def _record_message_diagnostics(self, message: str | bytes | Mapping[str, Any] | list[Any] | BrokerStreamEvent) -> None:
         summary = summarize_stream_message(message)
         self._diagnostics["message_count"] = int(self._diagnostics.get("message_count") or 0) + 1
