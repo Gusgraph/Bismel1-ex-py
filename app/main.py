@@ -11,7 +11,10 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import logging
+from datetime import UTC, datetime
+from time import perf_counter
 
 from fastapi import FastAPI, HTTPException, Request, status
 
@@ -352,9 +355,12 @@ def _run_scheduled_fanout(
 
     results: list[dict[str, object]] = []
     for target in targets:
+        cycle_started_at = datetime.now(tz=UTC)
+        cycle_started_perf = perf_counter()
         dispatch_symbols = [symbol] if symbol is not None and str(symbol).strip() != "" else [None]
         target_results_by_symbol: dict[str, dict[str, object]] = {}
         preview_results: list[object] = []
+        symbol_timings: list[dict[str, object]] = []
         if hasattr(service, "list_target_symbols"):
             try:
                 dispatch_symbols = service.list_target_symbols(
@@ -380,7 +386,9 @@ def _run_scheduled_fanout(
                 results.append(payload)
                 continue
 
-        for dispatch_symbol in dispatch_symbols:
+        def _run_preview_symbol(dispatch_symbol):
+            symbol_started_at = datetime.now(tz=UTC)
+            symbol_started_perf = perf_counter()
             try:
                 preview_result = service.run_once(
                     symbol=dispatch_symbol,
@@ -393,19 +401,31 @@ def _run_scheduled_fanout(
                     trigger_type=trigger_type,
                     trigger_source=trigger_source,
                 )
-                preview_results.append(preview_result)
                 symbol_ai = None
                 market_ai = None
                 if isinstance(preview_result.ai, dict):
                     symbol_ai = preview_result.ai.get("symbol_record")
                     market_ai = preview_result.ai.get("market_record")
-                target_results_by_symbol[preview_result.symbol] = _payload_from_result(
+                symbol_duration_ms = int(round((perf_counter() - symbol_started_perf) * 1000))
+                symbol_timing = {
+                    "symbol": preview_result.symbol,
+                    "phase": "preview",
+                    "symbol_started_at": symbol_started_at.isoformat(),
+                    "symbol_finished_at": datetime.now(tz=UTC).isoformat(),
+                    "symbol_duration_ms": symbol_duration_ms,
+                }
+                if isinstance(getattr(preview_result, "timing", None), dict):
+                    symbol_timing.update(getattr(preview_result, "timing"))
+                payload = _payload_from_result(
                     preview_result,
                     target=target,
                     symbol_ai=symbol_ai,
                     market_ai=market_ai,
                 )
+                payload["timing"] = symbol_timing
+                return preview_result, payload, symbol_timing
             except ValueError as exc:
+                failed_duration_ms = int(round((perf_counter() - symbol_started_perf) * 1000))
                 payload = {
                     "uid": target.uid,
                     "account_id": target.account_id,
@@ -417,9 +437,39 @@ def _run_scheduled_fanout(
                     "execution_decision": "scheduler_dispatch_failed",
                     "skipped_reason": str(exc),
                     "order_status": "not_submitted",
+                    "timing": {
+                        "symbol": dispatch_symbol,
+                        "phase": "preview",
+                        "symbol_started_at": symbol_started_at.isoformat(),
+                        "symbol_finished_at": datetime.now(tz=UTC).isoformat(),
+                        "symbol_duration_ms": failed_duration_ms,
+                    },
                 }
-                results.append(payload)
-                target_results_by_symbol[dispatch_symbol or ""] = payload
+                return None, payload, payload["timing"]
+
+        preview_workers = max(1, min(len(dispatch_symbols), int(getattr(settings, "prime_stocks_scheduler_preview_workers", 1) or 1)))
+        if preview_workers > 1 and len(dispatch_symbols) > 1:
+            with ThreadPoolExecutor(max_workers=preview_workers, thread_name_prefix="prime-preview") as executor:
+                preview_outputs = [executor.submit(_run_preview_symbol, dispatch_symbol) for dispatch_symbol in dispatch_symbols]
+                for dispatch_symbol, future in zip(dispatch_symbols, preview_outputs, strict=False):
+                    preview_result, payload, symbol_timing = future.result()
+                    if preview_result is not None:
+                        preview_results.append(preview_result)
+                        target_results_by_symbol[preview_result.symbol] = payload
+                    else:
+                        results.append(payload)
+                        target_results_by_symbol[dispatch_symbol or ""] = payload
+                    symbol_timings.append(symbol_timing)
+        else:
+            for dispatch_symbol in dispatch_symbols:
+                preview_result, payload, symbol_timing = _run_preview_symbol(dispatch_symbol)
+                if preview_result is not None:
+                    preview_results.append(preview_result)
+                    target_results_by_symbol[preview_result.symbol] = payload
+                else:
+                    results.append(payload)
+                    target_results_by_symbol[dispatch_symbol or ""] = payload
+                symbol_timings.append(symbol_timing)
 
         ranked_candidates = sorted(
             [preview for preview in preview_results if preview.candidate_action == "FirstLot"],
@@ -468,6 +518,8 @@ def _run_scheduled_fanout(
                 continue
 
             try:
+                execution_started_at = datetime.now(tz=UTC)
+                execution_started_perf = perf_counter()
                 executed = service.run_once(
                     symbol=preview.symbol,
                     uid=target.uid,
@@ -489,6 +541,17 @@ def _run_scheduled_fanout(
                     symbol_ai=symbol_ai,
                     market_ai=market_ai,
                 )
+                execution_timing = {
+                    "symbol": executed.symbol,
+                    "phase": "execution",
+                    "symbol_started_at": execution_started_at.isoformat(),
+                    "symbol_finished_at": datetime.now(tz=UTC).isoformat(),
+                    "symbol_duration_ms": int(round((perf_counter() - execution_started_perf) * 1000)),
+                }
+                if isinstance(getattr(executed, "timing", None), dict):
+                    execution_timing.update(getattr(executed, "timing"))
+                target_results_by_symbol[executed.symbol]["timing"] = execution_timing
+                symbol_timings.append(execution_timing)
                 if executed.execution_decision == "prime_total_entry_budget_reached":
                     exposure_cap_reached = True
                     logger.info(
@@ -499,6 +562,7 @@ def _run_scheduled_fanout(
                         target.account_id,
                     )
             except ValueError as exc:
+                failed_execution_duration_ms = int(round((perf_counter() - execution_started_perf) * 1000))
                 payload = {
                     "uid": target.uid,
                     "account_id": target.account_id,
@@ -510,8 +574,16 @@ def _run_scheduled_fanout(
                     "execution_decision": "scheduler_dispatch_failed",
                     "skipped_reason": str(exc),
                     "order_status": "not_submitted",
+                    "timing": {
+                        "symbol": preview.symbol,
+                        "phase": "execution",
+                        "symbol_started_at": execution_started_at.isoformat(),
+                        "symbol_finished_at": datetime.now(tz=UTC).isoformat(),
+                        "symbol_duration_ms": failed_execution_duration_ms,
+                    },
                 }
                 target_results_by_symbol[preview.symbol] = payload
+                symbol_timings.append(payload["timing"])
 
         target_results: list[dict[str, object]] = [
             target_results_by_symbol[symbol_key]
@@ -521,6 +593,17 @@ def _run_scheduled_fanout(
 
         if target_results and hasattr(service, "record_cycle_summary"):
             try:
+                cycle_duration_ms = int(round((perf_counter() - cycle_started_perf) * 1000))
+                completed_durations = [
+                    int(item.get("symbol_duration_ms"))
+                    for item in symbol_timings
+                    if isinstance(item.get("symbol_duration_ms"), int)
+                ]
+                slowest_timing = max(
+                    symbol_timings,
+                    key=lambda item: int(item.get("symbol_duration_ms", 0) or 0),
+                    default={},
+                )
                 service.record_cycle_summary(
                     uid=target.uid,
                     account_id=target.account_id,
@@ -532,6 +615,21 @@ def _run_scheduled_fanout(
                     results=target_results,
                     target_count=len(dispatch_symbols),
                     completed_count=len(target_results),
+                    timing={
+                        "cycle_started_at": cycle_started_at.isoformat(),
+                        "cycle_finished_at": datetime.now(tz=UTC).isoformat(),
+                        "cycle_duration_ms": cycle_duration_ms,
+                        "target_count": len(dispatch_symbols),
+                        "completed_count": len(target_results),
+                        "avg_symbol_duration_ms": (
+                            int(round(sum(completed_durations) / len(completed_durations)))
+                            if completed_durations
+                            else None
+                        ),
+                        "max_symbol_duration_ms": max(completed_durations) if completed_durations else None,
+                        "slowest_symbol": slowest_timing.get("symbol"),
+                        "per_symbol": symbol_timings,
+                    },
                 )
             except Exception:
                 logger.exception(

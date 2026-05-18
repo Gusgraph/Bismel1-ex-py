@@ -45,6 +45,7 @@ def test_runtime_config_loads_prime_stocks_dry_run_defaults(monkeypatch) -> None
     assert settings.prime_stocks_scheduler_schedule == "5 * * * 1-5"
     assert settings.prime_stocks_scheduler_header_name == "X-Prime-Stocks-Scheduler"
     assert settings.prime_stocks_scheduler_header_value is None
+    assert settings.prime_stocks_scheduler_preview_workers == 6
     assert settings.prime_stocks_scheduler_timezone == "Etc/UTC"
     assert settings.prime_stocks_ping_scheduler_job_name == "prime-stocks-ping"
     assert settings.prime_stocks_ping_scheduler_schedule == "*/1 * * * *"

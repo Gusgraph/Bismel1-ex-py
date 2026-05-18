@@ -66,6 +66,7 @@ class AppConfig:
     prime_stocks_scheduler_timezone: str
     prime_stocks_scheduler_header_name: str
     prime_stocks_scheduler_header_value: str | None
+    prime_stocks_scheduler_preview_workers: int
     prime_stocks_ping_scheduler_job_name: str
     prime_stocks_ping_scheduler_schedule: str
     prime_stocks_ping_scheduler_timezone: str
@@ -170,6 +171,10 @@ def get_settings() -> AppConfig:
         prime_stocks_scheduler_timezone=os.getenv("PRIME_STOCKS_SCHEDULER_TIMEZONE", "Etc/UTC"),
         prime_stocks_scheduler_header_name=os.getenv("PRIME_STOCKS_SCHEDULER_HEADER_NAME", "X-Prime-Stocks-Scheduler"),
         prime_stocks_scheduler_header_value=_env_optional("PRIME_STOCKS_SCHEDULER_HEADER_VALUE"),
+        prime_stocks_scheduler_preview_workers=max(
+            1,
+            int(os.getenv("PRIME_STOCKS_SCHEDULER_PREVIEW_WORKERS", "6")),
+        ),
         prime_stocks_ping_scheduler_job_name=os.getenv("PRIME_STOCKS_PING_SCHEDULER_JOB_NAME", "prime-stocks-ping"),
         prime_stocks_ping_scheduler_schedule=os.getenv("PRIME_STOCKS_PING_SCHEDULER_SCHEDULE", "*/1 * * * *"),
         prime_stocks_ping_scheduler_timezone=os.getenv("PRIME_STOCKS_PING_SCHEDULER_TIMEZONE", "Etc/UTC"),

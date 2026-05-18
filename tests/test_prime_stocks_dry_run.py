@@ -253,6 +253,9 @@ def test_runtime_service_submits_take_profit_when_fresh_bar_confirms_threshold()
     assert execution["request_action"] == "close"
     assert execution["market_confirmation"]["market_confirmation_fresh"] is True
     assert execution["market_confirmation"]["market_confirmation_source"] == "bar_close"
+    assert execution["market_confirmation"]["tp_percent_floor"] == 3.1
+    assert execution["market_confirmation"]["tp_floor_applied"] is True
+    assert execution["market_confirmation"]["floor_threshold"] == 103.1
 
 
 def test_runtime_service_does_not_submit_take_profit_from_bar_high_only() -> None:
@@ -323,6 +326,120 @@ def test_runtime_service_does_not_submit_take_profit_below_threshold() -> None:
     assert result.execution_decision == "no_op"
     assert result.order_submitted is False
     assert paper_trading.calls[-1]["action"] == "submission_state"
+
+
+def test_runtime_service_blocks_schd_style_tiny_tp_below_percent_floor() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading(
+        submission_state=AlpacaPaperSubmissionState(
+            account=AlpacaPaperAccountState(buying_power=1000.0, open_positions_count=1, equity=10000.0, total_exposure=101.0),
+            asset=AlpacaPaperAssetState(symbol="SCHD", tradable=True, status="active"),
+            position=AlpacaPaperPositionState(symbol="SCHD", qty=3.772415, market_value=101.0, avg_entry_price=100.0),
+        )
+    )
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketDataWithBars(execution_bars=_bars_with_latest_price(high=101.0, close=100.4), trend_bars=_bars()),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("HOLD", atr_value=0.1),
+    )
+
+    result = service.run_once(symbol="SCHD", allow_execution=True)
+
+    assert result.candidate_action == "HOLD"
+    assert result.execution_decision == "no_op"
+    assert result.order_submitted is False
+    assert not any(call["action"] == "take_profit" for call in paper_trading.calls)
+
+
+def test_runtime_service_blocks_xlp_style_tiny_tp_below_percent_floor() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading(
+        submission_state=AlpacaPaperSubmissionState(
+            account=AlpacaPaperAccountState(buying_power=1000.0, open_positions_count=1, equity=10000.0, total_exposure=101.0),
+            asset=AlpacaPaperAssetState(symbol="XLP", tradable=True, status="active"),
+            position=AlpacaPaperPositionState(symbol="XLP", qty=1.413599, market_value=101.0, avg_entry_price=100.0),
+        )
+    )
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketDataWithBars(execution_bars=_bars_with_latest_price(high=101.0, close=100.7), trend_bars=_bars()),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("HOLD", atr_value=0.2),
+    )
+
+    result = service.run_once(symbol="XLP", allow_execution=True)
+
+    assert result.execution_decision == "no_op"
+    assert result.order_submitted is False
+    assert not any(call["action"] == "take_profit" for call in paper_trading.calls)
+
+
+def test_runtime_service_allows_kos_style_tp_above_atr_and_percent_floor() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading(
+        submission_state=AlpacaPaperSubmissionState(
+            account=AlpacaPaperAccountState(buying_power=1000.0, open_positions_count=1, equity=10000.0, total_exposure=105.0),
+            asset=AlpacaPaperAssetState(symbol="KOS", tradable=True, status="active"),
+            position=AlpacaPaperPositionState(symbol="KOS", qty=39.911823, market_value=105.0, avg_entry_price=100.0),
+        )
+    )
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketDataWithBars(execution_bars=_bars_with_latest_price(high=104.0, close=104.0), trend_bars=_bars()),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("HOLD", atr_value=1.0),
+    )
+
+    result = service.run_once(symbol="KOS", allow_execution=True)
+
+    assert result.candidate_action == "take_profit"
+    assert result.execution_decision == "submitted_exit"
+    execution = fake_client.storage["runtime_products"]["prime_stocks"]["execution"]["current"]
+    assert execution["market_confirmation"]["tp_threshold"] == 103.1
+    assert execution["market_confirmation"]["tp_floor_applied"] is True
+
+
+def test_runtime_service_uses_atr_threshold_when_atr_exceeds_percent_floor() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading(
+        submission_state=AlpacaPaperSubmissionState(
+            account=AlpacaPaperAccountState(buying_power=1000.0, open_positions_count=1, equity=10000.0, total_exposure=105.0),
+            asset=AlpacaPaperAssetState(symbol="AAPL", tradable=True, status="active"),
+            position=AlpacaPaperPositionState(symbol="AAPL", qty=1.0, market_value=105.0, avg_entry_price=100.0),
+        )
+    )
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketDataWithBars(execution_bars=_bars_with_latest_price(high=105.0, close=105.0), trend_bars=_bars()),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("HOLD", atr_value=2.0),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.execution_decision == "submitted_exit"
+    execution = fake_client.storage["runtime_products"]["prime_stocks"]["execution"]["current"]
+    assert execution["market_confirmation"]["atr_threshold"] == 104.6
+    assert execution["market_confirmation"]["floor_threshold"] == 103.1
+    assert execution["market_confirmation"]["tp_threshold"] == 104.6
+    assert execution["market_confirmation"]["tp_floor_applied"] is False
 
 
 def test_strategy_reasoning_uses_full_1h_and_1d_context() -> None:
@@ -3352,6 +3469,7 @@ def _strategy_result(
     in_position_before: bool | None = None,
     state_before: BismillahTrobotStocksV1State | None = None,
     final_state: BismillahTrobotStocksV1State | None = None,
+    atr_value: float | None = None,
 ) -> PrimeStocksStrategyResult:
     base_entry_trigger = candidate_action == "FirstLot"
     add_trigger = candidate_action.startswith("MULTI")
@@ -3390,7 +3508,7 @@ def _strategy_result(
         state_after=resolved_final_state,
     )
     evaluation = PineSignalStateEvaluation(
-        series=PineComputedSeries(),
+        series=PineComputedSeries(atr_val=[atr_value] * 11 if atr_value is not None else []),
         bars=[latest_bar],
         final_state=resolved_final_state,
     )
@@ -3653,6 +3771,7 @@ def _settings(**overrides) -> AppConfig:
         prime_stocks_scheduler_timezone="Etc/UTC",
         prime_stocks_scheduler_header_name="X-Prime-Stocks-Scheduler",
         prime_stocks_scheduler_header_value="secret-value",
+        prime_stocks_scheduler_preview_workers=6,
         prime_stocks_ping_scheduler_job_name="prime-stocks-ping",
         prime_stocks_ping_scheduler_schedule="*/1 * * * *",
         prime_stocks_ping_scheduler_timezone="Etc/UTC",

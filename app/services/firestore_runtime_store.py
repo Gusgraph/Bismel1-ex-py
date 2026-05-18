@@ -1747,6 +1747,7 @@ class PrimeStocksFirestoreRuntimeStore:
         target_count: int,
         completed_count: int,
         results: list[dict[str, Any]],
+        timing: dict[str, Any] | None = None,
         service_revision: str | None = None,
         service_name: str | None = None,
     ) -> None:
@@ -1803,6 +1804,7 @@ class PrimeStocksFirestoreRuntimeStore:
                 "setup_state": _strategy_reasoning_value(item, "setup_state"),
                 "final_decision": _strategy_reasoning_value(item, "final_decision"),
                 "primary_reason": _strategy_reasoning_value(item, "primary_reason"),
+                "timing": item.get("timing") if isinstance(item.get("timing"), dict) else None,
             }
             for item in results
             if isinstance(item, dict)
@@ -1882,6 +1884,7 @@ class PrimeStocksFirestoreRuntimeStore:
                 "setup_state": item.get("setup_state"),
                 "final_decision": item.get("final_decision"),
                 "primary_reason": item.get("primary_reason"),
+                "timing": item.get("timing") if isinstance(item.get("timing"), dict) else None,
             }
             for item in per_symbol_results
             if item.get("symbol")
@@ -1903,6 +1906,7 @@ class PrimeStocksFirestoreRuntimeStore:
             "completed_count": completed_count,
             "per_symbol_results": per_symbol_results,
             "symbol_states": symbol_states,
+            "timing": timing or {},
             "last_concrete_runtime_result": last_concrete_result,
             "last_concrete_blocker": last_concrete_blocker,
             "runtime_heartbeat_freshness": "fresh" if completed_count > 0 else "unknown",

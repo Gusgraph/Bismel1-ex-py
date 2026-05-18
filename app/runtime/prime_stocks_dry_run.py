@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 import logging
+from time import perf_counter
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -213,6 +214,7 @@ class PrimeStocksRuntimeResult:
     firestore_paths: dict[str, str]
     strategy_reasoning: dict[str, Any] | None = None
     signal_score: float | None = None
+    timing: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -315,6 +317,7 @@ class PrimeStocksRuntimeService:
         results: list[dict[str, object]],
         target_count: int,
         completed_count: int,
+        timing: dict[str, object] | None = None,
     ) -> None:
         self._runtime_store.write_runtime_cycle_summary(
             uid=uid,
@@ -327,6 +330,7 @@ class PrimeStocksRuntimeService:
             target_count=target_count,
             completed_count=completed_count,
             results=results,
+            timing=timing,
             service_revision=self._settings.cloud_run_revision,
             service_name=self._settings.cloud_run_service_name,
         )
@@ -736,6 +740,25 @@ class PrimeStocksRuntimeService:
         trigger_source: str = "api",
         test_trigger: str | None = None,
     ) -> PrimeStocksRuntimeResult:
+        runtime_started_at = datetime.now(tz=UTC)
+        runtime_started_perf = perf_counter()
+        stage_timings_ms: dict[str, int] = {}
+
+        def _mark_stage(stage: str, started_at: float) -> None:
+            stage_timings_ms[stage] = int(round((perf_counter() - started_at) * 1000))
+
+        def _runtime_timing_payload() -> dict[str, Any]:
+            return {
+                "symbol_duration_ms": int(round((perf_counter() - runtime_started_perf) * 1000)),
+                "runtime_started_at": runtime_started_at.isoformat(),
+                "runtime_finished_at": datetime.now(tz=UTC).isoformat(),
+                "broker_context_ms": stage_timings_ms.get("broker_context_ms"),
+                "market_data_ms": stage_timings_ms.get("market_data_ms"),
+                "strategy_eval_ms": stage_timings_ms.get("strategy_eval_ms"),
+                "broker_check_ms": stage_timings_ms.get("broker_check_ms"),
+                "writeback_ms": stage_timings_ms.get("writeback_ms"),
+            }
+
         run_id = self._runtime_store.create_run_id()
         default_runtime_config = build_default_runtime_config(self._settings)
         fallback_runtime_config = _override_symbol(
@@ -861,6 +884,7 @@ class PrimeStocksRuntimeService:
                 candidate_action="DISABLED",
                 status="disabled",
             )
+        broker_context_started = perf_counter()
         try:
             account_context = self._account_resolver.resolve_runtime_account(resolved_runtime_config)
         except AlpacaAccountResolutionError as exc:
@@ -884,6 +908,7 @@ class PrimeStocksRuntimeService:
                     f"{exc}"
                 ),
             )
+        _mark_stage("broker_context_ms", broker_context_started)
         selected_slot_number = resolved_runtime_config.slot_number or account_context.slot_number
         if selected_slot_number != resolved_runtime_config.slot_number:
             resolved_runtime_config = replace(resolved_runtime_config, slot_number=selected_slot_number)
@@ -1038,6 +1063,7 @@ class PrimeStocksRuntimeService:
                 skipped_reason=execution_decision,
             )
 
+        market_data_started = perf_counter()
         try:
             bar_set = self._market_data.fetch_prime_stocks_bars(
                 symbol=resolved_runtime_config.symbol,
@@ -1070,6 +1096,7 @@ class PrimeStocksRuntimeService:
                     f"{exc}"
                 ),
             )
+        _mark_stage("market_data_ms", market_data_started)
         latest_signal_time = _resolve_latest_signal_time(bar_set.execution_bars)
         if _is_stale_market_data(
             latest_signal_time=latest_signal_time,
@@ -1222,6 +1249,7 @@ class PrimeStocksRuntimeService:
                 Ai_block_adds=False,
                 Ai_blocked_reason=None,
             )
+        strategy_eval_started = perf_counter()
         try:
             strategy_result = self._strategy_runner(
                 strategy_input=BismillahTrobotStocksV1Input(
@@ -1258,6 +1286,7 @@ class PrimeStocksRuntimeService:
                 bars_processed_execution=len(bar_set.execution_bars),
                 bars_processed_trend=len(bar_set.trend_bars),
             )
+        _mark_stage("strategy_eval_ms", strategy_eval_started)
         original_candidate_action = _resolve_candidate_action(strategy_result)
         candidate_action = _resolve_forced_candidate_action(
             candidate_action=original_candidate_action,
@@ -1482,8 +1511,9 @@ class PrimeStocksRuntimeService:
                 candidate_action=candidate_action,
                 bars_processed_execution=len(bar_set.execution_bars),
                 bars_processed_trend=len(bar_set.trend_bars),
-            )
+        )
         strategy_config = _build_strategy_config(resolved_runtime_config)
+        broker_check_started = perf_counter()
         try:
             (
                 execution_result,
@@ -1533,6 +1563,7 @@ class PrimeStocksRuntimeService:
                 bars_processed_trend=len(bar_set.trend_bars),
                 ai_decision=ai_decision,
             )
+        _mark_stage("broker_check_ms", broker_check_started)
         runtime_message = _build_runtime_message(
             execution_mode=_resolve_mode(
                 resolved_runtime_config,
@@ -1542,6 +1573,7 @@ class PrimeStocksRuntimeService:
             ),
             execution_decision=execution_decision,
         )
+        writeback_started = perf_counter()
         try:
             self._runtime_store.write_runtime_result(
                 run_id=run_id,
@@ -1580,7 +1612,9 @@ class PrimeStocksRuntimeService:
                     current_total_exposure_pct=current_total_exposure_pct,
                 ),
             )
+            _mark_stage("writeback_ms", writeback_started)
         except PrimeStocksRuntimeStoreError as exc:
+            _mark_stage("writeback_ms", writeback_started)
             logger.exception(
                 "Prime Stocks runtime completed execution but Firestore result persistence failed "
                 "trigger_type=%s trigger_source=%s run_id=%s",
@@ -1623,6 +1657,7 @@ class PrimeStocksRuntimeService:
                     ai_decision=ai_decision,
                 ),
                 signal_score=signal_score,
+                timing=_runtime_timing_payload(),
                 status="degraded",
                 message=(
                     "Prime Stocks runtime reached execution but Firestore result persistence failed. "
@@ -1671,6 +1706,7 @@ class PrimeStocksRuntimeService:
                 ai_decision=ai_decision,
             ),
             signal_score=signal_score,
+            timing=_runtime_timing_payload(),
             status=strategy_result.status,
             message=runtime_message,
             bars_processed_execution=len(bar_set.execution_bars),
@@ -3223,11 +3259,12 @@ def _resolve_prime_take_profit_candidate(
     if qty is None or qty <= 0 or entry_price is None or entry_price <= 0:
         return None
 
-    threshold = _resolve_prime_take_profit_threshold(
+    threshold_metadata = _resolve_prime_take_profit_threshold_metadata(
         runtime_config=runtime_config,
         strategy_result=strategy_result,
         entry_price=entry_price,
     )
+    threshold = _maybe_float(threshold_metadata.get("tp_threshold"))
     if threshold is None or threshold <= entry_price:
         return None
 
@@ -3249,7 +3286,7 @@ def _resolve_prime_take_profit_candidate(
         "tp_mode": runtime_config.tp_mode,
         "tp_atr_mult": runtime_config.tp_atr_mult,
         "tp_percent": runtime_config.tp_percent,
-        "tp_threshold": threshold,
+        **threshold_metadata,
         **confirmation,
     }
 
@@ -3260,23 +3297,65 @@ def _resolve_prime_take_profit_threshold(
     strategy_result: PrimeStocksStrategyResult,
     entry_price: float,
 ) -> float | None:
+    threshold_metadata = _resolve_prime_take_profit_threshold_metadata(
+        runtime_config=runtime_config,
+        strategy_result=strategy_result,
+        entry_price=entry_price,
+    )
+    return _maybe_float(threshold_metadata.get("tp_threshold"))
+
+
+def _resolve_prime_take_profit_threshold_metadata(
+    *,
+    runtime_config: PrimeStocksRuntimeConfigRecord,
+    strategy_result: PrimeStocksStrategyResult,
+    entry_price: float,
+) -> dict[str, Any]:
     mode = (runtime_config.tp_mode or "atr").strip().lower()
     atr_value = _latest_series_float(strategy_result, "atr_val")
+    atr_threshold = (
+        entry_price + (atr_value * runtime_config.tp_atr_mult)
+        if atr_value is not None and atr_value > 0 and runtime_config.tp_atr_mult > 0
+        else None
+    )
+    floor_threshold = (
+        entry_price * (1.0 + (runtime_config.tp_percent / 100.0))
+        if runtime_config.tp_percent > 0
+        else None
+    )
+    threshold: float | None = None
+    floor_applied = False
+
     if mode == "atr":
-        if atr_value is not None and atr_value > 0 and runtime_config.tp_atr_mult > 0:
-            return entry_price + (atr_value * runtime_config.tp_atr_mult)
-        if runtime_config.tp_percent > 0:
-            return entry_price * (1.0 + (runtime_config.tp_percent / 100.0))
-        return None
+        if atr_threshold is not None and floor_threshold is not None:
+            threshold = max(atr_threshold, floor_threshold)
+            floor_applied = floor_threshold >= atr_threshold
+        elif atr_threshold is not None:
+            threshold = atr_threshold
+        elif floor_threshold is not None:
+            threshold = floor_threshold
+            floor_applied = True
     if mode in {"percent", "pct"}:
-        if runtime_config.tp_percent <= 0:
-            return None
-        return entry_price * (1.0 + (runtime_config.tp_percent / 100.0))
-    if mode in {"off", "none", "disabled"}:
-        return None
-    if atr_value is not None and atr_value > 0 and runtime_config.tp_atr_mult > 0:
-        return entry_price + (atr_value * runtime_config.tp_atr_mult)
-    return entry_price * (1.0 + (runtime_config.tp_percent / 100.0)) if runtime_config.tp_percent > 0 else None
+        threshold = floor_threshold
+        floor_applied = threshold is not None
+    elif mode in {"off", "none", "disabled"}:
+        threshold = None
+        floor_applied = False
+    elif mode != "atr":
+        if atr_threshold is not None:
+            threshold = atr_threshold
+        elif floor_threshold is not None:
+            threshold = floor_threshold
+            floor_applied = True
+
+    return {
+        "tp_percent_floor": runtime_config.tp_percent if floor_threshold is not None else None,
+        "atr_value": atr_value,
+        "atr_threshold": atr_threshold,
+        "floor_threshold": floor_threshold,
+        "tp_threshold": threshold,
+        "tp_floor_applied": floor_applied,
+    }
 
 
 def _resolve_prime_take_profit_confirmation(
