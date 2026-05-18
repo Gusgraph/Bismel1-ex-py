@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
@@ -29,6 +29,13 @@ _SAFETY_ORDER = {"unsafe": 0, "caution": 1, "safe": 2}
 
 class GeminiAiScoringError(RuntimeError):
     """Raised when Gemini scoring cannot produce a normalized AI result."""
+
+
+@dataclass(frozen=True)
+class GeminiAiScoringResult:
+    record: AiCacheRecord
+    usage_metadata: dict[str, int | None]
+    raw_response_status: str = "success"
 
 
 class HttpJsonGenerateProtocol(Protocol):
@@ -49,8 +56,7 @@ class UrllibGeminiGenerateClient(HttpJsonGenerateProtocol):
             with urlopen(request, timeout=27) as response:
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise GeminiAiScoringError(f"Gemini API HTTP {exc.code}: {detail}") from exc
+            raise GeminiAiScoringError(f"Gemini API HTTP {exc.code}") from exc
         except URLError as exc:
             raise GeminiAiScoringError(f"Gemini API request failed: {exc.reason}") from exc
 
@@ -78,6 +84,23 @@ class GeminiAiScoringService:
         context: str | None = None,
         updated_at: datetime | None = None,
     ) -> AiCacheRecord:
+        return self.score_headline_with_metadata(
+            scope=scope,
+            headline=headline,
+            symbol=symbol,
+            context=context,
+            updated_at=updated_at,
+        ).record
+
+    def score_headline_with_metadata(
+        self,
+        *,
+        scope: str,
+        headline: str,
+        symbol: str | None = None,
+        context: str | None = None,
+        updated_at: datetime | None = None,
+    ) -> GeminiAiScoringResult:
         resolved_scope = scope.strip().lower()
         resolved_symbol = None if symbol is None else symbol.strip().upper() or None
         prompt = self._build_prompt(scope=resolved_scope, symbol=resolved_symbol, headline=headline, context=context)
@@ -92,12 +115,15 @@ class GeminiAiScoringService:
         response = self._http_client.generate(url=url, payload=payload)
         text = _extract_response_text(response)
         normalized = normalize_ai_classification_payload(json.loads(text))
-        return build_ai_cache_record(
-            scope=resolved_scope,
-            symbol=resolved_symbol,
-            ai_payload=normalized,
-            updated_at=updated_at or datetime.now(tz=UTC),
-            source=f"gemini:{self._model}",
+        return GeminiAiScoringResult(
+            record=build_ai_cache_record(
+                scope=resolved_scope,
+                symbol=resolved_symbol,
+                ai_payload=normalized,
+                updated_at=updated_at or datetime.now(tz=UTC),
+                source=f"gemini:{self._model}",
+            ),
+            usage_metadata=extract_usage_metadata(response),
         )
 
     def _build_prompt(self, *, scope: str, symbol: str | None, headline: str, context: str | None) -> str:
@@ -113,6 +139,9 @@ class GeminiAiScoringService:
             "- Ai_sentiment_label: bullish, neutral, or bearish\n"
             "- Ai_safety_label: safe, caution, or unsafe\n"
             "- Ai_confidence: decimal from 0.0 to 1.0\n"
+            "- setup_support_label: supports_entry, neutral, or caution\n"
+            "- entry_support_score: integer from 0 to 100\n"
+            "- caution_score: integer from 0 to 100\n"
             "- Ai_reason: one short sentence under 27 words\n"
             f"Headline: {headline.strip()}{context_line}"
         )
@@ -130,12 +159,22 @@ def normalize_ai_classification_payload(payload: dict[str, object]) -> dict[str,
         safety = "unsafe"
     safety = _normalize_label(safety, allowed=_SAFETY_ORDER, default="caution")
     confidence = _clamp_confidence(payload.get("Ai_confidence"))
+    setup_support_label = _normalize_label(
+        str(payload.get("setup_support_label", "neutral")),
+        allowed={"supports_entry": 2, "neutral": 1, "caution": 0},
+        default="neutral",
+    )
+    entry_support_score = _clamp_score(payload.get("entry_support_score"), default=_default_entry_support_score(sentiment))
+    caution_score = _clamp_score(payload.get("caution_score"), default=_default_caution_score(safety=safety, sentiment=sentiment))
     reason = str(payload.get("Ai_reason", "")).strip() or "Gemini classification returned no explicit reason."
     return {
         "Ai_regime_label": regime,
         "Ai_sentiment_label": sentiment,
         "Ai_safety_label": safety,
         "Ai_confidence": confidence,
+        "setup_support_label": setup_support_label,
+        "entry_support_score": entry_support_score,
+        "caution_score": caution_score,
         "Ai_reason": reason,
     }
 
@@ -149,8 +188,11 @@ def build_ai_cache_record(
     source: str,
 ) -> AiCacheRecord:
     blocked_reason = _resolve_ai_blocked_reason(ai_payload)
-    block_new_entries = blocked_reason in {"ai_safety_unsafe", "ai_regime_risk_off", "ai_sentiment_bearish"}
-    block_adds = blocked_reason in {"ai_safety_unsafe", "ai_regime_risk_off"}
+    block_new_entries = blocked_reason == "ai_safety_unsafe"
+    block_adds = blocked_reason == "ai_safety_unsafe"
+    expires_at = (updated_at.astimezone(UTC) + timedelta(minutes=60)).isoformat()
+    sentiment = str(ai_payload.get("Ai_sentiment_label", "neutral"))
+    safety = str(ai_payload.get("Ai_safety_label", "caution"))
     return AiCacheRecord(
         scope=scope,
         symbol=symbol,
@@ -167,6 +209,10 @@ def build_ai_cache_record(
         Ai_blocked_reason=blocked_reason,
         is_stale=False,
         is_available=True,
+        setup_support_label=str(ai_payload.get("setup_support_label", "neutral")),
+        entry_support_score=float(ai_payload.get("entry_support_score", _default_entry_support_score(sentiment))),
+        caution_score=float(ai_payload.get("caution_score", _default_caution_score(safety=safety, sentiment=sentiment))),
+        expires_at=expires_at,
     )
 
 
@@ -231,6 +277,9 @@ def merge_ai_cache_records(
         symbol_record=checked_symbol,
         is_stale=False,
         is_available=True,
+        setup_support_label=checked_symbol.setup_support_label,
+        entry_support_score=checked_symbol.entry_support_score,
+        caution_score=max(checked_market.caution_score, checked_symbol.caution_score),
     )
 
 
@@ -269,6 +318,9 @@ def _blocked_ai_decision(
         symbol_record=symbol_record,
         is_stale=reason == "ai_cache_stale",
         is_available=reason != "ai_cache_unavailable",
+        setup_support_label="neutral",
+        entry_support_score=50.0,
+        caution_score=75.0 if reason == "ai_cache_stale" else 50.0,
     )
 
 
@@ -291,26 +343,41 @@ def _mark_record_staleness(
 def _extract_response_text(payload: dict[str, object]) -> str:
     candidates = payload.get("candidates")
     if not isinstance(candidates, list) or len(candidates) == 0:
-        raise GeminiAiScoringError(f"Gemini API returned no candidates: {payload}")
+        raise GeminiAiScoringError("Gemini API returned no candidates.")
 
     first_candidate = candidates[0]
     if not isinstance(first_candidate, dict):
-        raise GeminiAiScoringError(f"Gemini API candidate was not an object: {payload}")
+        raise GeminiAiScoringError("Gemini API candidate was not an object.")
 
     content = first_candidate.get("content")
     if not isinstance(content, dict):
-        raise GeminiAiScoringError(f"Gemini API candidate content missing: {payload}")
+        raise GeminiAiScoringError("Gemini API candidate content missing.")
 
     parts = content.get("parts")
     if not isinstance(parts, list):
-        raise GeminiAiScoringError(f"Gemini API candidate parts missing: {payload}")
+        raise GeminiAiScoringError("Gemini API candidate parts missing.")
 
     combined = "".join(
         [part["text"] for part in parts if isinstance(part, dict) and isinstance(part.get("text"), str)]
     ).strip()
     if combined == "":
-        raise GeminiAiScoringError(f"Gemini API returned empty text: {payload}")
+        raise GeminiAiScoringError("Gemini API returned empty text.")
     return combined
+
+
+def extract_usage_metadata(payload: dict[str, object]) -> dict[str, int | None]:
+    usage = payload.get("usageMetadata")
+    if not isinstance(usage, dict):
+        return {
+            "input_tokens": None,
+            "output_tokens": None,
+            "total_tokens": None,
+        }
+    return {
+        "input_tokens": _optional_int(usage.get("promptTokenCount")),
+        "output_tokens": _optional_int(usage.get("candidatesTokenCount")),
+        "total_tokens": _optional_int(usage.get("totalTokenCount")),
+    }
 
 
 def _resolve_ai_blocked_reason(ai_payload: dict[str, object]) -> str | None:
@@ -334,6 +401,35 @@ def _clamp_confidence(value: object) -> float:
     except (TypeError, ValueError):
         return 0.0
     return max(0.0, min(1.0, resolved))
+
+
+def _clamp_score(value: object, *, default: float) -> float:
+    try:
+        resolved = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, min(100.0, resolved))
+
+
+def _default_entry_support_score(sentiment: str) -> float:
+    return {"bullish": 70.0, "neutral": 50.0, "bearish": 25.0}.get(sentiment, 50.0)
+
+
+def _default_caution_score(*, safety: str, sentiment: str) -> float:
+    if safety == "unsafe":
+        return 100.0
+    if safety == "caution" or sentiment == "bearish":
+        return 70.0
+    return 30.0
+
+
+def _optional_int(value: object) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _select_label(values: list[str], *, ordering: dict[str, int], default: str) -> str:

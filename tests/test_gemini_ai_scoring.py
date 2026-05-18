@@ -16,11 +16,15 @@ from datetime import UTC, datetime, timedelta
 from app.products.stocks.bismel1.models import AiCacheRecord
 from app.services.firestore_runtime_store import PrimeStocksFirestoreRuntimeStore
 from app.services.gemini_ai_scoring import (
+    GeminiAiScoringResult,
     GeminiAiScoringService,
     build_ai_cache_record,
+    extract_usage_metadata,
     merge_ai_cache_records,
     normalize_ai_classification_payload,
 )
+from app.services.gemini_market_intelligence import GeminiMarketIntelligenceRefreshService
+from app.services.gemini_runtime_diagnostics import build_gemini_runtime_event, run_gemini_smoke_test
 from app.shared.config import AppConfig
 
 
@@ -71,6 +75,160 @@ def test_gemini_scoring_service_returns_normalized_record() -> None:
     assert record.Ai_blocked_reason is None
 
 
+def test_gemini_usage_metadata_extracts_token_counts() -> None:
+    usage = extract_usage_metadata(
+        {
+            "usageMetadata": {
+                "promptTokenCount": 12,
+                "candidatesTokenCount": 8,
+                "totalTokenCount": 20,
+            }
+        }
+    )
+
+    assert usage == {"input_tokens": 12, "output_tokens": 8, "total_tokens": 20}
+
+
+def test_gemini_runtime_event_is_sanitized() -> None:
+    event = build_gemini_runtime_event(
+        source="smoke_test",
+        product_code="prime_stocks",
+        symbol="AAPL",
+        model="gemini-test",
+        prompt="Return JSON only.",
+        response_status="success",
+        parsed_status="ok",
+        usage_metadata={"input_tokens": 4, "output_tokens": 3, "total_tokens": 7},
+        latency_ms=42,
+        sanitized_summary={"status": "ok"},
+    )
+
+    assert event["prompt_hash"] != "Return JSON only."
+    assert "raw_prompt" not in event
+    assert "raw_response" not in event
+    assert event["input_tokens"] == 4
+    assert event["total_tokens"] == 7
+
+
+def test_gemini_smoke_test_writes_sanitized_event_and_summary() -> None:
+    settings = _settings()
+    fake_client = FakeFirestoreClient()
+    store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    result = run_gemini_smoke_test(
+        settings=settings,
+        api_key="test-key",
+        model="gemini-2.5-flash-lite",
+        store=store,
+        http_client=FakeGeminiClient(
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": '{"status":"ok","service":"gemini-smoke"}'
+                                }
+                            ]
+                        }
+                    }
+                ],
+                "usageMetadata": {
+                    "promptTokenCount": 10,
+                    "candidatesTokenCount": 5,
+                    "totalTokenCount": 15,
+                },
+            }
+        ),
+    )
+
+    assert result["ok"] is True
+    assert result["total_tokens"] == 15
+    summary = fake_client.storage["runtime_products"]["prime_stocks"]["ai_runtime"]["current"]
+    assert summary["last_response_status"] == "success"
+    events = fake_client.storage["runtime_products"]["prime_stocks"]["ai_runtime_events"]
+    event = next(iter(events.values()))
+    assert event["source"] == "smoke_test"
+    assert "raw_response" not in event
+
+
+def test_gemini_smoke_test_records_missing_key_without_secret_leak() -> None:
+    settings = _settings()
+    fake_client = FakeFirestoreClient()
+    store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+
+    result = run_gemini_smoke_test(settings=settings, api_key="", store=store)
+
+    assert result["ok"] is False
+    assert result["error_category"] == "missing_key"
+    assert "key" in result["error_message_safe"].lower()
+    event = next(iter(fake_client.storage["runtime_products"]["prime_stocks"]["ai_runtime_events"].values()))
+    assert "api_key" not in str(event).lower()
+    assert "secret" not in str(event).lower()
+
+
+def test_shared_gemini_refresh_dedupes_symbols_and_skips_fresh_cache(monkeypatch) -> None:
+    settings = _settings()
+    fake_client = FakeFirestoreClient()
+    store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    scorer = FakeSymbolScorer()
+    now = datetime(2026, 5, 18, 14, 0, tzinfo=UTC)
+    monkeypatch.setenv("AI_REFRESH_SYMBOLS", "AAPL,MSFT,AAPL")
+
+    service = GeminiMarketIntelligenceRefreshService(
+        settings=settings,
+        store=store,
+        scorer=scorer,
+        now_provider=lambda: now,
+    )
+    result = service.refresh(symbols=["AAPL", "NVDA", "MSFT"], force=False)
+
+    assert result.ok is True
+    assert result.symbols_discovered == 3
+    assert result.symbols_refreshed == 3
+    assert scorer.symbol_calls == ["AAPL", "MSFT", "NVDA"]
+    assert "users" not in str(fake_client.storage)
+    assert "client_order_id" not in str(scorer.prompts).lower()
+
+    second = service.refresh(symbols=["AAPL", "NVDA", "MSFT"], force=False)
+
+    assert second.symbols_refreshed == 0
+    assert second.symbols_skipped_fresh == 3
+
+
+def test_ai_cache_is_advisory_for_bearish_but_unsafe_can_be_flagged() -> None:
+    bearish = build_ai_cache_record(
+        scope="symbol",
+        symbol="AAPL",
+        ai_payload={
+            "Ai_regime_label": "neutral",
+            "Ai_sentiment_label": "bearish",
+            "Ai_safety_label": "caution",
+            "Ai_confidence": 0.8,
+            "Ai_reason": "Weak headline.",
+        },
+        updated_at=datetime.now(tz=UTC),
+        source="gemini:test",
+    )
+    unsafe = build_ai_cache_record(
+        scope="symbol",
+        symbol="MSFT",
+        ai_payload={
+            "Ai_regime_label": "neutral",
+            "Ai_sentiment_label": "neutral",
+            "Ai_safety_label": "unsafe",
+            "Ai_confidence": 0.9,
+            "Ai_reason": "High uncertainty.",
+        },
+        updated_at=datetime.now(tz=UTC),
+        source="gemini:test",
+    )
+
+    assert bearish.Ai_block_new_entries is False
+    assert bearish.entry_support_score < 50
+    assert unsafe.Ai_block_new_entries is True
+    assert unsafe.Ai_blocked_reason == "ai_safety_unsafe"
+
+
 def test_firestore_runtime_store_reads_and_writes_ai_cache_records() -> None:
     settings = _settings()
     fake_client = FakeFirestoreClient()
@@ -95,7 +253,8 @@ def test_firestore_runtime_store_reads_and_writes_ai_cache_records() -> None:
     assert loaded is not None
     assert loaded.symbol == "AAPL"
     assert loaded.Ai_sentiment_label == "bearish"
-    assert loaded.Ai_block_new_entries is True
+    assert loaded.Ai_block_new_entries is False
+    assert loaded.entry_support_score < 50
 
 
 def test_merge_ai_cache_records_blocks_when_symbol_record_is_missing() -> None:
@@ -178,6 +337,45 @@ class FakeGeminiClient:
         assert "gemini-2.5-flash-lite" in url
         assert payload["generationConfig"]["responseMimeType"] == "application/json"
         return self.payload
+
+
+class FakeSymbolScorer:
+    def __init__(self) -> None:
+        self.symbol_calls: list[str] = []
+        self.prompts: list[str] = []
+
+    def score_headline_with_metadata(
+        self,
+        *,
+        scope: str,
+        headline: str,
+        symbol: str | None = None,
+        context: str | None = None,
+        updated_at: datetime | None = None,
+    ) -> GeminiAiScoringResult:
+        self.prompts.append(" ".join([headline, context or ""]))
+        if scope == "symbol" and symbol is not None:
+            self.symbol_calls.append(symbol)
+        record = build_ai_cache_record(
+            scope=scope,
+            symbol=symbol,
+            ai_payload={
+                "Ai_regime_label": "risk_on",
+                "Ai_sentiment_label": "bullish",
+                "Ai_safety_label": "safe",
+                "Ai_confidence": 0.84,
+                "Ai_reason": "Constructive shared context.",
+                "setup_support_label": "supports_entry",
+                "entry_support_score": 82,
+                "caution_score": 18,
+            },
+            updated_at=updated_at or datetime.now(tz=UTC),
+            source="gemini:test",
+        )
+        return GeminiAiScoringResult(
+            record=record,
+            usage_metadata={"input_tokens": 7, "output_tokens": 5, "total_tokens": 12},
+        )
 
 
 class FakeSnapshot:
@@ -274,6 +472,7 @@ def _settings() -> AppConfig:
         prime_stocks_test_mode=False,
         prime_stocks_test_trigger=None,
         prime_stocks_test_symbol_override=None,
+        prime_stocks_strategy_mode="scalper",
         prime_stocks_execution_bar_limit=351,
         prime_stocks_trend_bar_limit=221,
         prime_stocks_first_lot_notional=101.0,
@@ -291,6 +490,7 @@ def _settings() -> AppConfig:
         prime_stocks_scheduler_timezone="Etc/UTC",
         prime_stocks_scheduler_header_name="X-Prime-Stocks-Scheduler",
         prime_stocks_scheduler_header_value="secret-value",
+        prime_stocks_scheduler_preview_workers=6,
         prime_stocks_ping_scheduler_job_name="prime-stocks-ping",
         prime_stocks_ping_scheduler_schedule="*/1 * * * *",
         prime_stocks_ping_scheduler_timezone="Etc/UTC",

@@ -146,6 +146,10 @@ class AiCacheRecord:
     Ai_blocked_reason: str | None
     is_stale: bool = False
     is_available: bool = True
+    setup_support_label: str = "neutral"
+    entry_support_score: float = 50.0
+    caution_score: float = 50.0
+    expires_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -165,6 +169,9 @@ class PrimeStocksAiDecision:
     symbol_record: AiCacheRecord | None = None
     is_stale: bool = False
     is_available: bool = True
+    setup_support_label: str = "neutral"
+    entry_support_score: float = 50.0
+    caution_score: float = 50.0
 
 
 @dataclass(frozen=True)

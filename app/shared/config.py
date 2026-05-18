@@ -93,6 +93,10 @@ class AppConfig:
     admin_runtime_monitor_crypto_order_test_symbol: str = "BTC/USD"
     admin_runtime_monitor_order_test_notional: float = 10.0
     admin_runtime_monitor_order_test_enabled: bool = False
+    ai_market_cache_ttl_minutes: int = 60
+    ai_symbol_cache_ttl_minutes: int = 60
+    ai_refresh_max_symbols: int = 80
+    ai_safety_hard_block_enabled: bool = False
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -216,4 +220,8 @@ def get_settings() -> AppConfig:
             os.getenv("ADMIN_RUNTIME_MONITOR_ORDER_TEST_NOTIONAL", "10.0")
         ),
         admin_runtime_monitor_order_test_enabled=_env_flag("ADMIN_RUNTIME_MONITOR_ORDER_TEST_ENABLED", False),
+        ai_market_cache_ttl_minutes=int(os.getenv("AI_MARKET_CACHE_TTL_MINUTES", "60")),
+        ai_symbol_cache_ttl_minutes=int(os.getenv("AI_SYMBOL_CACHE_TTL_MINUTES", "60")),
+        ai_refresh_max_symbols=max(1, int(os.getenv("AI_REFRESH_MAX_SYMBOLS", "80"))),
+        ai_safety_hard_block_enabled=_env_flag("AI_SAFETY_HARD_BLOCK_ENABLED", False),
     )

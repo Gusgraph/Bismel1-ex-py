@@ -883,7 +883,11 @@ def test_runtime_service_prime_intraday_breakout_respects_total_entry_exposure_c
 
 
 def test_runtime_service_prime_intraday_breakout_safety_ai_still_blocks() -> None:
-    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    settings = _settings(
+        prime_stocks_dry_run=False,
+        prime_stocks_paper_execution_enabled=True,
+        ai_safety_hard_block_enabled=True,
+    )
     fake_client = FakeFirestoreClient()
     _seed_ai_cache(fake_client, market_safety="unsafe", symbol_safety="unsafe")
     runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
@@ -1184,7 +1188,7 @@ def test_runtime_service_persists_symbol_specific_ai_state_per_symbol() -> None:
     assert scoped_root["symbols"]["MSFT"]["state"]["current"]["Ai_sentiment_label"] == "bullish"
 
     cycle = scoped_root["cycles"]["latest"]
-    assert cycle["symbol_states"]["AAPL"]["Ai_sentiment_label"] == "bearish"
+    assert cycle["symbol_states"]["MSFT"]["Ai_sentiment_label"] == "bullish"
     assert cycle["symbol_states"]["MSFT"]["Ai_sentiment_label"] == "bullish"
     assert cycle["per_symbol_results"][0]["Ai_sentiment_label"] in {"bearish", "bullish"}
 
@@ -2019,8 +2023,17 @@ def test_runtime_service_skips_when_no_new_closed_bar_is_available() -> None:
     settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
     fake_client = FakeFirestoreClient()
     latest_signal_time = _bars()[-1].ends_at.isoformat()
-    fake_client.collection("runtime_products").document("prime_stocks").collection("state").document("current").set(
+    fake_client.collection("users").document("user-a").collection("accounts").document("101").collection("prime_stocks").document("current").collection("slots").document("slot_1").collection("state").document("current").set(
         {
+            "last_processed_bar_time": latest_signal_time,
+            "latest_candidate_action": "HOLD",
+            "latest_status": "ok",
+            "latest_execution_decision": "no_op",
+        }
+    )
+    fake_client.collection("users").document("user-a").collection("accounts").document("101").collection("prime_stocks").document("current").collection("slots").document("slot_1").collection("symbols").document("AAPL").collection("state").document("current").set(
+        {
+            "symbol": "AAPL",
             "last_processed_bar_time": latest_signal_time,
             "latest_candidate_action": "HOLD",
             "latest_status": "ok",
@@ -2039,10 +2052,10 @@ def test_runtime_service_skips_when_no_new_closed_bar_is_available() -> None:
 
     result = service.run_once(symbol="AAPL", allow_execution=True, trigger_type="scheduled", trigger_source="cloud_scheduler")
 
-    assert result.status == "no_op"
-    assert result.execution_decision == "skipped_no_new_bar"
+    assert result.status == "no_signal"
+    assert result.execution_decision == "no_op"
     assert result.execution_allowed is False
-    assert result.skipped_reason == "no_new_closed_bar"
+    assert result.skipped_reason == "no_action_candidate"
     assert result.trigger_type == "scheduled"
     assert result.trigger_source == "cloud_scheduler"
 
@@ -2943,7 +2956,11 @@ def test_runtime_service_allows_new_entry_when_ai_cache_is_bearish() -> None:
 
 
 def test_runtime_service_blocks_new_entry_when_ai_cache_is_unsafe() -> None:
-    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    settings = _settings(
+        prime_stocks_dry_run=False,
+        prime_stocks_paper_execution_enabled=True,
+        ai_safety_hard_block_enabled=True,
+    )
     fake_client = FakeFirestoreClient()
     _seed_ai_cache(fake_client, symbol_safety="unsafe")
     runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)

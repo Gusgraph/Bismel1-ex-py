@@ -20,6 +20,8 @@ from fastapi import FastAPI, HTTPException, Request, status
 
 from app.runtime.execution import build_execution_runtime_service
 from app.runtime.prime_stocks_dry_run import build_prime_stocks_runtime_service
+from app.services.gemini_market_intelligence import GeminiMarketIntelligenceRefreshService
+from app.services.gemini_runtime_diagnostics import run_gemini_smoke_test
 from app.shared.config import get_settings
 from app.shared.logging import configure_logging
 
@@ -266,6 +268,46 @@ def trigger_execution_runtime(
     return result.__dict__
 
 
+@app.post("/runtime/gemini/smoke-test")
+def trigger_gemini_smoke_test(request: Request) -> dict[str, object]:
+    _validate_runtime_request(request=request)
+    result = run_gemini_smoke_test(settings=settings)
+    return {
+        "ok": result.get("ok"),
+        "source": result.get("source"),
+        "product_code": result.get("product_code"),
+        "model": result.get("model"),
+        "response_status": result.get("response_status"),
+        "parsed_status": result.get("parsed_status"),
+        "input_tokens": result.get("input_tokens"),
+        "output_tokens": result.get("output_tokens"),
+        "total_tokens": result.get("total_tokens"),
+        "latency_ms": result.get("latency_ms"),
+        "error_category": result.get("error_category"),
+        "error_message_safe": result.get("error_message_safe"),
+    }
+
+
+@app.post("/runtime/gemini/refresh")
+def trigger_gemini_market_intelligence_refresh(
+    request: Request,
+    force: bool = False,
+    symbol: str | None = None,
+) -> dict[str, object]:
+    _validate_runtime_request(request=request)
+    service = GeminiMarketIntelligenceRefreshService(settings=settings)
+    result = service.refresh(symbols=[] if symbol is None else [symbol], force=force)
+    return {
+        "ok": result.ok,
+        "market_refreshed": result.market_refreshed,
+        "symbols_discovered": result.symbols_discovered,
+        "symbols_refreshed": result.symbols_refreshed,
+        "symbols_skipped_fresh": result.symbols_skipped_fresh,
+        "errors": result.errors,
+        "tokens_used": result.tokens_used,
+    }
+
+
 def _validate_scheduler_request(*, request: Request | None, expected_header_value: str | None = None) -> None:
     if expected_header_value is None:
         expected_header_value = settings.prime_stocks_scheduler_header_value
@@ -474,7 +516,7 @@ def _run_scheduled_fanout(
         ranked_candidates = sorted(
             [preview for preview in preview_results if preview.candidate_action == "FirstLot"],
             key=lambda preview: (
-                float(getattr(preview, "signal_score", 0.0) or 0.0),
+                _ai_adjusted_signal_score(preview),
                 preview.latest_signal_time or "",
                 preview.symbol,
             ),
@@ -489,6 +531,7 @@ def _run_scheduled_fanout(
                     {
                         "symbol": preview.symbol,
                         "signal_score": getattr(preview, "signal_score", None),
+                        "ai_adjusted_signal_score": _ai_adjusted_signal_score(preview),
                         "candidate_action": preview.candidate_action,
                     }
                     for preview in ranked_candidates
@@ -719,3 +762,20 @@ def _run_execution_scheduled_fanout(
         "slots_failed": slots_failed,
         "results": results,
     }
+
+
+def _ai_adjusted_signal_score(preview) -> float:
+    base_score = float(getattr(preview, "signal_score", 0.0) or 0.0)
+    ai_payload = getattr(preview, "ai", None)
+    if not isinstance(ai_payload, dict):
+        return base_score
+    symbol_record = ai_payload.get("symbol_record")
+    if not isinstance(symbol_record, dict):
+        return base_score
+    try:
+        entry_support = float(symbol_record.get("entry_support_score", 50.0))
+        caution_score = float(symbol_record.get("caution_score", 50.0))
+    except (TypeError, ValueError):
+        return base_score
+    boost = max(-0.2, min(0.2, ((entry_support - 50.0) - (caution_score - 50.0) * 0.5) / 250.0))
+    return base_score + boost

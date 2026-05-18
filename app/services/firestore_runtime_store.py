@@ -122,6 +122,8 @@ class PrimeStocksRuntimeStorePaths:
     notification_state_document: str
     ai_market_document: str
     ai_symbols_collection: str
+    ai_runtime_summary_document: str
+    ai_runtime_events_collection: str
     symbol_state_document: str | None = None
 
 
@@ -400,6 +402,8 @@ class PrimeStocksFirestoreRuntimeStore:
             notification_state_document=f"{root}/notification_state/current",
             ai_market_document=f"{root}/ai_market/current",
             ai_symbols_collection=f"{root}/ai_symbols",
+            ai_runtime_summary_document=f"{root}/ai_runtime/current",
+            ai_runtime_events_collection=f"{root}/ai_runtime_events",
             symbol_state_document=None if symbol_root is None else f"{symbol_root}/state/current",
         )
 
@@ -973,6 +977,44 @@ class PrimeStocksFirestoreRuntimeStore:
             path=path,
             fn=lambda: self._ai_symbols_collection().document(symbol_document_id).set(payload, merge=True),
         )
+
+    def write_ai_runtime_event(self, payload: dict[str, object]) -> str:
+        now = datetime.now(tz=UTC)
+        event_id = f"{now.strftime('%Y%m%dT%H%M%S%fZ')}-{uuid4().hex[:10]}"
+        safe_payload = {
+            **payload,
+            "id": event_id,
+            "created_at": payload.get("created_at") or now.isoformat(),
+            "updated_at": now.isoformat(),
+        }
+        self._firestore_call(
+            action="write ai runtime event",
+            path=f"{self.get_paths().ai_runtime_events_collection}/{event_id}",
+            fn=lambda: self._ai_runtime_events_collection().document(event_id).set(safe_payload, merge=False),
+        )
+        summary_payload = {
+            "last_event_id": event_id,
+            "last_source": safe_payload.get("source"),
+            "last_product_code": safe_payload.get("product_code"),
+            "last_symbol": safe_payload.get("symbol"),
+            "last_model": safe_payload.get("model"),
+            "last_response_status": safe_payload.get("response_status"),
+            "last_parsed_status": safe_payload.get("parsed_status"),
+            "last_error_category": safe_payload.get("error_category"),
+            "last_error_message_safe": safe_payload.get("error_message_safe"),
+            "last_input_tokens": safe_payload.get("input_tokens"),
+            "last_output_tokens": safe_payload.get("output_tokens"),
+            "last_total_tokens": safe_payload.get("total_tokens"),
+            "last_latency_ms": safe_payload.get("latency_ms"),
+            "last_updated_at": safe_payload.get("created_at"),
+            "updated_at": now.isoformat(),
+        }
+        self._firestore_call(
+            action="write ai runtime summary",
+            path=self.get_paths().ai_runtime_summary_document,
+            fn=lambda: self._ai_runtime_summary_document().set(summary_payload, merge=True),
+        )
+        return event_id
 
     def write_runtime_result(
         self,
@@ -2086,6 +2128,12 @@ class PrimeStocksFirestoreRuntimeStore:
     def _ai_symbols_collection(self) -> Any:
         return self._collection_ref(self.get_paths().ai_symbols_collection)
 
+    def _ai_runtime_summary_document(self) -> Any:
+        return self._document_ref(self.get_paths().ai_runtime_summary_document)
+
+    def _ai_runtime_events_collection(self) -> Any:
+        return self._collection_ref(self.get_paths().ai_runtime_events_collection)
+
     def prime_stocks_performance_base_path(self, *, uid: str, account_id: int) -> str:
         resolved_uid = uid.strip()
         if resolved_uid == "":
@@ -2803,6 +2851,12 @@ def _serialize_ai_cache_record(record: AiCacheRecord) -> dict[str, Any]:
         "Ai_block_new_entries": record.Ai_block_new_entries,
         "Ai_block_adds": record.Ai_block_adds,
         "Ai_blocked_reason": record.Ai_blocked_reason,
+        "setup_support_label": record.setup_support_label,
+        "entry_support_score": record.entry_support_score,
+        "caution_score": record.caution_score,
+        "expires_at": record.expires_at,
+        "stale": record.is_stale,
+        "source": record.Ai_source,
     }
 
 
@@ -2997,6 +3051,10 @@ def _deserialize_ai_cache_record(payload: dict[str, Any]) -> AiCacheRecord:
         Ai_block_new_entries=bool(payload.get("Ai_block_new_entries", False)),
         Ai_block_adds=bool(payload.get("Ai_block_adds", False)),
         Ai_blocked_reason=_maybe_string(payload.get("Ai_blocked_reason")),
+        setup_support_label=str(payload.get("setup_support_label", "neutral")).strip().lower(),
+        entry_support_score=float(payload.get("entry_support_score", 50.0)),
+        caution_score=float(payload.get("caution_score", 50.0)),
+        expires_at=_maybe_string(payload.get("expires_at")),
     )
 
 

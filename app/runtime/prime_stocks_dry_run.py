@@ -1252,6 +1252,33 @@ class PrimeStocksRuntimeService:
                 Ai_block_adds=False,
                 Ai_blocked_reason=None,
             )
+        if not ai_decision.is_available:
+            logger.warning(
+                "Prime Stocks runtime continuing with advisory unavailable AI cache "
+                "trigger_type=%s trigger_source=%s run_id=%s symbol=%s",
+                trigger_type,
+                trigger_source,
+                run_id,
+                resolved_runtime_config.symbol,
+            )
+            ai_decision = replace(
+                ai_decision,
+                Ai_execution_allowed=True,
+                Ai_block_new_entries=False,
+                Ai_block_adds=False,
+                Ai_blocked_reason=None,
+            )
+        if (
+            ai_decision.Ai_blocked_reason == "ai_safety_unsafe"
+            and not self._settings.ai_safety_hard_block_enabled
+        ):
+            ai_decision = replace(
+                ai_decision,
+                Ai_execution_allowed=True,
+                Ai_block_new_entries=False,
+                Ai_block_adds=False,
+                Ai_blocked_reason=None,
+            )
         strategy_eval_started = perf_counter()
         try:
             strategy_result = self._strategy_runner(
