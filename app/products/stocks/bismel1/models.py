@@ -183,6 +183,7 @@ class PrimeStocksStrategyResult:
     execution_allowed: bool = False
     execution_timeframe: str = "1H"
     trend_timeframe: str = "1D"
+    entry_branch_metadata: dict[str, object] | None = None
 
 
 

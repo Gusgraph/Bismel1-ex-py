@@ -64,6 +64,9 @@ PRIME_DIAGNOSTIC_ACTIONS = {
     PRIME_DIAGNOSTIC_ATR_REVIEW,
     PRIME_DIAGNOSTIC_REGIME_REVIEW,
 }
+PRIME_INTRADAY_BREAKOUT_SCALP_BRANCH = "prime_intraday_breakout_scalp"
+PRIME_INTRADAY_BREAKOUT_SCALP_REASON = "intraday_breakout_scalp"
+PRIME_INTRADAY_CUSTOMER_LABEL = "Prime Intraday Setup"
 ADMIN_CRYPTO_MONITOR_UIDS = frozenset({"admin-runtime-monitor-prime", "admin-runtime-monitor-execution"})
 ADMIN_CRYPTO_MONITOR_SYMBOLS = frozenset({"UNI/USD", "LINK/USD"})
 POSITION_RESIDUAL_QTY_THRESHOLD = 0.000001
@@ -1288,8 +1291,29 @@ class PrimeStocksRuntimeService:
             )
         _mark_stage("strategy_eval_ms", strategy_eval_started)
         original_candidate_action = _resolve_candidate_action(strategy_result)
+        candidate_action = original_candidate_action
+        if original_candidate_action == "HOLD":
+            intraday_branch_metadata = _resolve_prime_intraday_breakout_scalp_metadata(
+                execution_bars=bar_set.execution_bars,
+                trend_bars=bar_set.trend_bars,
+            )
+            if intraday_branch_metadata is not None:
+                if intraday_branch_metadata.get("qualified") is True:
+                    candidate_action = "FirstLot"
+                    strategy_result = replace(
+                        strategy_result,
+                        status="signal",
+                        message="Prime Intraday Setup qualified after fresh intraday confirmation.",
+                        entry_branch_metadata=intraday_branch_metadata,
+                    )
+                else:
+                    strategy_result = replace(
+                        strategy_result,
+                        entry_branch_metadata=intraday_branch_metadata,
+                    )
+        pre_forced_candidate_action = candidate_action
         candidate_action = _resolve_forced_candidate_action(
-            candidate_action=original_candidate_action,
+            candidate_action=candidate_action,
             runtime_config=resolved_runtime_config,
             settings=self._settings,
         )
@@ -1306,11 +1330,21 @@ class PrimeStocksRuntimeService:
             None if latest_signal_time is None else latest_signal_time.astimezone(UTC).isoformat(),
             run_id,
         )
-        if candidate_action != original_candidate_action:
+        if pre_forced_candidate_action != original_candidate_action:
+            logger.info(
+                "Prime Stocks intraday branch candidate resolved original_candidate_action=%s branch_candidate_action=%s "
+                "trigger_type=%s trigger_source=%s run_id=%s",
+                original_candidate_action,
+                pre_forced_candidate_action,
+                trigger_type,
+                trigger_source,
+                run_id,
+            )
+        if candidate_action != pre_forced_candidate_action:
             logger.warning(
                 "Prime Stocks runtime force-candidate override applied original_candidate_action=%s forced_candidate_action=%s "
                 "trigger_type=%s trigger_source=%s run_id=%s",
-                original_candidate_action,
+                pre_forced_candidate_action,
                 candidate_action,
                 trigger_type,
                 trigger_source,
@@ -1339,7 +1373,11 @@ class PrimeStocksRuntimeService:
                 trigger_source,
                 run_id,
             )
-        ai_blocked_decision = _resolve_ai_blocked_candidate_action(candidate_action=candidate_action, ai_decision=ai_decision)
+        ai_blocked_decision = _resolve_ai_blocked_candidate_action(
+            candidate_action=candidate_action,
+            ai_decision=ai_decision,
+            strategy_result=strategy_result,
+        )
         if _ai_validation_bypass_enabled(resolved_runtime_config) and ai_blocked_decision is not None:
             logger.warning(
                 "Prime Stocks runtime validation-only AI bypass ignored blocked candidate_action=%s trigger_type=%s trigger_source=%s run_id=%s",
@@ -1985,7 +2023,21 @@ class PrimeStocksRuntimeService:
             except AlpacaPaperTradingError as exc:
                 return None, exc.code, exc.code, False, state_retry_count + int(getattr(exc, "retry_count", 0)), exc.code, exc.message, current_total_exposure_pct
             total_retry_count = state_retry_count + submit_retry_count
-            result = replace(result, retry_count=total_retry_count)
+            entry_branch_metadata = getattr(strategy_result, "entry_branch_metadata", None)
+            if isinstance(entry_branch_metadata, dict) and entry_branch_metadata.get("qualified") is True:
+                raw_response = result.raw_response if isinstance(result.raw_response, dict) else {}
+                result = replace(
+                    result,
+                    retry_count=total_retry_count,
+                    raw_response={
+                        **raw_response,
+                        "entry_branch": entry_branch_metadata.get("entry_branch"),
+                        "entry_reason": entry_branch_metadata.get("entry_reason"),
+                        "customer_setup_label": entry_branch_metadata.get("customer_setup_label"),
+                    },
+                )
+            else:
+                result = replace(result, retry_count=total_retry_count)
             invalid_execution_result = _validate_successful_execution_result(result=result, candidate_action=candidate_action)
             if invalid_execution_result is not None:
                 return None, invalid_execution_result.code, invalid_execution_result.code, False, total_retry_count, invalid_execution_result.code, invalid_execution_result.message, current_total_exposure_pct
@@ -2871,6 +2923,99 @@ def _resolve_candidate_action(strategy_result) -> str:
     return "HOLD"
 
 
+def _is_prime_intraday_branch_result(strategy_result: PrimeStocksStrategyResult | None) -> bool:
+    metadata = getattr(strategy_result, "entry_branch_metadata", None)
+    return isinstance(metadata, dict) and metadata.get("entry_branch") == PRIME_INTRADAY_BREAKOUT_SCALP_BRANCH
+
+
+def _resolve_prime_intraday_breakout_scalp_metadata(
+    *,
+    execution_bars: list[Any],
+    trend_bars: list[Any],
+) -> dict[str, Any] | None:
+    if len(execution_bars) < 9:
+        return None
+
+    latest_bar = execution_bars[-1]
+    prior_bars = execution_bars[-9:-1]
+    latest_close = _maybe_float(getattr(latest_bar, "close", None))
+    latest_open = _maybe_float(getattr(latest_bar, "open", None))
+    latest_high = _maybe_float(getattr(latest_bar, "high", None))
+    latest_low = _maybe_float(getattr(latest_bar, "low", None))
+    previous_close = _maybe_float(getattr(prior_bars[-1], "close", None)) if prior_bars else None
+    if latest_close is None or latest_close <= 0 or previous_close is None or previous_close <= 0:
+        return None
+
+    prior_highs = [_maybe_float(getattr(bar, "high", None)) for bar in prior_bars]
+    prior_closes = [_maybe_float(getattr(bar, "close", None)) for bar in prior_bars]
+    valid_prior_highs = [value for value in prior_highs if value is not None and value > 0]
+    valid_prior_closes = [value for value in prior_closes if value is not None and value > 0]
+    if not valid_prior_highs or len(valid_prior_closes) < 5:
+        return None
+
+    recent_range_high = max(valid_prior_highs)
+    recent_range_low = min(_maybe_float(getattr(bar, "low", None)) or recent_range_high for bar in prior_bars)
+    latest_bar_return_pct = ((latest_close - previous_close) / previous_close) * 100.0
+    recent_range_move_pct = ((latest_close - recent_range_low) / recent_range_low) * 100.0 if recent_range_low > 0 else 0.0
+    daily_move_pct = _resolve_latest_daily_move_pct(trend_bars)
+
+    latest_range = (latest_high - latest_low) if latest_high is not None and latest_low is not None else None
+    range_close_ratio = (
+        (latest_close - latest_low) / latest_range
+        if latest_range is not None and latest_range > 0 and latest_low is not None
+        else 1.0
+    )
+    short_ma = sum(valid_prior_closes[-5:]) / 5.0
+
+    latest_volume = _maybe_float(getattr(latest_bar, "volume", None))
+    prior_volumes = [_maybe_float(getattr(bar, "volume", None)) for bar in prior_bars]
+    valid_prior_volumes = [value for value in prior_volumes if value is not None and value > 0]
+    average_volume = sum(valid_prior_volumes) / len(valid_prior_volumes) if valid_prior_volumes else None
+    volume_ratio = latest_volume / average_volume if latest_volume is not None and average_volume and average_volume > 0 else None
+    volume_confirmed = volume_ratio is None or volume_ratio >= 1.05
+
+    strong_daily_move = daily_move_pct is not None and daily_move_pct >= 2.0
+    strong_recent_momentum = latest_bar_return_pct >= 0.75 or recent_range_move_pct >= 1.5
+    has_strong_mover_input = strong_daily_move or strong_recent_momentum
+    if not has_strong_mover_input:
+        return None
+
+    breakout_confirmed = latest_close > (recent_range_high * 1.001)
+    short_ma_confirmed = latest_close >= short_ma
+    no_sharp_reversal = range_close_ratio >= 0.55 and (latest_open is None or latest_close >= latest_open * 0.998)
+    qualified = bool(breakout_confirmed and short_ma_confirmed and no_sharp_reversal and volume_confirmed)
+    reason_code = PRIME_INTRADAY_BREAKOUT_SCALP_REASON if qualified else "intraday_confirmation_missing"
+
+    return {
+        "entry_branch": PRIME_INTRADAY_BREAKOUT_SCALP_BRANCH,
+        "entry_reason": reason_code,
+        "customer_setup_label": PRIME_INTRADAY_CUSTOMER_LABEL,
+        "qualified": qualified,
+        "daily_move_pct": round(daily_move_pct, 4) if daily_move_pct is not None else None,
+        "latest_bar_return_pct": round(latest_bar_return_pct, 4),
+        "recent_range_move_pct": round(recent_range_move_pct, 4),
+        "recent_range_high": round(recent_range_high, 6),
+        "latest_close": round(latest_close, 6),
+        "breakout_confirmed": breakout_confirmed,
+        "short_ma_confirmed": short_ma_confirmed,
+        "volume_confirmed": volume_confirmed,
+        "volume_ratio": round(volume_ratio, 4) if volume_ratio is not None else None,
+        "range_close_ratio": round(range_close_ratio, 4),
+        "no_sharp_reversal": no_sharp_reversal,
+    }
+
+
+def _resolve_latest_daily_move_pct(trend_bars: list[Any]) -> float | None:
+    if not trend_bars:
+        return None
+    latest_trend_bar = trend_bars[-1]
+    trend_open = _maybe_float(getattr(latest_trend_bar, "open", None))
+    trend_close = _maybe_float(getattr(latest_trend_bar, "close", None))
+    if trend_open is None or trend_open <= 0 or trend_close is None or trend_close <= 0:
+        return None
+    return ((trend_close - trend_open) / trend_open) * 100.0
+
+
 def _prime_diagnostic_reason(candidate_action: str) -> str | None:
     if candidate_action in {PRIME_DIAGNOSTIC_ATR_REVIEW, "EXIT_ATR"}:
         return "atr_review"
@@ -2888,10 +3033,12 @@ def _prime_diagnostic_summary(candidate_action: str) -> str | None:
     return None
 
 
-def _resolve_ai_blocked_candidate_action(*, candidate_action: str, ai_decision) -> str | None:
+def _resolve_ai_blocked_candidate_action(*, candidate_action: str, ai_decision, strategy_result: PrimeStocksStrategyResult | None = None) -> str | None:
     if ai_decision is None:
         return None
     if candidate_action == "FirstLot" and ai_decision.Ai_block_new_entries:
+        if _is_prime_intraday_branch_result(strategy_result) and ai_decision.Ai_blocked_reason != "ai_safety_unsafe":
+            return None
         return ai_decision.Ai_blocked_reason or "ai_blocked"
     if candidate_action.startswith("MULTI-") and ai_decision.Ai_block_adds:
         return ai_decision.Ai_blocked_reason or "ai_blocked"
@@ -2927,6 +3074,19 @@ def _build_strategy_reasoning(
     confirmation = latest_signal.base_entry_trigger or latest_signal.add_trigger
     trigger_active = latest_signal.base_entry_trigger or latest_signal.add_trigger or latest_signal.hit_atr_trail or latest_signal.hit_regime
     setup_valid = bool(latest_signal.base_entry_signal)
+    entry_branch_metadata = getattr(strategy_result, "entry_branch_metadata", None)
+    if not isinstance(entry_branch_metadata, dict):
+        entry_branch_metadata = None
+    intraday_branch_active = (
+        entry_branch_metadata is not None
+        and entry_branch_metadata.get("entry_branch") == PRIME_INTRADAY_BREAKOUT_SCALP_BRANCH
+        and entry_branch_metadata.get("qualified") is True
+    )
+    intraday_branch_reviewed = entry_branch_metadata is not None and entry_branch_metadata.get("entry_branch") == PRIME_INTRADAY_BREAKOUT_SCALP_BRANCH
+    if intraday_branch_active:
+        confirmation = True
+        trigger_active = True
+        setup_valid = True
     strategy_mode = str(getattr(strategy_result, "strategy_mode", "scalper")).strip().lower()
     trend_weight = 1.0 if trend_ok else 0.7 if strategy_mode == "scalper" else 0.7
 
@@ -2945,7 +3105,10 @@ def _build_strategy_reasoning(
         bias_state = "Neutral"
 
     if candidate_action == "FirstLot":
-        trigger_state = "Buy" if latest_signal.base_entry_trigger else ("Waiting" if latest_signal.base_entry_signal else "No signal")
+        if intraday_branch_active:
+            trigger_state = "Buy"
+        else:
+            trigger_state = "Buy" if latest_signal.base_entry_trigger else ("Waiting" if latest_signal.base_entry_signal else "No signal")
     elif candidate_action.startswith("MULTI-"):
         trigger_state = "Add" if latest_signal.add_trigger else "Waiting"
     elif candidate_action in PRIME_DIAGNOSTIC_ACTIONS or latest_signal.hit_atr_trail or latest_signal.hit_regime:
@@ -2996,7 +3159,9 @@ def _build_strategy_reasoning(
     elif latest_signal.hit_atr_trail:
         primary_reason = "Non-executable review signal: ATR condition observed. Prime closes only by take profit."
     elif candidate_action == "FirstLot":
-        if strategy_mode == "trend" and not trend_ok:
+        if intraday_branch_active:
+            primary_reason = "Prime Intraday Setup passed intraday confirmation."
+        elif strategy_mode == "trend" and not trend_ok:
             primary_reason = "Against 1D bias."
         elif strategy_mode == "scalper" and not trend_ok:
             primary_reason = "Against trend (scalper mode)."
@@ -3013,6 +3178,8 @@ def _build_strategy_reasoning(
             primary_reason = "Add gates aligned."
     elif latest_signal.base_entry_signal:
         primary_reason = "15M setup is developing on the latest closed bar."
+    elif intraday_branch_reviewed and entry_branch_metadata.get("entry_reason") == "intraday_confirmation_missing":
+        primary_reason = "Watching for Setup. The symbol was reviewed. No qualified setup yet."
     else:
         primary_reason = "No setup on the latest closed bar."
 
@@ -3024,7 +3191,7 @@ def _build_strategy_reasoning(
         "execution_timeframe": strategy_result.execution_timeframe,
         "trend_timeframe": strategy_result.trend_timeframe,
         "strategy_context": f"{strategy_result.execution_timeframe} closed bars + {strategy_result.trend_timeframe} trend",
-        "setup_context": "Reversal" if reversal_context else ("Continuation" if continuation_context else "Neutral"),
+        "setup_context": PRIME_INTRADAY_CUSTOMER_LABEL if intraday_branch_reviewed else ("Reversal" if reversal_context else ("Continuation" if continuation_context else "Neutral")),
         "trend_1d": trend_1d,
         "bias_state": bias_state,
         "trend_weight": trend_weight,
@@ -3041,6 +3208,10 @@ def _build_strategy_reasoning(
         "trigger_active": trigger_active,
         "diagnostic_reason": _prime_diagnostic_reason(candidate_action),
         "diagnostic_executable": False if _prime_diagnostic_reason(candidate_action) is not None else None,
+        "entry_branch": entry_branch_metadata.get("entry_branch") if entry_branch_metadata is not None else None,
+        "entry_reason": entry_branch_metadata.get("entry_reason") if entry_branch_metadata is not None else None,
+        "entry_setup_label": entry_branch_metadata.get("customer_setup_label") if entry_branch_metadata is not None else None,
+        "intraday_breakout": entry_branch_metadata,
     }
 
 

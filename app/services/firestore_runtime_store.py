@@ -41,6 +41,8 @@ PRIME_DIAGNOSTIC_ACTIONS = {
     PRIME_DIAGNOSTIC_ATR_REVIEW,
     PRIME_DIAGNOSTIC_REGIME_REVIEW,
 }
+PRIME_INTRADAY_BREAKOUT_SCALP_BRANCH = "prime_intraday_breakout_scalp"
+PRIME_INTRADAY_CUSTOMER_LABEL = "Prime Intraday Setup"
 
 
 class PrimeStocksRuntimeStoreError(RuntimeError):
@@ -87,11 +89,11 @@ class PrimeStocksRuntimeConfigRecord:
     entitlement: dict[str, Any] = field(default_factory=dict)
     safe_mode_enabled: bool = False
     safe_mode_size_pct: float = 100.0
-    live_cap_pct: float = 3.0
+    live_cap_pct: float = 7.3
     max_total_exposure_pct: float = 70.0
-    per_symbol_entry_pct: float = 3.0
-    total_entry_exposure_cap_pct: float = 20.0
-    total_add_exposure_cap_pct: float = 70.0
+    per_symbol_entry_pct: float = 7.3
+    total_entry_exposure_cap_pct: float = 27.0
+    total_add_exposure_cap_pct: float = 85.0
     global_kill_switch_enabled: bool = False
     account_kill_switch_enabled: bool = False
     tp_mode: str = "atr"
@@ -196,11 +198,27 @@ def _build_strategy_reasoning_payload(
     setup_ready_series = _series_list("setup_ready")
     setup_age_bars_series = _series_list("setup_age_bars")
     setup_invalidated_series = _series_list("setup_invalidated")
+    reversal_context_series = _series_list("reversal_context")
+    continuation_context_series = _series_list("continuation_context")
     setup_ready = bool(setup_ready_series[latest_index]) if latest_index < len(setup_ready_series) else False
     setup_age_bars = setup_age_bars_series[latest_index] if latest_index < len(setup_age_bars_series) else None
     setup_invalidated = bool(setup_invalidated_series[latest_index]) if latest_index < len(setup_invalidated_series) else False
+    reversal_context = bool(reversal_context_series[latest_index]) if latest_index < len(reversal_context_series) else False
+    continuation_context = bool(continuation_context_series[latest_index]) if latest_index < len(continuation_context_series) else False
     confirmation = bool(latest_signal.base_entry_trigger or latest_signal.add_trigger)
     setup_valid = bool(latest_signal.base_entry_signal)
+    entry_branch_metadata = getattr(strategy_result, "entry_branch_metadata", None)
+    if not isinstance(entry_branch_metadata, dict):
+        entry_branch_metadata = None
+    intraday_branch_active = (
+        entry_branch_metadata is not None
+        and entry_branch_metadata.get("entry_branch") == PRIME_INTRADAY_BREAKOUT_SCALP_BRANCH
+        and entry_branch_metadata.get("qualified") is True
+    )
+    intraday_branch_reviewed = entry_branch_metadata is not None and entry_branch_metadata.get("entry_branch") == PRIME_INTRADAY_BREAKOUT_SCALP_BRANCH
+    if intraday_branch_active:
+        confirmation = True
+        setup_valid = True
     strategy_mode = str(getattr(strategy_result, "strategy_mode", "scalper")).strip().lower()
     trend_weight = 1.0 if trend_ok else 0.7
 
@@ -219,7 +237,10 @@ def _build_strategy_reasoning_payload(
         bias_state = "Neutral"
 
     if candidate_action == "FirstLot":
-        trigger_state = "Buy" if latest_signal.base_entry_trigger else ("Waiting" if latest_signal.base_entry_signal else "No signal")
+        if intraday_branch_active:
+            trigger_state = "Buy"
+        else:
+            trigger_state = "Buy" if latest_signal.base_entry_trigger else ("Waiting" if latest_signal.base_entry_signal else "No signal")
     elif candidate_action.startswith("MULTI-"):
         trigger_state = "Add" if latest_signal.add_trigger else "Waiting"
     elif candidate_action in PRIME_DIAGNOSTIC_ACTIONS or latest_signal.hit_atr_trail or latest_signal.hit_regime:
@@ -270,7 +291,9 @@ def _build_strategy_reasoning_payload(
     elif latest_signal.hit_atr_trail:
         primary_reason = "Non-executable review signal: ATR condition observed. Prime closes only by take profit."
     elif candidate_action == "FirstLot":
-        if strategy_mode == "trend" and not trend_ok:
+        if intraday_branch_active:
+            primary_reason = "Prime Intraday Setup passed intraday confirmation."
+        elif strategy_mode == "trend" and not trend_ok:
             primary_reason = "Against 1D bias."
         elif strategy_mode == "scalper" and not trend_ok:
             primary_reason = "Against trend (scalper mode)."
@@ -287,6 +310,8 @@ def _build_strategy_reasoning_payload(
             primary_reason = "Add gates aligned."
     elif latest_signal.base_entry_signal:
         primary_reason = "15M setup is developing on the latest closed bar."
+    elif intraday_branch_reviewed and entry_branch_metadata.get("entry_reason") == "intraday_confirmation_missing":
+        primary_reason = "Watching for Setup. The symbol was reviewed. No qualified setup yet."
     else:
         primary_reason = "No setup on the latest closed bar."
 
@@ -296,6 +321,7 @@ def _build_strategy_reasoning_payload(
         "execution_timeframe": strategy_result.execution_timeframe,
         "trend_timeframe": strategy_result.trend_timeframe,
         "strategy_context": f"{strategy_result.execution_timeframe} closed bars + {strategy_result.trend_timeframe} trend",
+        "setup_context": PRIME_INTRADAY_CUSTOMER_LABEL if intraday_branch_reviewed else ("Reversal" if reversal_context else ("Continuation" if continuation_context else "Neutral")),
         "trend_1d": trend_1d,
         "bias_state": bias_state,
         "trend_weight": trend_weight,
@@ -312,6 +338,10 @@ def _build_strategy_reasoning_payload(
         "signal_score": latest_signal_score,
         "diagnostic_reason": _prime_diagnostic_reason(candidate_action),
         "diagnostic_executable": False if _prime_diagnostic_reason(candidate_action) is not None else None,
+        "entry_branch": entry_branch_metadata.get("entry_branch") if entry_branch_metadata is not None else None,
+        "entry_reason": entry_branch_metadata.get("entry_reason") if entry_branch_metadata is not None else None,
+        "entry_setup_label": entry_branch_metadata.get("customer_setup_label") if entry_branch_metadata is not None else None,
+        "intraday_breakout": entry_branch_metadata,
     }
 
 

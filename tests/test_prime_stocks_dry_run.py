@@ -718,7 +718,193 @@ def test_runtime_service_submits_first_lot_buy_when_paper_enabled() -> None:
     assert result.order_submitted is True
     assert result.order_status == "accepted"
     assert paper_trading.calls[-1]["action"] == "FirstLot"
-    assert paper_trading.calls[-1]["notional"] == 300.0
+    assert paper_trading.calls[-1]["notional"] == 730.0
+
+
+def test_runtime_service_prime_intraday_breakout_creates_first_lot_candidate() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading()
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketDataWithBars(
+            execution_bars=_intraday_bars(confirmed=True),
+            trend_bars=_daily_move_bars(strong=True),
+        ),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("HOLD"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.execution_decision == "submitted_buy"
+    assert result.candidate_action == "FirstLot"
+    assert result.order_submitted is True
+    assert result.strategy_reasoning is not None
+    assert result.strategy_reasoning["entry_branch"] == "prime_intraday_breakout_scalp"
+    assert result.strategy_reasoning["entry_reason"] == "intraday_breakout_scalp"
+    assert result.strategy_reasoning["setup_context"] == "Prime Intraday Setup"
+    assert result.strategy_reasoning["primary_reason"] == "Prime Intraday Setup passed intraday confirmation."
+    assert paper_trading.calls[-1]["notional"] == 730.0
+
+
+def test_runtime_service_prime_intraday_strong_move_without_confirmation_holds() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading()
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketDataWithBars(
+            execution_bars=_intraday_bars(confirmed=False),
+            trend_bars=_daily_move_bars(strong=True),
+        ),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("HOLD"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.execution_decision == "no_op"
+    assert result.order_submitted is False
+    assert result.skipped_reason == "no_action_candidate"
+    assert result.strategy_reasoning is not None
+    assert result.strategy_reasoning["entry_reason"] == "intraday_confirmation_missing"
+    assert result.strategy_reasoning["primary_reason"] == "Watching for Setup. The symbol was reviewed. No qualified setup yet."
+    assert not any(call["action"] == "FirstLot" for call in paper_trading.calls)
+
+
+def test_runtime_service_prime_intraday_breakout_existing_position_blocks_duplicate_entry() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=FakeFirestoreClient())
+    paper_trading = FakePaperTrading(
+        submission_state=AlpacaPaperSubmissionState(
+            account=AlpacaPaperAccountState(
+                buying_power=1000.0,
+                open_positions_count=1,
+                equity=10000.0,
+                total_exposure=500.0,
+            ),
+            asset=AlpacaPaperAssetState(symbol="AAPL", tradable=True, status="active"),
+            position=AlpacaPaperPositionState(symbol="AAPL", qty=1.0, market_value=500.0),
+        )
+    )
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketDataWithBars(
+            execution_bars=_intraday_bars(confirmed=True),
+            trend_bars=_daily_move_bars(strong=True),
+        ),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("HOLD"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.execution_decision == "base_position_exists"
+    assert result.order_submitted is False
+    assert not any(call["action"] == "FirstLot" for call in paper_trading.calls)
+
+
+def test_runtime_service_prime_intraday_breakout_pending_order_blocks_duplicate_entry() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    execution_bars = _intraday_bars(confirmed=True)
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=FakeFirestoreClient())
+    paper_trading = FakePaperTrading(
+        recent_orders=[
+            {
+                "symbol": "AAPL",
+                "side": "buy",
+                "type": "market",
+                "status": "accepted",
+                "created_at": execution_bars[-1].ends_at.isoformat(),
+            }
+        ]
+    )
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketDataWithBars(
+            execution_bars=execution_bars,
+            trend_bars=_daily_move_bars(strong=True),
+        ),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("HOLD"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.execution_decision == "skipped_duplicate"
+    assert result.skipped_reason == "duplicate_firstlot_order"
+    assert result.order_submitted is False
+    assert not any(call["action"] == "FirstLot" for call in paper_trading.calls)
+
+
+def test_runtime_service_prime_intraday_breakout_respects_total_entry_exposure_cap() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=FakeFirestoreClient())
+    paper_trading = FakePaperTrading(
+        submission_state=AlpacaPaperSubmissionState(
+            account=AlpacaPaperAccountState(
+                buying_power=1000.0,
+                open_positions_count=2,
+                equity=10000.0,
+                total_exposure=2600.0,
+            ),
+            asset=AlpacaPaperAssetState(symbol="AAPL", tradable=True, status="active"),
+            position=None,
+        )
+    )
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketDataWithBars(
+            execution_bars=_intraday_bars(confirmed=True),
+            trend_bars=_daily_move_bars(strong=True),
+        ),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("HOLD"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.execution_decision == "prime_total_entry_budget_reached"
+    assert result.order_submitted is False
+    assert not any(call["action"] == "FirstLot" for call in paper_trading.calls)
+
+
+def test_runtime_service_prime_intraday_breakout_safety_ai_still_blocks() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    _seed_ai_cache(fake_client, market_safety="unsafe", symbol_safety="unsafe")
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading()
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketDataWithBars(
+            execution_bars=_intraday_bars(confirmed=True),
+            trend_bars=_daily_move_bars(strong=True),
+        ),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("HOLD"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.execution_decision == "ai_safety_unsafe"
+    assert result.order_submitted is False
+    assert not any(call["action"] == "FirstLot" for call in paper_trading.calls)
 
 
 def test_runtime_service_can_force_candidate_action_for_validation() -> None:
@@ -2485,7 +2671,7 @@ def test_runtime_service_persists_runtime_state_after_first_lot_buy() -> None:
     assert result.execution_decision == "submitted_buy"
     assert state["position_open"] is True
     assert state["position_size"] > 0.0
-    assert state["dollars_used"] == 300.0
+    assert state["dollars_used"] == 730.0
     assert state["add_count"] == 0
     assert state["last_entry_time"] == _bars()[-1].ends_at.isoformat()
     assert state["latest_execution_decision"] == "submitted_buy"
@@ -3463,6 +3649,52 @@ def _bars_with_latest_price(*, high: float, close: float) -> list[PriceBar]:
     return bars
 
 
+def _intraday_bars(*, confirmed: bool = True, sharp_reversal: bool = False) -> list[PriceBar]:
+    start = datetime.now(tz=UTC).replace(second=0, microsecond=0) - timedelta(minutes=15 * 11)
+    closes = [100.0, 100.2, 100.1, 100.4, 100.3, 100.6, 100.7, 100.8, 100.9, 101.0, 102.35 if confirmed else 101.05]
+    bars: list[PriceBar] = []
+    for index, close in enumerate(closes):
+        high = close + 0.12
+        low = close - 0.45
+        open_price = close - 0.18
+        if index == len(closes) - 1:
+            high = 102.6 if confirmed else 101.2
+            low = 101.7 if confirmed else 100.65
+            open_price = 101.8 if confirmed else 100.95
+            if sharp_reversal:
+                high = 103.0
+                close = 101.2
+                low = 101.0
+                open_price = 102.7
+        bars.append(
+            PriceBar(
+                starts_at=start + timedelta(minutes=15 * index),
+                ends_at=start + timedelta(minutes=15 * (index + 1)),
+                open=open_price,
+                high=high,
+                low=low,
+                close=close,
+                volume=1000.0 if index < len(closes) - 1 else 1300.0,
+            )
+        )
+    return bars
+
+
+def _daily_move_bars(*, strong: bool = True) -> list[PriceBar]:
+    bars = _bars()
+    latest = bars[-1]
+    bars[-1] = PriceBar(
+        starts_at=latest.starts_at,
+        ends_at=latest.ends_at,
+        open=100.0,
+        high=105.0 if strong else 101.0,
+        low=99.0,
+        close=103.0 if strong else 100.5,
+        volume=latest.volume,
+    )
+    return bars
+
+
 def _strategy_result(
     candidate_action: str,
     *,
@@ -3765,6 +3997,9 @@ def _settings(**overrides) -> AppConfig:
         prime_stocks_max_open_positions=None,
         prime_stocks_broker_retry_max_attempts=1,
         prime_stocks_force_candidate_action=None,
+        prime_stocks_live_cap_pct=7.3,
+        prime_stocks_total_entry_exposure_cap_pct=27.0,
+        prime_stocks_total_add_exposure_cap_pct=85.0,
         prime_stocks_scheduler_job_name="prime-stocks-scheduled",
         prime_stocks_scheduler_region="us-central1",
         prime_stocks_scheduler_schedule="5 * * * 1-5",
