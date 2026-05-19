@@ -718,7 +718,7 @@ def test_runtime_service_submits_first_lot_buy_when_paper_enabled() -> None:
     assert result.order_submitted is True
     assert result.order_status == "accepted"
     assert paper_trading.calls[-1]["action"] == "FirstLot"
-    assert paper_trading.calls[-1]["notional"] == 730.0
+    assert paper_trading.calls[-1]["notional"] == 530.0
 
 
 def test_runtime_service_prime_intraday_breakout_creates_first_lot_candidate() -> None:
@@ -748,7 +748,7 @@ def test_runtime_service_prime_intraday_breakout_creates_first_lot_candidate() -
     assert result.strategy_reasoning["entry_reason"] == "intraday_breakout_scalp"
     assert result.strategy_reasoning["setup_context"] == "Prime Intraday Setup"
     assert result.strategy_reasoning["primary_reason"] == "Prime Intraday Setup passed intraday confirmation."
-    assert paper_trading.calls[-1]["notional"] == 730.0
+    assert paper_trading.calls[-1]["notional"] == 530.0
 
 
 def test_runtime_service_prime_intraday_strong_move_without_confirmation_holds() -> None:
@@ -857,7 +857,7 @@ def test_runtime_service_prime_intraday_breakout_respects_total_entry_exposure_c
                 buying_power=1000.0,
                 open_positions_count=2,
                 equity=10000.0,
-                total_exposure=2600.0,
+                total_exposure=3600.0,
             ),
             asset=AlpacaPaperAssetState(symbol="AAPL", tradable=True, status="active"),
             position=None,
@@ -1552,6 +1552,107 @@ def test_runtime_service_prime_first_lot_respects_total_entry_budget() -> None:
 
     assert result.execution_decision == "prime_total_entry_budget_reached"
     assert result.order_submitted is False
+
+
+def test_runtime_service_prime_defaults_allow_seventh_first_lot_entry() -> None:
+    settings = _settings(
+        prime_stocks_dry_run=False,
+        prime_stocks_paper_execution_enabled=True,
+    )
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=FakeFirestoreClient())
+    paper_trading = FakePaperTrading(
+        submission_state=AlpacaPaperSubmissionState(
+            account=AlpacaPaperAccountState(
+                buying_power=1000.0,
+                open_positions_count=6,
+                equity=1000.0,
+                total_exposure=318.0,
+            ),
+            asset=AlpacaPaperAssetState(symbol="AAPL", tradable=True, status="active"),
+            position=None,
+        )
+    )
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("FirstLot", in_position_before=False),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.execution_decision == "submitted_buy"
+    assert result.order_submitted is True
+    buy_call = next(call for call in paper_trading.calls if call["action"] == "FirstLot")
+    assert abs(float(buy_call["notional"]) - 53.0) < 0.01
+
+
+def test_runtime_service_prime_defaults_block_eighth_first_lot_entry() -> None:
+    settings = _settings(
+        prime_stocks_dry_run=False,
+        prime_stocks_paper_execution_enabled=True,
+    )
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=FakeFirestoreClient())
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=FakePaperTrading(
+            submission_state=AlpacaPaperSubmissionState(
+                account=AlpacaPaperAccountState(
+                    buying_power=1000.0,
+                    open_positions_count=7,
+                    equity=1000.0,
+                    total_exposure=371.0,
+                ),
+                asset=AlpacaPaperAssetState(symbol="AAPL", tradable=True, status="active"),
+                position=None,
+            )
+        ),
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("FirstLot", in_position_before=False),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.execution_decision == "prime_total_entry_budget_reached"
+    assert result.order_submitted is False
+
+
+def test_runtime_service_prime_defaults_allow_adds_up_to_ninety_five_percent_cap() -> None:
+    settings = _settings(
+        prime_stocks_dry_run=False,
+        prime_stocks_paper_execution_enabled=True,
+    )
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=FakeFirestoreClient())
+    paper_trading = FakePaperTrading(
+        submission_state=AlpacaPaperSubmissionState(
+            account=AlpacaPaperAccountState(
+                buying_power=1000.0,
+                open_positions_count=1,
+                equity=1000.0,
+                total_exposure=800.0,
+            ),
+            asset=AlpacaPaperAssetState(symbol="AAPL", tradable=True, status="active"),
+            position=AlpacaPaperPositionState(symbol="AAPL", qty=1.0, market_value=876.0),
+        )
+    )
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("MULTI-1"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.execution_decision == "submitted_buy"
+    assert result.order_submitted is True
+    assert any(call["action"] == "MULTI-1" for call in paper_trading.calls)
 
 
 def test_runtime_service_prime_add_respects_total_add_budget() -> None:
@@ -2684,7 +2785,7 @@ def test_runtime_service_persists_runtime_state_after_first_lot_buy() -> None:
     assert result.execution_decision == "submitted_buy"
     assert state["position_open"] is True
     assert state["position_size"] > 0.0
-    assert state["dollars_used"] == 730.0
+    assert state["dollars_used"] == 530.0
     assert state["add_count"] == 0
     assert state["last_entry_time"] == _bars()[-1].ends_at.isoformat()
     assert state["latest_execution_decision"] == "submitted_buy"
@@ -4014,9 +4115,9 @@ def _settings(**overrides) -> AppConfig:
         prime_stocks_max_open_positions=None,
         prime_stocks_broker_retry_max_attempts=1,
         prime_stocks_force_candidate_action=None,
-        prime_stocks_live_cap_pct=7.3,
-        prime_stocks_total_entry_exposure_cap_pct=27.0,
-        prime_stocks_total_add_exposure_cap_pct=85.0,
+        prime_stocks_live_cap_pct=5.3,
+        prime_stocks_total_entry_exposure_cap_pct=37.1,
+        prime_stocks_total_add_exposure_cap_pct=95.0,
         prime_stocks_scheduler_job_name="prime-stocks-scheduled",
         prime_stocks_scheduler_region="us-central1",
         prime_stocks_scheduler_schedule="5 * * * 1-5",
