@@ -33,10 +33,18 @@ from app.products.stocks.bismel1.models import (
     PriceBar,
     PrimeStocksStrategyResult,
 )
-from app.runtime.prime_stocks_dry_run import PrimeStocksRuntimeService, _position_has_broker_quantity, _position_is_residual, _position_is_strategy_managed_open, _validate_prime_close_order_metadata
+from app.runtime.prime_stocks_dry_run import (
+    PrimeStocksRuntimeService,
+    _position_has_broker_quantity,
+    _position_is_residual,
+    _position_is_strategy_managed_open,
+    _resolve_profit_extension_decision,
+    _validate_prime_close_order_metadata,
+)
 from app.services.alpaca_account_resolver import AlpacaAccountResolutionError, ResolvedAlpacaAccountContext
 from app.services.firestore_runtime_store import (
     PrimeStocksFirestoreRuntimeStore,
+    PrimeStocksRuntimeStateRecord,
     PrimeStocksRuntimeStoreError,
     build_default_runtime_config,
     _build_strategy_reasoning_payload,
@@ -88,6 +96,7 @@ def test_dry_run_service_writes_snapshot_signal_state_and_log_records() -> None:
 
 def test_prime_final_close_guard_allows_take_profit_only() -> None:
     assert _validate_prime_close_order_metadata(candidate_action="take_profit", client_order_id="prime-take-profit-run") is None
+    assert _validate_prime_close_order_metadata(candidate_action="take_profit_extended", client_order_id="prime-tp-run") is None
     assert _validate_prime_close_order_metadata(candidate_action="EXIT_ATR", client_order_id="prime-exit-atr-run") == "prime_non_tp_close_blocked"
     assert _validate_prime_close_order_metadata(candidate_action="EXIT_REGIME", client_order_id="prime-exit-regime-run") == "prime_non_tp_close_blocked"
     assert _validate_prime_close_order_metadata(candidate_action="unknown", client_order_id="prime-unknown-run") == "prime_non_tp_close_blocked"
@@ -256,6 +265,133 @@ def test_runtime_service_submits_take_profit_when_fresh_bar_confirms_threshold()
     assert execution["market_confirmation"]["tp_percent_floor"] == 3.1
     assert execution["market_confirmation"]["tp_floor_applied"] is True
     assert execution["market_confirmation"]["floor_threshold"] == 103.1
+
+
+def test_runtime_service_holds_take_profit_extension_while_move_is_strong() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading(
+        submission_state=AlpacaPaperSubmissionState(
+            account=AlpacaPaperAccountState(buying_power=1000.0, open_positions_count=1, equity=10000.0, total_exposure=215.0),
+            asset=AlpacaPaperAssetState(symbol="AAPL", tradable=True, status="active"),
+            position=AlpacaPaperPositionState(symbol="AAPL", qty=2.0, market_value=215.0, avg_entry_price=100.0),
+        )
+    )
+    bars = _bars()
+    latest = bars[-1]
+    bars[-1] = PriceBar(
+        starts_at=latest.starts_at,
+        ends_at=latest.ends_at,
+        open=106.5,
+        high=107.0,
+        low=106.25,
+        close=107.0,
+        volume=latest.volume,
+    )
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeMarketDataWithBars(execution_bars=bars, trend_bars=_bars()),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("HOLD"),
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.candidate_action == "HOLD"
+    assert result.execution_decision == "no_op"
+    assert result.skipped_reason == "profit_extension_active"
+    assert result.order_submitted is False
+    assert not any(call["action"] == "take_profit" for call in paper_trading.calls)
+
+
+def test_prime_profit_extension_simulation_closes_on_slowdown_above_floor() -> None:
+    bars = _bars()
+    bars[-3] = replace(bars[-3], open=106.5, high=107.0, low=106.0, close=106.8)
+    bars[-2] = replace(bars[-2], open=106.6, high=106.9, low=106.1, close=106.5)
+    bars[-1] = replace(bars[-1], open=106.3, high=106.4, low=105.8, close=106.0)
+
+    decision = _resolve_profit_extension_decision(
+        enabled=True,
+        bars=bars,
+        runtime_state=PrimeStocksRuntimeStateRecord(
+            profit_extension_active=True,
+            extension_peak_price=107.0,
+            extension_bars_held=2,
+        ),
+        tp_candidate={
+            "market_confirmation_price": 106.0,
+            "market_confirmation_at": bars[-1].ends_at.isoformat(),
+            "tp_threshold": 104.0,
+        },
+        pullback_pct=0.35,
+        slowdown_bars=2,
+        max_hold_bars=6,
+        protect_tp_floor=True,
+    )
+
+    assert decision["action"] == "close_extended"
+    assert decision["slowdown_reason"] in {"pullback_from_extension_peak", "close_below_prior_close", "2_bars_failed_new_high", "reversal_bar"}
+    assert decision["tp_floor_price"] == 104.0
+
+
+def test_prime_profit_extension_simulation_protects_floor_after_extension() -> None:
+    bars = _bars()
+    bars[-1] = replace(bars[-1], open=104.5, high=104.6, low=104.0, close=104.1)
+
+    decision = _resolve_profit_extension_decision(
+        enabled=True,
+        bars=bars,
+        runtime_state=PrimeStocksRuntimeStateRecord(
+            profit_extension_active=True,
+            extension_peak_price=107.0,
+            extension_bars_held=3,
+        ),
+        tp_candidate={
+            "market_confirmation_price": 104.1,
+            "market_confirmation_at": bars[-1].ends_at.isoformat(),
+            "tp_threshold": 104.0,
+        },
+        pullback_pct=0.35,
+        slowdown_bars=2,
+        max_hold_bars=6,
+        protect_tp_floor=True,
+    )
+
+    assert decision["action"] == "close_extended"
+    assert decision["reason"] == "protect_tp_floor"
+    assert decision["extension_active"] is False
+
+
+def test_prime_after_hours_stale_bars_do_not_submit_take_profit_even_above_floor() -> None:
+    settings = _settings(prime_stocks_dry_run=False, prime_stocks_paper_execution_enabled=True)
+    fake_client = FakeFirestoreClient()
+    runtime_store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    paper_trading = FakePaperTrading(
+        submission_state=AlpacaPaperSubmissionState(
+            account=AlpacaPaperAccountState(buying_power=1000.0, open_positions_count=1, equity=10000.0, total_exposure=215.0),
+            asset=AlpacaPaperAssetState(symbol="AAPL", tradable=True, status="active"),
+            position=AlpacaPaperPositionState(symbol="AAPL", qty=2.0, market_value=215.0, avg_entry_price=100.0),
+        )
+    )
+    stale_now = datetime.now(tz=UTC)
+    service = PrimeStocksRuntimeService(
+        settings=settings,
+        market_data=FakeStaleMarketData(),
+        runtime_store=runtime_store,
+        paper_trading=paper_trading,
+        account_resolver=FakeAccountResolver(),
+        strategy_runner=lambda **_: _strategy_result("HOLD"),
+        now_provider=lambda: stale_now,
+    )
+
+    result = service.run_once(symbol="AAPL", allow_execution=True)
+
+    assert result.execution_decision == "stale_data"
+    assert result.order_submitted is False
+    assert paper_trading.calls == []
 
 
 def test_runtime_service_does_not_submit_take_profit_from_bar_high_only() -> None:

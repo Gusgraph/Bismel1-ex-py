@@ -1256,6 +1256,460 @@ def test_execution_runtime_strategy_exit_below_entry_is_blocked_when_stop_loss_d
     assert result.client_order_id == "execution-close-test"
 
 
+def test_execution_runtime_strategy_profit_exit_below_take_profit_floor_is_blocked() -> None:
+    service = ExecutionRuntimeService(
+        settings=get_settings(),
+        runtime_store=FakeExecutionRuntimeStore(),
+        account_resolver=FakeAccountResolver(),
+        paper_trading=FakePaperTradingAdapterWithTrackedEntryPosition(avg_entry_price=100.0, qty=3.0),
+        market_data=FakeMarketDataAdapter({"AAPL": _make_bars([100, 101, 102, 103, 103, 103, 103])}),
+    )
+    runtime_request = ExecutionRuntimeRequest(
+        user_id="user-a",
+        account_id=101,
+        slot=1,
+        symbol="AAPL",
+        action="close",
+        payload={
+            "product": "execution",
+            "request_action": "close",
+            "close_reason": "strategy_exit",
+            "source_type": "selected_strategy",
+        },
+    )
+    runtime_config = ExecutionRuntimeConfig(
+        product_id="execution",
+        enabled=True,
+        execution_mode="strategy_cycle",
+        uid="user-a",
+        account_id=101,
+        slot_number=1,
+        symbol="AAPL",
+        action="close",
+        strategy_settings={"_latest_price": 103.0},
+        risk_settings={"stop_loss_enabled": False, "stop_loss_percent": 0, "take_profit_percent": 4},
+    )
+    submission_state = AlpacaPaperSubmissionState(
+        account=AlpacaPaperAccountState(buying_power=10000.0, open_positions_count=1, equity=10000.0, total_exposure=100.0),
+        asset=AlpacaPaperAssetState(symbol="AAPL", tradable=True, status="active"),
+        position=AlpacaPaperPositionState(symbol="AAPL", qty=3.0, market_value=309.0, avg_entry_price=100.0),
+    )
+
+    result = service._validate_execution_close_order(
+        runtime_request=runtime_request,
+        runtime_config=runtime_config,
+        assignment={"risk_settings": {"stop_loss_enabled": False, "stop_loss_percent": 0, "take_profit_percent": 4}},
+        client_order_id="execution-close-test",
+        submission_state=submission_state,
+    )
+
+    assert result is not None
+    assert result.submitted is False
+    assert result.broker_error_code == "execution_strategy_profit_below_tp_floor"
+    assert result.raw_response["close_guard"]["take_profit_floor"]["configured_tp_percent"] == 4
+    assert result.raw_response["close_guard"]["take_profit_floor"]["tp_threshold"] == 104.0
+    assert result.raw_response["close_guard"]["take_profit_floor"]["confirmation_price"] == 103.0
+    assert result.raw_response["close_guard"]["take_profit_floor"]["close_floor_passed"] is False
+
+
+def test_execution_runtime_strategy_profit_exit_at_take_profit_floor_is_allowed() -> None:
+    service = ExecutionRuntimeService(
+        settings=get_settings(),
+        runtime_store=FakeExecutionRuntimeStore(),
+        account_resolver=FakeAccountResolver(),
+        paper_trading=FakePaperTradingAdapterWithTrackedEntryPosition(avg_entry_price=100.0, qty=3.0),
+        market_data=FakeMarketDataAdapter({"AAPL": _make_bars([100, 101, 102, 104, 104, 104, 104])}),
+    )
+    runtime_request = ExecutionRuntimeRequest(
+        user_id="user-a",
+        account_id=101,
+        slot=1,
+        symbol="AAPL",
+        action="close",
+        payload={
+            "product": "execution",
+            "request_action": "close",
+            "close_reason": "strategy_exit",
+            "source_type": "selected_strategy",
+        },
+    )
+    runtime_config = ExecutionRuntimeConfig(
+        product_id="execution",
+        enabled=True,
+        execution_mode="strategy_cycle",
+        uid="user-a",
+        account_id=101,
+        slot_number=1,
+        symbol="AAPL",
+        action="close",
+        strategy_settings={"_latest_price": 104.0},
+        risk_settings={"stop_loss_enabled": False, "stop_loss_percent": 0, "take_profit_percent": 4},
+    )
+    submission_state = AlpacaPaperSubmissionState(
+        account=AlpacaPaperAccountState(buying_power=10000.0, open_positions_count=1, equity=10000.0, total_exposure=100.0),
+        asset=AlpacaPaperAssetState(symbol="AAPL", tradable=True, status="active"),
+        position=AlpacaPaperPositionState(symbol="AAPL", qty=3.0, market_value=312.0, avg_entry_price=100.0),
+    )
+
+    result = service._validate_execution_close_order(
+        runtime_request=runtime_request,
+        runtime_config=runtime_config,
+        assignment={"risk_settings": {"stop_loss_enabled": False, "stop_loss_percent": 0, "take_profit_percent": 4}},
+        client_order_id="execution-close-test",
+        submission_state=submission_state,
+    )
+
+    assert result is None
+
+
+def test_execution_runtime_take_profit_below_floor_is_blocked() -> None:
+    service = ExecutionRuntimeService(
+        settings=get_settings(),
+        runtime_store=FakeExecutionRuntimeStore(),
+        account_resolver=FakeAccountResolver(),
+        paper_trading=FakePaperTradingAdapterWithTrackedEntryPosition(avg_entry_price=100.0, qty=3.0),
+        market_data=FakeMarketDataAdapter({"AAPL": _make_bars([100, 101, 102, 103, 103, 103, 103])}),
+    )
+    runtime_request = ExecutionRuntimeRequest(
+        user_id="user-a",
+        account_id=101,
+        slot=1,
+        symbol="AAPL",
+        action="close",
+        payload={
+            "product": "execution",
+            "request_action": "close",
+            "close_reason": "take_profit",
+            "source_type": "selected_strategy",
+        },
+    )
+    runtime_config = ExecutionRuntimeConfig(
+        product_id="execution",
+        enabled=True,
+        execution_mode="strategy_cycle",
+        uid="user-a",
+        account_id=101,
+        slot_number=1,
+        symbol="AAPL",
+        action="close",
+        strategy_settings={"_latest_price": 103.0},
+        risk_settings={"stop_loss_enabled": False, "stop_loss_percent": 0, "take_profit_percent": 4},
+    )
+    submission_state = AlpacaPaperSubmissionState(
+        account=AlpacaPaperAccountState(buying_power=10000.0, open_positions_count=1, equity=10000.0, total_exposure=100.0),
+        asset=AlpacaPaperAssetState(symbol="AAPL", tradable=True, status="active"),
+        position=AlpacaPaperPositionState(symbol="AAPL", qty=3.0, market_value=309.0, avg_entry_price=100.0),
+    )
+
+    result = service._validate_execution_close_order(
+        runtime_request=runtime_request,
+        runtime_config=runtime_config,
+        assignment={"risk_settings": {"stop_loss_enabled": False, "stop_loss_percent": 0, "take_profit_percent": 4}},
+        client_order_id="execution-close-test",
+        submission_state=submission_state,
+    )
+
+    assert result is not None
+    assert result.submitted is False
+    assert result.broker_error_code == "execution_take_profit_below_configured_floor"
+    assert result.raw_response["close_guard"]["take_profit_floor"]["configured_tp_percent"] == 4
+    assert result.raw_response["close_guard"]["take_profit_floor"]["close_floor_passed"] is False
+
+
+def test_execution_runtime_take_profit_at_floor_is_allowed() -> None:
+    service = ExecutionRuntimeService(
+        settings=get_settings(),
+        runtime_store=FakeExecutionRuntimeStore(),
+        account_resolver=FakeAccountResolver(),
+        paper_trading=FakePaperTradingAdapterWithTrackedEntryPosition(avg_entry_price=100.0, qty=3.0),
+        market_data=FakeMarketDataAdapter({"AAPL": _make_bars([100, 101, 102, 104, 104, 104, 104])}),
+    )
+    runtime_request = ExecutionRuntimeRequest(
+        user_id="user-a",
+        account_id=101,
+        slot=1,
+        symbol="AAPL",
+        action="close",
+        payload={
+            "product": "execution",
+            "request_action": "close",
+            "close_reason": "take_profit",
+            "source_type": "selected_strategy",
+        },
+    )
+    runtime_config = ExecutionRuntimeConfig(
+        product_id="execution",
+        enabled=True,
+        execution_mode="strategy_cycle",
+        uid="user-a",
+        account_id=101,
+        slot_number=1,
+        symbol="AAPL",
+        action="close",
+        strategy_settings={"_latest_price": 104.0},
+        risk_settings={"stop_loss_enabled": False, "stop_loss_percent": 0, "take_profit_percent": 4},
+    )
+    submission_state = AlpacaPaperSubmissionState(
+        account=AlpacaPaperAccountState(buying_power=10000.0, open_positions_count=1, equity=10000.0, total_exposure=100.0),
+        asset=AlpacaPaperAssetState(symbol="AAPL", tradable=True, status="active"),
+        position=AlpacaPaperPositionState(symbol="AAPL", qty=3.0, market_value=312.0, avg_entry_price=100.0),
+    )
+
+    result = service._validate_execution_close_order(
+        runtime_request=runtime_request,
+        runtime_config=runtime_config,
+        assignment={"risk_settings": {"stop_loss_enabled": False, "stop_loss_percent": 0, "take_profit_percent": 4}},
+        client_order_id="execution-close-test",
+        submission_state=submission_state,
+    )
+
+    assert result is None
+
+
+def test_execution_runtime_configured_take_profit_closes_open_position_above_floor() -> None:
+    store = FakeExecutionRuntimeStore()
+    store.runtime_config_payload = {
+        "enabled": True,
+        "automation_enabled": True,
+        "strategy_key": "ema",
+        "strategy_settings": {
+            "fast_ema_length": 3,
+            "slow_ema_length": 5,
+            "timeframe": "15m",
+            "direction_filter": "both",
+        },
+        "risk_settings": {
+            "position_size_mode": "qty",
+            "default_qty": 1,
+            "take_profit_percent": 4,
+            "stop_loss_enabled": False,
+            "stop_loss_percent": 0,
+        },
+        "selected_symbols": ["XLE"],
+    }
+    paper_trading = FakePaperTradingAdapterWithTrackedEntryPosition(avg_entry_price=57.54, qty=17.379214459)
+    service = ExecutionRuntimeService(
+        settings=get_settings(),
+        runtime_store=store,
+        account_resolver=FakeAccountResolver(),
+        paper_trading=paper_trading,
+        market_data=FakeMarketDataAdapter({"XLE": _make_bars([61.25, 61.25, 61.25, 61.25, 61.25, 61.25, 61.25])}),
+    )
+
+    result = service.run_once({"user_id": "user-a", "account_id": 101, "slot": 1})
+
+    assert result.execution_status == "close_submitted"
+    symbol_result = next(item for item in store.writes if item.symbol == "XLE")
+    assert symbol_result.enforcement_reason == "take_profit"
+    assert symbol_result.raw_response["exit_reason"] == "take_profit"
+    assert symbol_result.raw_response["take_profit"]["configured_tp_percent"] == 4
+    assert symbol_result.raw_response["take_profit"]["tp_threshold"] == 59.8416
+    assert symbol_result.raw_response["take_profit"]["confirmation_price"] == 61.25
+    assert symbol_result.raw_response["take_profit"]["close_floor_passed"] is True
+    assert symbol_result.raw_response["profit_extension"]["action"] == "close_now"
+    assert paper_trading.submitted_qty_orders[-1]["client_order_id"].startswith("execution-close-")
+    assert paper_trading.submitted_qty_orders[-1]["qty"] == 17.379214459
+
+
+def test_execution_runtime_configured_take_profit_waits_below_floor() -> None:
+    store = FakeExecutionRuntimeStore()
+    store.runtime_config_payload = {
+        "enabled": True,
+        "automation_enabled": True,
+        "strategy_key": "ema",
+        "strategy_settings": {
+            "fast_ema_length": 3,
+            "slow_ema_length": 5,
+            "timeframe": "15m",
+            "direction_filter": "both",
+        },
+        "risk_settings": {
+            "position_size_mode": "qty",
+            "default_qty": 1,
+            "take_profit_percent": 4,
+            "stop_loss_enabled": False,
+            "stop_loss_percent": 0,
+        },
+        "selected_symbols": ["XLE"],
+    }
+    paper_trading = FakePaperTradingAdapterWithTrackedEntryPosition(avg_entry_price=57.54, qty=17.379214459)
+    service = ExecutionRuntimeService(
+        settings=get_settings(),
+        runtime_store=store,
+        account_resolver=FakeAccountResolver(),
+        paper_trading=paper_trading,
+        market_data=FakeMarketDataAdapter({"XLE": _make_bars([59.0, 59.0, 59.0, 59.0, 59.0, 59.0, 59.0])}),
+    )
+
+    result = service.run_once({"user_id": "user-a", "account_id": 101, "slot": 1})
+
+    assert result.execution_status == "no_signal"
+    assert paper_trading.submitted_qty_orders == []
+    assert not any(item.execution_status == "close_submitted" for item in store.writes)
+
+
+def test_execution_historical_below_floor_examples_do_not_submit_profit_close() -> None:
+    examples = [
+        ("XLP", 84.60, 85.91),
+        ("SMH", 548.61, 551.28),
+        ("XLV", 146.51, 147.71),
+        ("AAPL", 292.80, 298.35),
+        ("SMH", 571.72, 573.37),
+    ]
+
+    for symbol, entry, close in examples:
+        store = FakeExecutionRuntimeStore()
+        store.runtime_config_payload = {
+            "enabled": True,
+            "automation_enabled": True,
+            "strategy_key": "ema",
+            "strategy_settings": {
+                "fast_ema_length": 3,
+                "slow_ema_length": 5,
+                "timeframe": "15m",
+                "direction_filter": "both",
+            },
+            "risk_settings": {
+                "position_size_mode": "qty",
+                "default_qty": 1,
+                "take_profit_percent": 4,
+                "stop_loss_enabled": False,
+                "stop_loss_percent": 0,
+            },
+            "selected_symbols": [symbol],
+        }
+        paper_trading = FakePaperTradingAdapterWithTrackedEntryPosition(avg_entry_price=entry, qty=3.0)
+        service = ExecutionRuntimeService(
+            settings=get_settings(),
+            runtime_store=store,
+            account_resolver=FakeAccountResolver(),
+            paper_trading=paper_trading,
+            market_data=FakeMarketDataAdapter({symbol: _make_bars([close, close, close, close, close, close, close])}),
+        )
+
+        result = service.run_once({"user_id": "user-a", "account_id": 101, "slot": 1})
+
+        assert result.execution_status == "no_signal"
+        assert paper_trading.submitted_qty_orders == []
+        assert not any(item.execution_status == "close_submitted" for item in store.writes)
+
+
+def test_execution_runtime_profit_extension_holds_strong_move_above_take_profit_floor() -> None:
+    store = FakeExecutionRuntimeStore()
+    store.runtime_config_payload = {
+        "enabled": True,
+        "automation_enabled": True,
+        "strategy_key": "ema",
+        "strategy_settings": {
+            "fast_ema_length": 3,
+            "slow_ema_length": 5,
+            "timeframe": "15m",
+            "direction_filter": "both",
+        },
+        "risk_settings": {
+            "position_size_mode": "qty",
+            "default_qty": 1,
+            "take_profit_percent": 4,
+            "profit_extension_enabled": True,
+        },
+        "selected_symbols": ["XLE"],
+    }
+    paper_trading = FakePaperTradingAdapterWithTrackedEntryPosition(avg_entry_price=57.54, qty=17.379214459)
+    service = ExecutionRuntimeService(
+        settings=get_settings(),
+        runtime_store=store,
+        account_resolver=FakeAccountResolver(),
+        paper_trading=paper_trading,
+        market_data=FakeMarketDataAdapter({"XLE": _make_bars([58, 59, 60, 60.5, 60.9, 61.1, 61.25])}),
+    )
+
+    result = service.run_once({"user_id": "user-a", "account_id": 101, "slot": 1})
+
+    assert result.execution_status == "no_signal"
+    symbol_result = next(item for item in store.writes if item.symbol == "XLE")
+    assert symbol_result.raw_response["profit_extension"]["action"] == "hold"
+    assert symbol_result.raw_response["take_profit"]["close_floor_passed"] is True
+    assert paper_trading.submitted_qty_orders == []
+
+
+def test_execution_runtime_profit_extension_slowdown_closes_extended_above_floor() -> None:
+    store = FakeExecutionRuntimeStore()
+    store.runtime_config_payload = {
+        "enabled": True,
+        "automation_enabled": True,
+        "strategy_key": "ema",
+        "strategy_settings": {
+            "fast_ema_length": 3,
+            "slow_ema_length": 5,
+            "timeframe": "15m",
+            "direction_filter": "both",
+        },
+        "risk_settings": {
+            "position_size_mode": "qty",
+            "default_qty": 1,
+            "take_profit_percent": 4,
+            "profit_extension_enabled": True,
+            "profit_extension_active": True,
+            "profit_extension_peak_price": 62.0,
+        },
+        "selected_symbols": ["XLE"],
+    }
+    paper_trading = FakePaperTradingAdapterWithTrackedEntryPosition(avg_entry_price=57.54, qty=17.379214459)
+    service = ExecutionRuntimeService(
+        settings=get_settings(),
+        runtime_store=store,
+        account_resolver=FakeAccountResolver(),
+        paper_trading=paper_trading,
+        market_data=FakeMarketDataAdapter({"XLE": _make_bars([58, 59, 60, 61.5, 61.4, 61.3, 61.25])}),
+    )
+
+    result = service.run_once({"user_id": "user-a", "account_id": 101, "slot": 1})
+
+    assert result.execution_status == "close_submitted"
+    symbol_result = next(item for item in store.writes if item.symbol == "XLE")
+    assert symbol_result.raw_response["exit_reason"] == "take_profit_extended"
+    assert symbol_result.raw_response["profit_extension"]["action"] == "close_extended"
+    assert symbol_result.raw_response["take_profit"]["close_floor_passed"] is True
+    assert paper_trading.submitted_qty_orders[-1]["client_order_id"].startswith("execution-close-")
+
+
+def test_execution_after_hours_stale_bars_above_floor_do_not_submit_without_fresh_confirmation() -> None:
+    store = FakeExecutionRuntimeStore()
+    store.runtime_config_payload = {
+        "enabled": True,
+        "automation_enabled": True,
+        "strategy_key": "ema",
+        "strategy_settings": {
+            "fast_ema_length": 3,
+            "slow_ema_length": 5,
+            "timeframe": "15m",
+            "direction_filter": "both",
+        },
+        "risk_settings": {
+            "position_size_mode": "qty",
+            "default_qty": 1,
+            "take_profit_percent": 4,
+            "stop_loss_enabled": False,
+            "stop_loss_percent": 0,
+        },
+        "selected_symbols": ["XLE"],
+    }
+    paper_trading = FakePaperTradingAdapterWithTrackedEntryPosition(avg_entry_price=57.54, qty=17.379214459)
+    service = ExecutionRuntimeService(
+        settings=get_settings(),
+        runtime_store=store,
+        account_resolver=FakeAccountResolver(),
+        paper_trading=paper_trading,
+        market_data=FakeMarketDataAdapter({"XLE": _make_stale_bars([61.25, 61.25, 61.25, 61.25, 61.25, 61.25, 61.25])}),
+    )
+
+    result = service.run_once({"user_id": "user-a", "account_id": 101, "slot": 1})
+
+    assert result.execution_status == "market_data_issue"
+    assert paper_trading.submitted_qty_orders == []
+    assert not any(item.execution_status == "close_submitted" for item in store.writes)
+
+
 def test_execution_runtime_ema_no_cross_writes_no_signal() -> None:
     store = FakeExecutionRuntimeStore()
     store.runtime_config_payload = {

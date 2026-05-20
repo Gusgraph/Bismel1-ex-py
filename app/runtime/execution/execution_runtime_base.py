@@ -1659,13 +1659,22 @@ class ExecutionRuntimeService:
                     broker_error_code="no_position_to_close",
                     broker_error_message="Execution runtime close skipped because the slot has no open position.",
                 )
-            return self._paper_trading.submit_market_order_qty(
+            result = self._paper_trading.submit_market_order_qty(
                 symbol=runtime_config.symbol,
                 side="sell",
                 qty=position.qty,
                 action=action,
                 client_order_id=client_order_id,
                 credential_context=account_context,
+            )
+            return _execution_result_with_close_floor_metadata(
+                result,
+                _execution_take_profit_floor_details(
+                    assignment=assignment,
+                    runtime_config=runtime_config,
+                    submission_state=submission_state,
+                    payload=runtime_request.payload if isinstance(runtime_request.payload, dict) else {},
+                ),
             )
 
         if action == "cancel":
@@ -1820,6 +1829,12 @@ class ExecutionRuntimeService:
             or _nested_payload_value(payload, "internal_strategy_state", "close_reason")
         )
         source_type = _maybe_string(payload.get("source_type")) or _maybe_string(payload.get("runtime_source")) or "execution_runtime"
+        tp_floor_details = _execution_take_profit_floor_details(
+            assignment=assignment,
+            runtime_config=runtime_config,
+            submission_state=submission_state,
+            payload=payload,
+        )
 
         block_reason: str | None = None
         if product != "execution" or request_action != "close" or not client_order_id.startswith("execution-close-"):
@@ -1836,8 +1851,12 @@ class ExecutionRuntimeService:
             submission_state=submission_state,
         ):
             block_reason = "execution_strategy_loss_exit_blocked"
+        elif close_reason == "strategy_exit" and bool(tp_floor_details.get("below_floor")):
+            block_reason = "execution_strategy_profit_below_tp_floor"
         elif close_reason == "take_profit" and not _execution_take_profit_configured(assignment, payload):
             block_reason = "execution_close_metadata_invalid"
+        elif close_reason == "take_profit" and bool(tp_floor_details.get("below_floor")):
+            block_reason = "execution_take_profit_below_configured_floor"
 
         if block_reason is None:
             return None
@@ -1860,6 +1879,7 @@ class ExecutionRuntimeService:
                     "close_reason": close_reason,
                     "source_type": source_type,
                     "blocked_reason": block_reason,
+                    "take_profit_floor": tp_floor_details,
                 },
             },
         )
@@ -3298,6 +3318,18 @@ class ExecutionRuntimeService:
         if stop_loss_result is not None:
             return stop_loss_result
 
+        take_profit_result = self._evaluate_configured_take_profit(
+            runtime_request=runtime_request,
+            runtime_config=runtime_config,
+            account_context=account_context,
+            run_id=run_id,
+            symbol=symbol,
+            assignment=assignment,
+            bars=bars,
+        )
+        if take_profit_result is not None:
+            return take_profit_result
+
         if strategy_key == "breakout":
             evaluation = evaluate_breakout_strategy(symbol=symbol, bars=bars, config=strategy_config)
         elif strategy_key == "vwap":
@@ -3583,6 +3615,176 @@ class ExecutionRuntimeService:
                     "stop_loss_percent": stop_loss_percent,
                     "stop_loss_price": round(stop_loss_price, 6),
                 },
+                "broker": execution_result.raw_response,
+            },
+        )
+
+    def _evaluate_configured_take_profit(
+        self,
+        *,
+        runtime_request: ExecutionRuntimeRequest,
+        runtime_config: ExecutionRuntimeConfig,
+        account_context: ResolvedAlpacaAccountContext,
+        run_id: str,
+        symbol: str,
+        assignment: dict[str, Any],
+        bars: list[Any],
+    ) -> ExecutionRuntimeResult | None:
+        risk_settings = assignment.get("risk_settings") if isinstance(assignment.get("risk_settings"), dict) else {}
+        take_profit_percent = _maybe_float(risk_settings.get("take_profit_percent")) or 0.0
+        if take_profit_percent <= 0 or not bars:
+            return None
+
+        latest_price = _maybe_float(getattr(bars[-1], "close", None))
+        if latest_price is None or latest_price <= 0:
+            return None
+
+        try:
+            submission_state = self._paper_trading.get_submission_state(
+                symbol=symbol,
+                credential_context=account_context,
+            )
+        except AlpacaPaperTradingError as exc:
+            return self._build_result(
+                runtime_config=runtime_config,
+                run_id=run_id,
+                execution_status="failed",
+                message=_normalize_execution_error_message(exc.message),
+                account_context=account_context,
+                symbol=symbol,
+                action="evaluate",
+                broker_error_code=exc.code,
+                broker_error_message=_normalize_execution_error_message(exc.message),
+                raw_response=exc.raw_response,
+            )
+
+        position = submission_state.position
+        if not _position_is_strategy_managed_open(position):
+            return None
+
+        entry_price = _maybe_float(getattr(position, "avg_entry_price", None))
+        if entry_price is None or entry_price <= 0:
+            return None
+
+        tp_threshold = entry_price * (1 + (take_profit_percent / 100.0))
+        if latest_price < tp_threshold:
+            return None
+        extension = _resolve_execution_profit_extension_decision(
+            risk_settings=risk_settings,
+            bars=bars,
+            tp_threshold=tp_threshold,
+            confirmation_price=latest_price,
+        )
+        if extension["action"] == "hold":
+            return self._build_result(
+                runtime_config=runtime_config,
+                run_id=run_id,
+                execution_status="no_signal",
+                message="Execution runtime is holding above the profit target while the move remains strong.",
+                account_context=account_context,
+                symbol=symbol,
+                action="evaluate",
+                manually_disabled=bool(assignment.get("manually_disabled")),
+                auto_disabled=bool(assignment.get("auto_disabled")),
+                disabled_source=_maybe_string(assignment.get("disabled_source")),
+                disabled_reason=_maybe_string(assignment.get("disabled_reason")),
+                auto_disabled_at=_maybe_string(assignment.get("auto_disabled_at")),
+                last_runtime_decision_at=self._now_provider().isoformat(),
+                last_processed_bar_at=_maybe_string(getattr(bars[-1], "ends_at", None)),
+                raw_response={
+                    "profit_extension": extension,
+                    "take_profit": {
+                        "configured_tp_percent": take_profit_percent,
+                        "entry_price": entry_price,
+                        "latest_price": latest_price,
+                        "tp_threshold": round(tp_threshold, 6),
+                        "confirmation_price": latest_price,
+                        "confirmation_source": "latest_bar_close",
+                        "close_floor_passed": True,
+                    },
+                },
+            )
+
+        trade_config = self._build_trade_config(
+            runtime_config=runtime_config,
+            symbol=symbol,
+            action="close",
+            assignment=assignment,
+            latest_price=latest_price,
+        )
+        trade_request = ExecutionRuntimeRequest(
+            user_id=runtime_request.user_id,
+            account_id=runtime_request.account_id,
+            slot=runtime_request.slot,
+            symbol=symbol,
+            action="close",
+            alpaca_account_id=runtime_request.alpaca_account_id,
+            broker_environment=runtime_request.broker_environment,
+            payload=_execution_order_metadata_payload(
+                runtime_request.payload,
+                action="close",
+                close_reason="take_profit",
+                source_type="configured_take_profit",
+                strategy_key=str(assignment.get("strategy_key") or runtime_config.strategy_key or "unknown"),
+            ),
+        )
+        try:
+            execution_result = self._execute_order(
+                runtime_request=trade_request,
+                runtime_config=trade_config,
+                account_context=account_context,
+            )
+        except AlpacaPaperTradingError as exc:
+            return self._build_result(
+                runtime_config=trade_config,
+                run_id=run_id,
+                execution_status="failed",
+                message=_normalize_execution_error_message(exc.message),
+                account_context=account_context,
+                symbol=symbol,
+                action="close",
+                broker_error_code=exc.code,
+                broker_error_message=_normalize_execution_error_message(exc.message),
+                raw_response=exc.raw_response,
+            )
+
+        execution_status = _strategy_execution_status(action="close", execution_result=execution_result)
+        return self._build_result(
+            runtime_config=trade_config,
+            run_id=run_id,
+            execution_status=execution_status,
+            message="Execution runtime submitted take-profit close order for "
+            f"{symbol}." if execution_result.submitted else _strategy_result_message(symbol=symbol, action="close", execution_result=execution_result),
+            account_context=account_context,
+            symbol=symbol,
+            action="close",
+            order_id=execution_result.order_id,
+            client_order_id=execution_result.client_order_id,
+            side=execution_result.side,
+            qty=trade_config.qty,
+            notional=execution_result.notional if execution_result.notional is not None else trade_config.notional,
+            broker_error_code=execution_result.broker_error_code,
+            broker_error_message=execution_result.broker_error_message,
+            enforcement_reason="take_profit",
+            manually_disabled=bool(assignment.get("manually_disabled")),
+            auto_disabled=bool(assignment.get("auto_disabled")),
+            disabled_source=_maybe_string(assignment.get("disabled_source")),
+            disabled_reason=_maybe_string(assignment.get("disabled_reason")),
+            auto_disabled_at=_maybe_string(assignment.get("auto_disabled_at")),
+            last_runtime_decision_at=self._now_provider().isoformat(),
+            last_processed_bar_at=_maybe_string(getattr(bars[-1], "ends_at", None)),
+            raw_response={
+                "exit_reason": "take_profit_extended" if extension["action"] == "close_extended" else "take_profit",
+                "take_profit": {
+                    "configured_tp_percent": take_profit_percent,
+                    "entry_price": entry_price,
+                    "latest_price": latest_price,
+                    "tp_threshold": round(tp_threshold, 6),
+                    "confirmation_price": latest_price,
+                    "confirmation_source": "latest_bar_close",
+                    "close_floor_passed": True,
+                },
+                "profit_extension": extension,
                 "broker": execution_result.raw_response,
             },
         )
@@ -3928,11 +4130,218 @@ def _execution_stop_loss_enabled(assignment: dict[str, Any]) -> bool:
     return bool(risk_settings.get("stop_loss_enabled", False)) and ((_maybe_float(risk_settings.get("stop_loss_percent")) or 0.0) > 0.0)
 
 
-def _execution_take_profit_configured(assignment: dict[str, Any], payload: dict[str, Any]) -> bool:
+def _execution_take_profit_configured(assignment: dict[str, Any] | None, payload: dict[str, Any]) -> bool:
     if bool(payload.get("take_profit_configured")) or bool(_nested_payload_value(payload, "safe_flags", "take_profit_exit")):
         return True
-    risk_settings = assignment.get("risk_settings") if isinstance(assignment.get("risk_settings"), dict) else {}
+    assignment_payload = assignment if isinstance(assignment, dict) else {}
+    risk_settings = assignment_payload.get("risk_settings") if isinstance(assignment_payload.get("risk_settings"), dict) else {}
     return ((_maybe_float(risk_settings.get("take_profit_percent")) or 0.0) > 0.0)
+
+
+def _execution_take_profit_percent(assignment: dict[str, Any] | None, payload: dict[str, Any]) -> float | None:
+    candidates = [
+        _maybe_float(payload.get("take_profit_percent")),
+        _maybe_float(payload.get("tp_percent")),
+        _maybe_float(_nested_payload_value(payload, "risk_settings", "take_profit_percent")),
+        _maybe_float(_nested_payload_value(payload, "safe_flags", "take_profit_percent")),
+    ]
+    assignment_payload = assignment if isinstance(assignment, dict) else {}
+    risk_settings = assignment_payload.get("risk_settings") if isinstance(assignment_payload.get("risk_settings"), dict) else {}
+    candidates.append(_maybe_float(risk_settings.get("take_profit_percent")))
+
+    for candidate in candidates:
+        if candidate is not None and candidate > 0:
+            return candidate
+    return None
+
+
+def _execution_take_profit_floor_details(
+    *,
+    assignment: dict[str, Any] | None,
+    runtime_config: ExecutionRuntimeConfig,
+    submission_state: AlpacaPaperSubmissionState,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    take_profit_percent = _execution_take_profit_percent(assignment, payload)
+    if take_profit_percent is None:
+        return {
+            "configured": False,
+            "close_floor_passed": None,
+            "below_floor": False,
+            "confirmation_source": "latest_price",
+        }
+
+    position = submission_state.position
+    if not _position_is_strategy_managed_open(position):
+        return {
+            "configured": True,
+            "configured_tp_percent": take_profit_percent,
+            "close_floor_passed": None,
+            "below_floor": False,
+            "confirmation_source": "latest_price",
+            "reason": "no_strategy_managed_position",
+        }
+
+    entry_price = _maybe_float(getattr(position, "avg_entry_price", None))
+    latest_price = _maybe_float((runtime_config.strategy_settings or {}).get("_latest_price"))
+
+    if entry_price is None or entry_price <= 0:
+        return {
+            "configured": True,
+            "configured_tp_percent": take_profit_percent,
+            "entry_price": entry_price,
+            "confirmation_price": latest_price,
+            "confirmation_source": "latest_price",
+            "close_floor_passed": False,
+            "below_floor": True,
+            "reason": "missing_entry_price",
+        }
+    if latest_price is None or latest_price <= 0:
+        return {
+            "configured": True,
+            "configured_tp_percent": take_profit_percent,
+            "entry_price": entry_price,
+            "confirmation_price": latest_price,
+            "confirmation_source": "latest_price",
+            "close_floor_passed": False,
+            "below_floor": True,
+            "reason": "missing_confirmation_price",
+        }
+
+    threshold = entry_price * (1 + (take_profit_percent / 100.0))
+    floor_passed = latest_price >= threshold
+    return {
+        "configured": True,
+        "configured_tp_percent": take_profit_percent,
+        "entry_price": entry_price,
+        "tp_threshold": threshold,
+        "confirmation_price": latest_price,
+        "confirmation_source": "latest_price",
+        "close_floor_passed": floor_passed,
+        "below_floor": not floor_passed,
+    }
+
+
+def _execution_result_with_close_floor_metadata(
+    result: AlpacaPaperExecutionResult,
+    floor_details: dict[str, Any],
+) -> AlpacaPaperExecutionResult:
+    raw_response = result.raw_response if isinstance(result.raw_response, dict) else {}
+    metadata = dict(floor_details)
+    fill_price = _maybe_float(raw_response.get("filled_avg_price") or raw_response.get("avg_fill_price"))
+    threshold = _maybe_float(metadata.get("tp_threshold"))
+
+    if fill_price is not None and threshold is not None:
+        metadata["fill_price"] = fill_price
+        metadata["slippage_from_threshold"] = fill_price - threshold
+        metadata["fill_slippage_below_tp"] = fill_price < threshold
+
+    return replace(result, raw_response={**raw_response, "take_profit_floor": metadata})
+
+
+def _resolve_execution_profit_extension_decision(
+    *,
+    risk_settings: dict[str, Any],
+    bars: list[Any],
+    tp_threshold: float,
+    confirmation_price: float,
+) -> dict[str, Any]:
+    enabled = bool(risk_settings.get("profit_extension_enabled", True))
+    pullback_pct = max(0.0, _maybe_float(risk_settings.get("profit_extension_min_pullback_from_peak_pct")) or 0.35)
+    slowdown_bars = max(1, int(risk_settings.get("profit_extension_slowdown_bars", 2) or 2))
+    max_hold_bars = max(1, int(risk_settings.get("profit_extension_max_hold_bars", 6) or 6))
+    protect_tp_floor = bool(risk_settings.get("profit_extension_protect_tp_floor", True))
+    extension_active = bool(risk_settings.get("profit_extension_active", False))
+    if not enabled:
+        return {"enabled": False, "action": "close_now", "reason": "disabled"}
+
+    latest_bar = bars[-1] if bars else None
+    prior_bar = bars[-2] if len(bars) >= 2 else None
+    latest_close = _maybe_float(getattr(latest_bar, "close", None))
+    prior_close = _maybe_float(getattr(prior_bar, "close", None))
+    latest_high = _maybe_float(getattr(latest_bar, "high", None)) or latest_close or confirmation_price
+    latest_open = _maybe_float(getattr(latest_bar, "open", None))
+    previous_peak = _maybe_float(risk_settings.get("profit_extension_peak_price"))
+    peak = max(value for value in [previous_peak, latest_high, confirmation_price] if value is not None)
+    pullback_from_peak_pct = ((peak - confirmation_price) / peak) * 100.0 if peak and peak > 0 else 0.0
+    recent_highs = [
+        _maybe_float(getattr(bar, "high", None))
+        for bar in bars[-max(2, slowdown_bars + 1):]
+    ]
+    recent_highs = [value for value in recent_highs if value is not None]
+    failed_new_highs = (
+        len(recent_highs) >= slowdown_bars + 1
+        and all(recent_highs[-index] <= max(recent_highs[: -index]) for index in range(1, slowdown_bars + 1))
+    )
+    reversal_bar = (
+        latest_open is not None
+        and latest_close is not None
+        and latest_high is not None
+        and latest_close < latest_open
+        and latest_high > 0
+        and ((latest_high - latest_close) / latest_high) * 100.0 >= pullback_pct
+    )
+    near_tp_floor = tp_threshold > 0 and confirmation_price <= tp_threshold * (1 + (pullback_pct / 100.0))
+    if extension_active and protect_tp_floor and near_tp_floor:
+        return {
+            "enabled": True,
+            "action": "close_extended",
+            "reason": "protect_tp_floor",
+            "extension_active": False,
+            "tp_floor_price": tp_threshold,
+            "extension_peak_price": peak,
+            "extension_bars_held": min(1, max_hold_bars),
+            "pullback_from_peak_pct": pullback_from_peak_pct,
+            "slowdown_reason": "protect_tp_floor",
+        }
+    strong_move = (
+        prior_close is not None
+        and latest_close is not None
+        and latest_close > prior_close
+        and not failed_new_highs
+        and not reversal_bar
+        and pullback_from_peak_pct <= pullback_pct
+    )
+    if strong_move:
+        return {
+            "enabled": True,
+            "action": "hold",
+            "reason": "strong_move_continues",
+            "extension_active": True,
+            "tp_floor_price": tp_threshold,
+            "extension_peak_price": peak,
+            "extension_bars_held": 1,
+            "pullback_from_peak_pct": pullback_from_peak_pct,
+        }
+    if not extension_active:
+        return {
+            "enabled": True,
+            "action": "close_now",
+            "reason": "tp_reached_without_extension_confirmation",
+            "extension_active": False,
+            "tp_floor_price": tp_threshold,
+            "extension_peak_price": peak,
+            "extension_bars_held": min(1, max_hold_bars),
+            "pullback_from_peak_pct": pullback_from_peak_pct,
+        }
+    slowdown_reason = "close_below_prior_close" if prior_close is not None and latest_close is not None and latest_close <= prior_close else "momentum_slowdown"
+    if failed_new_highs:
+        slowdown_reason = f"{slowdown_bars}_bars_failed_new_high"
+    elif reversal_bar:
+        slowdown_reason = "reversal_bar"
+    elif pullback_from_peak_pct >= pullback_pct:
+        slowdown_reason = "pullback_from_extension_peak"
+    return {
+        "enabled": True,
+        "action": "close_extended",
+        "reason": slowdown_reason,
+        "extension_active": False,
+        "tp_floor_price": tp_threshold,
+        "extension_peak_price": peak,
+        "extension_bars_held": min(1, max_hold_bars),
+        "pullback_from_peak_pct": pullback_from_peak_pct,
+        "slowdown_reason": slowdown_reason,
+    }
 
 
 def _execution_strategy_exit_would_realize_loss(

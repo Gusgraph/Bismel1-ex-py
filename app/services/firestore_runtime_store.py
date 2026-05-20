@@ -99,6 +99,11 @@ class PrimeStocksRuntimeConfigRecord:
     tp_mode: str = "atr"
     tp_atr_mult: float = 2.3
     tp_percent: float = 3.1
+    profit_extension_enabled: bool = True
+    profit_extension_slowdown_bars: int = 2
+    profit_extension_min_pullback_from_peak_pct: float = 0.35
+    profit_extension_max_hold_bars: int = 6
+    profit_extension_protect_tp_floor: bool = True
     selected_symbols: list[str] = field(default_factory=list)
     symbol_states: list[dict[str, Any]] = field(default_factory=list)
     strategy_mode: str = "scalper"
@@ -164,6 +169,15 @@ class PrimeStocksRuntimeStateRecord:
     latest_status: str | None = None
     latest_execution_decision: str | None = None
     current_total_exposure_pct: float | None = None
+    profit_extension_active: bool = False
+    tp_floor_reached_at: str | None = None
+    tp_floor_price: float | None = None
+    extension_peak_price: float | None = None
+    extension_peak_at: str | None = None
+    extension_bars_held: int = 0
+    last_extension_check_at: str | None = None
+    extension_reason: str | None = None
+    slowdown_reason: str | None = None
 
     def to_strategy_state(self) -> BismillahTrobotStocksV1State:
         return BismillahTrobotStocksV1State(
@@ -758,6 +772,11 @@ class PrimeStocksFirestoreRuntimeStore:
             tp_mode=str(payload.get("tp_mode", default_config.tp_mode)).strip().lower() or default_config.tp_mode,
             tp_atr_mult=max(0.0, float(payload.get("tp_atr_mult", default_config.tp_atr_mult))),
             tp_percent=max(0.0, float(payload.get("tp_percent", default_config.tp_percent))),
+            profit_extension_enabled=bool(payload.get("profit_extension_enabled", default_config.profit_extension_enabled)),
+            profit_extension_slowdown_bars=max(1, int(payload.get("profit_extension_slowdown_bars", default_config.profit_extension_slowdown_bars))),
+            profit_extension_min_pullback_from_peak_pct=max(0.0, float(payload.get("profit_extension_min_pullback_from_peak_pct", default_config.profit_extension_min_pullback_from_peak_pct))),
+            profit_extension_max_hold_bars=max(1, int(payload.get("profit_extension_max_hold_bars", default_config.profit_extension_max_hold_bars))),
+            profit_extension_protect_tp_floor=bool(payload.get("profit_extension_protect_tp_floor", default_config.profit_extension_protect_tp_floor)),
             selected_symbols=[
                 str(symbol).strip().upper()
                 for symbol in selected_symbols_source
@@ -827,6 +846,15 @@ class PrimeStocksFirestoreRuntimeStore:
             latest_status=_maybe_string(payload.get("latest_status")),
             latest_execution_decision=_maybe_string(payload.get("latest_execution_decision")),
             current_total_exposure_pct=_maybe_float(payload.get("current_total_exposure_pct")),
+            profit_extension_active=bool(payload.get("profit_extension_active", False)),
+            tp_floor_reached_at=_maybe_string(payload.get("tp_floor_reached_at")),
+            tp_floor_price=_maybe_float(payload.get("tp_floor_price")),
+            extension_peak_price=_maybe_float(payload.get("extension_peak_price")),
+            extension_peak_at=_maybe_string(payload.get("extension_peak_at")),
+            extension_bars_held=max(0, int(payload.get("extension_bars_held", 0) or 0)),
+            last_extension_check_at=_maybe_string(payload.get("last_extension_check_at")),
+            extension_reason=_maybe_string(payload.get("extension_reason")),
+            slowdown_reason=_maybe_string(payload.get("slowdown_reason")),
         )
 
     def load_runtime_symbol_state_record(
@@ -880,6 +908,15 @@ class PrimeStocksFirestoreRuntimeStore:
             latest_status=_maybe_string(payload.get("latest_status")),
             latest_execution_decision=_maybe_string(payload.get("latest_execution_decision")),
             current_total_exposure_pct=_maybe_float(payload.get("current_total_exposure_pct")),
+            profit_extension_active=bool(payload.get("profit_extension_active", False)),
+            tp_floor_reached_at=_maybe_string(payload.get("tp_floor_reached_at")),
+            tp_floor_price=_maybe_float(payload.get("tp_floor_price")),
+            extension_peak_price=_maybe_float(payload.get("extension_peak_price")),
+            extension_peak_at=_maybe_string(payload.get("extension_peak_at")),
+            extension_bars_held=max(0, int(payload.get("extension_bars_held", 0) or 0)),
+            last_extension_check_at=_maybe_string(payload.get("last_extension_check_at")),
+            extension_reason=_maybe_string(payload.get("extension_reason")),
+            slowdown_reason=_maybe_string(payload.get("slowdown_reason")),
         )
 
     def load_heartbeat_record(self, *, uid: str | None = None, account_id: int | None = None, slot_number: int | None = None) -> dict[str, Any] | None:
@@ -1108,6 +1145,15 @@ class PrimeStocksFirestoreRuntimeStore:
             latest_status=strategy_result.status,
             latest_execution_decision=execution_decision,
             current_total_exposure_pct=state_record.current_total_exposure_pct if state_record is not None else None,
+            profit_extension_active=state_record.profit_extension_active if state_record is not None else False,
+            tp_floor_reached_at=state_record.tp_floor_reached_at if state_record is not None else None,
+            tp_floor_price=state_record.tp_floor_price if state_record is not None else None,
+            extension_peak_price=state_record.extension_peak_price if state_record is not None else None,
+            extension_peak_at=state_record.extension_peak_at if state_record is not None else None,
+            extension_bars_held=state_record.extension_bars_held if state_record is not None else 0,
+            last_extension_check_at=state_record.last_extension_check_at if state_record is not None else None,
+            extension_reason=state_record.extension_reason if state_record is not None else None,
+            slowdown_reason=state_record.slowdown_reason if state_record is not None else None,
         )
         symbol_state = {
             "run_id": run_id,
@@ -1132,6 +1178,15 @@ class PrimeStocksFirestoreRuntimeStore:
             "client_order_id": serialized_execution["client_order_id"],
             "latest_order_status": serialized_execution["order_status"],
             "current_total_exposure_pct": persisted_state.current_total_exposure_pct,
+            "profit_extension_active": persisted_state.profit_extension_active,
+            "tp_floor_reached_at": persisted_state.tp_floor_reached_at,
+            "tp_floor_price": persisted_state.tp_floor_price,
+            "extension_peak_price": persisted_state.extension_peak_price,
+            "extension_peak_at": persisted_state.extension_peak_at,
+            "extension_bars_held": persisted_state.extension_bars_held,
+            "last_extension_check_at": persisted_state.last_extension_check_at,
+            "extension_reason": persisted_state.extension_reason,
+            "slowdown_reason": persisted_state.slowdown_reason,
             "Ai_regime_label": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_regime_label"],
             "Ai_sentiment_label": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_sentiment_label"],
             "Ai_safety_label": None if serialized_symbol_ai is None else serialized_symbol_ai["Ai_safety_label"],
@@ -2413,6 +2468,11 @@ def build_default_runtime_config(settings: AppConfig) -> PrimeStocksRuntimeConfi
         tp_mode=settings.prime_stocks_tp_mode,
         tp_atr_mult=settings.prime_stocks_tp_atr_mult,
         tp_percent=settings.prime_stocks_tp_percent,
+        profit_extension_enabled=True,
+        profit_extension_slowdown_bars=2,
+        profit_extension_min_pullback_from_peak_pct=0.35,
+        profit_extension_max_hold_bars=6,
+        profit_extension_protect_tp_floor=True,
         account_kill_switch_enabled=False,
         selected_symbols=[],
         symbol_states=[],
@@ -2688,6 +2748,15 @@ def _serialize_runtime_state(state_record: PrimeStocksRuntimeStateRecord) -> dic
         "last_processed_bar_time": state_record.last_processed_bar_time,
         "latest_signal_time": state_record.latest_signal_time,
         "current_total_exposure_pct": state_record.current_total_exposure_pct,
+        "profit_extension_active": state_record.profit_extension_active,
+        "tp_floor_reached_at": state_record.tp_floor_reached_at,
+        "tp_floor_price": state_record.tp_floor_price,
+        "extension_peak_price": state_record.extension_peak_price,
+        "extension_peak_at": state_record.extension_peak_at,
+        "extension_bars_held": state_record.extension_bars_held,
+        "last_extension_check_at": state_record.last_extension_check_at,
+        "extension_reason": state_record.extension_reason,
+        "slowdown_reason": state_record.slowdown_reason,
     }
 
 

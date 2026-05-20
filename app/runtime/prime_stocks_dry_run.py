@@ -1598,7 +1598,9 @@ class PrimeStocksRuntimeService:
                 candidate_action=candidate_action,
                 latest_signal_time=latest_signal_time,
                 latest_execution_bar=bar_set.execution_bars[-1] if bar_set.execution_bars else None,
+                execution_bars=bar_set.execution_bars,
                 latest_execution=latest_execution,
+                runtime_state=processed_bar_state,
                 allow_execution=allow_execution,
                 preview_only=preview_only,
             )
@@ -1804,7 +1806,9 @@ class PrimeStocksRuntimeService:
         candidate_action: str,
         latest_signal_time: datetime | None,
         latest_execution_bar: Any | None,
+        execution_bars: list[Any],
         latest_execution: PrimeStocksLatestExecutionRecord,
+        runtime_state: PrimeStocksRuntimeStateRecord,
         allow_execution: bool | None,
         preview_only: bool = False,
     ) -> tuple[AlpacaPaperExecutionResult | None, str, str | None, bool, int, str | None, str | None, float | None]:
@@ -1943,14 +1947,38 @@ class PrimeStocksRuntimeService:
         )
         take_profit_skip_reason = "tp_not_reached" if broker_state.position is not None else "no_action_candidate"
         if tp_candidate is not None:
-            candidate_action = "take_profit"
-            logger.info(
-                "Prime Stocks take-profit candidate confirmed symbol=%s source=%s price=%s threshold=%s",
-                runtime_config.symbol,
-                tp_candidate["market_confirmation_source"],
-                tp_candidate["market_confirmation_price"],
-                tp_candidate["tp_threshold"],
+            extension_decision = _resolve_profit_extension_decision(
+                enabled=runtime_config.profit_extension_enabled,
+                bars=execution_bars,
+                runtime_state=runtime_state,
+                tp_candidate=tp_candidate,
+                pullback_pct=runtime_config.profit_extension_min_pullback_from_peak_pct,
+                slowdown_bars=runtime_config.profit_extension_slowdown_bars,
+                max_hold_bars=runtime_config.profit_extension_max_hold_bars,
+                protect_tp_floor=runtime_config.profit_extension_protect_tp_floor,
             )
+            tp_candidate["profit_extension"] = extension_decision
+            if extension_decision["action"] == "hold":
+                candidate_action = "HOLD"
+                take_profit_skip_reason = "profit_extension_active"
+                logger.info(
+                    "Prime Stocks profit extension active symbol=%s price=%s threshold=%s peak=%s",
+                    runtime_config.symbol,
+                    tp_candidate["market_confirmation_price"],
+                    tp_candidate["tp_threshold"],
+                    extension_decision.get("extension_peak_price"),
+                )
+            else:
+                candidate_action = "take_profit_extended" if extension_decision["action"] == "close_extended" else "take_profit"
+                tp_candidate["close_reason"] = "take_profit_extended" if candidate_action == "take_profit_extended" else "take_profit"
+                logger.info(
+                    "Prime Stocks take-profit candidate confirmed symbol=%s source=%s price=%s threshold=%s close_reason=%s",
+                    runtime_config.symbol,
+                    tp_candidate["market_confirmation_source"],
+                    tp_candidate["market_confirmation_price"],
+                    tp_candidate["tp_threshold"],
+                    tp_candidate["close_reason"],
+                )
         elif broker_state.position is not None and _prime_take_profit_high_touched_without_executable_confirmation(
             runtime_config=runtime_config,
             strategy_result=strategy_result,
@@ -1964,7 +1992,7 @@ class PrimeStocksRuntimeService:
                 runtime_config.symbol,
             )
 
-        if candidate_action not in {"FirstLot", "EXIT_ATR", "EXIT_REGIME", "take_profit"} and not candidate_action.startswith("MULTI-"):
+        if candidate_action not in {"FirstLot", "EXIT_ATR", "EXIT_REGIME", "take_profit", "take_profit_extended"} and not candidate_action.startswith("MULTI-"):
             return None, "no_op", take_profit_skip_reason, False, state_retry_count, None, None, current_total_exposure_pct
 
         execution_key = _build_execution_key(candidate_action, latest_signal_time, symbol=runtime_config.symbol)
@@ -2154,7 +2182,7 @@ class PrimeStocksRuntimeService:
                 raw_response={
                     **raw_response,
                     "request_action": "close",
-                    "close_reason": "take_profit",
+                    "close_reason": tp_candidate.get("close_reason", "take_profit"),
                     "close_scope": "full_position",
                     "broker_position_qty_source": "broker_current_position",
                     "requested_close_qty": _format_qty(position_qty),
@@ -2214,7 +2242,7 @@ class PrimeStocksRuntimeService:
         latest_signal_time: datetime | None,
         run_id: str,
     ) -> None:
-        if candidate_action != "take_profit":
+        if candidate_action not in {"take_profit", "take_profit_extended"}:
             return
 
         if execution_result is None or not execution_result.submitted:
@@ -3432,7 +3460,7 @@ def _extract_order_time(raw_response: dict[str, Any] | None, key: str) -> str | 
 
 
 def _build_client_order_id(*, run_id: str, candidate_action: str) -> str:
-    action_slug = "tp" if candidate_action == "take_profit" else candidate_action.lower().replace("_", "-")
+    action_slug = "tp" if candidate_action in {"take_profit", "take_profit_extended"} else candidate_action.lower().replace("_", "-")
     run_slug = run_id.replace("dryrun-", "").replace("run-", "")
     return f"prime-{action_slug}-{run_slug}"[:47]
 
@@ -3584,6 +3612,122 @@ def _resolve_prime_take_profit_confirmation(
     }
 
 
+def _resolve_profit_extension_decision(
+    *,
+    enabled: bool,
+    bars: list[Any],
+    runtime_state: PrimeStocksRuntimeStateRecord,
+    tp_candidate: dict[str, Any],
+    pullback_pct: float,
+    slowdown_bars: int,
+    max_hold_bars: int,
+    protect_tp_floor: bool,
+) -> dict[str, Any]:
+    confirmation_price = _maybe_float(tp_candidate.get("market_confirmation_price"))
+    threshold = _maybe_float(tp_candidate.get("tp_threshold"))
+    if not enabled or confirmation_price is None or threshold is None:
+        return {"enabled": bool(enabled), "action": "close_now", "reason": "disabled_or_missing_data"}
+    if confirmation_price < threshold:
+        return {"enabled": bool(enabled), "action": "no_close", "reason": "below_tp_floor"}
+
+    latest_bar = bars[-1] if bars else None
+    prior_bar = bars[-2] if len(bars) >= 2 else None
+    latest_close = _maybe_float(getattr(latest_bar, "close", None))
+    prior_close = _maybe_float(getattr(prior_bar, "close", None))
+    latest_high = _maybe_float(getattr(latest_bar, "high", None)) or latest_close or confirmation_price
+    latest_open = _maybe_float(getattr(latest_bar, "open", None))
+    previous_peak = _maybe_float(runtime_state.extension_peak_price)
+    peak = max(value for value in [previous_peak, latest_high, confirmation_price] if value is not None)
+    pullback_from_peak_pct = ((peak - confirmation_price) / peak) * 100.0 if peak > 0 else 0.0
+    bars_held = (runtime_state.extension_bars_held if runtime_state.profit_extension_active else 0) + 1
+    recent_highs = [
+        _maybe_float(getattr(bar, "high", None))
+        for bar in bars[-max(2, slowdown_bars + 1):]
+    ]
+    recent_highs = [value for value in recent_highs if value is not None]
+    failed_new_highs = (
+        len(recent_highs) >= slowdown_bars + 1
+        and all(recent_highs[-index] <= max(recent_highs[: -index]) for index in range(1, slowdown_bars + 1))
+    )
+    reversal_bar = (
+        latest_open is not None
+        and latest_close is not None
+        and latest_high is not None
+        and latest_close < latest_open
+        and latest_high > 0
+        and ((latest_high - latest_close) / latest_high) * 100.0 >= pullback_pct
+    )
+    strong_move = (
+        prior_close is not None
+        and latest_close is not None
+        and latest_close > prior_close
+        and not failed_new_highs
+        and not reversal_bar
+        and pullback_from_peak_pct <= pullback_pct
+    )
+    near_tp_floor = threshold > 0 and confirmation_price <= threshold * (1 + (pullback_pct / 100.0))
+
+    if runtime_state.profit_extension_active and protect_tp_floor and near_tp_floor:
+        return {
+            "enabled": True,
+            "action": "close_extended",
+            "reason": "protect_tp_floor",
+            "extension_active": False,
+            "tp_floor_price": threshold,
+            "extension_peak_price": peak,
+            "extension_bars_held": bars_held,
+            "pullback_from_peak_pct": pullback_from_peak_pct,
+            "slowdown_reason": "protect_tp_floor",
+        }
+
+    if strong_move and bars_held < max_hold_bars:
+        return {
+            "enabled": True,
+            "action": "hold",
+            "reason": "strong_move_continues",
+            "extension_active": True,
+            "tp_floor_reached_at": tp_candidate.get("market_confirmation_at"),
+            "tp_floor_price": threshold,
+            "extension_peak_price": peak,
+            "extension_peak_at": tp_candidate.get("market_confirmation_at"),
+            "extension_bars_held": bars_held,
+            "pullback_from_peak_pct": pullback_from_peak_pct,
+        }
+
+    if not runtime_state.profit_extension_active:
+        return {
+            "enabled": True,
+            "action": "close_now",
+            "reason": "tp_reached_without_extension_confirmation",
+            "extension_active": False,
+            "tp_floor_price": threshold,
+            "extension_peak_price": peak,
+            "extension_bars_held": bars_held,
+            "pullback_from_peak_pct": pullback_from_peak_pct,
+        }
+
+    slowdown_reason = "max_hold_bars_reached" if bars_held >= max_hold_bars else "momentum_slowdown"
+    if pullback_from_peak_pct >= pullback_pct:
+        slowdown_reason = "pullback_from_extension_peak"
+    elif prior_close is not None and latest_close is not None and latest_close <= prior_close:
+        slowdown_reason = "close_below_prior_close"
+    elif failed_new_highs:
+        slowdown_reason = f"{slowdown_bars}_bars_failed_new_high"
+    elif reversal_bar:
+        slowdown_reason = "reversal_bar"
+    return {
+        "enabled": True,
+        "action": "close_extended" if runtime_state.profit_extension_active else "close_now",
+        "reason": slowdown_reason,
+        "extension_active": False,
+        "tp_floor_price": threshold,
+        "extension_peak_price": peak,
+        "extension_bars_held": bars_held,
+        "pullback_from_peak_pct": pullback_from_peak_pct,
+        "slowdown_reason": slowdown_reason,
+    }
+
+
 def _prime_take_profit_high_touched_without_executable_confirmation(
     *,
     runtime_config: PrimeStocksRuntimeConfigRecord,
@@ -3624,6 +3768,7 @@ def _latest_series_float(strategy_result: PrimeStocksStrategyResult, name: str) 
 def _validate_prime_close_order_metadata(*, candidate_action: str, client_order_id: str) -> str | None:
     close_reason = {
         "take_profit": "take_profit",
+        "take_profit_extended": "take_profit",
         "TAKE_PROFIT": "take_profit",
         "TP": "take_profit",
         "EXIT_ATR": "atr_exit",
