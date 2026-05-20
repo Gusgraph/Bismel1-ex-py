@@ -45,6 +45,8 @@ class GeminiRefreshResult:
     symbols_discovered: int
     symbols_refreshed: int
     symbols_skipped_fresh: int
+    symbols_remaining_stale: int = 0
+    batch_limit: int = 0
     errors: list[dict[str, object]] = field(default_factory=list)
     tokens_used: int = 0
 
@@ -137,6 +139,7 @@ class GeminiMarketIntelligenceRefreshService:
                 errors.append({"scope": "market", "error_category": "gemini_refresh_failed", "message": str(exc)})
 
         unique_symbols = self.collect_unique_symbols(extra_symbols=symbols)
+        stale_symbols: list[str] = []
         for symbol in unique_symbols:
             existing = self._store.load_ai_symbol_record(symbol)
             if not force and not _is_record_stale(
@@ -146,7 +149,13 @@ class GeminiMarketIntelligenceRefreshService:
             ):
                 symbols_skipped_fresh += 1
                 continue
+            stale_symbols.append(symbol)
 
+        batch_limit = max(1, int(self._settings.ai_refresh_batch_size))
+        symbols_to_refresh = stale_symbols[:batch_limit]
+        symbols_remaining_stale = max(0, len(stale_symbols) - len(symbols_to_refresh))
+
+        for symbol in symbols_to_refresh:
             try:
                 started = perf_counter()
                 result = self._scorer.score_headline_with_metadata(
@@ -185,15 +194,64 @@ class GeminiMarketIntelligenceRefreshService:
             except Exception as exc:
                 errors.append({"scope": "symbol", "symbol": symbol, "error_category": "gemini_refresh_failed", "message": str(exc)})
 
+        self._write_batch_summary_event(
+            symbols_discovered=len(unique_symbols),
+            symbols_refreshed=symbols_refreshed,
+            symbols_skipped_fresh=symbols_skipped_fresh,
+            symbols_remaining_stale=symbols_remaining_stale,
+            batch_limit=batch_limit,
+            errors=errors,
+            tokens_used=tokens_used,
+        )
         return GeminiRefreshResult(
             ok=len(errors) == 0,
             market_refreshed=market_refreshed,
             symbols_discovered=len(unique_symbols),
             symbols_refreshed=symbols_refreshed,
             symbols_skipped_fresh=symbols_skipped_fresh,
+            symbols_remaining_stale=symbols_remaining_stale,
+            batch_limit=batch_limit,
             errors=errors,
             tokens_used=tokens_used,
         )
+
+    def _write_batch_summary_event(
+        self,
+        *,
+        symbols_discovered: int,
+        symbols_refreshed: int,
+        symbols_skipped_fresh: int,
+        symbols_remaining_stale: int,
+        batch_limit: int,
+        errors: list[dict[str, object]],
+        tokens_used: int,
+    ) -> None:
+        try:
+            self._store.write_ai_runtime_event(
+                build_gemini_runtime_event(
+                    source="ai_scanner",
+                    product_code="shared_symbol_cache",
+                    model=getattr(self._scorer, "model", None) or self._settings.gemini_model,
+                    prompt="ai-refresh-batch-summary",
+                    response_status="success" if not errors else "partial",
+                    parsed_status="ok" if not errors else "partial",
+                    usage_metadata={"total_tokens": tokens_used},
+                    sanitized_summary={
+                        "scope": "refresh_batch",
+                        "symbols_discovered": symbols_discovered,
+                        "symbols_refreshed": symbols_refreshed,
+                        "symbols_skipped_fresh": symbols_skipped_fresh,
+                        "symbols_remaining_stale": symbols_remaining_stale,
+                        "batch_limit": batch_limit,
+                        "error_count": len(errors),
+                    },
+                    error_category=None if not errors else "gemini_refresh_partial_errors",
+                    error_message_safe=None if not errors else "One or more symbols failed during the bounded AI refresh batch.",
+                )
+            )
+        except Exception:
+            # Batch summary writeback is diagnostic only; symbol cache writes above remain authoritative.
+            return
 
 
 def _is_record_stale(record: AiCacheRecord | None, *, ttl_minutes: int, now: datetime) -> bool:

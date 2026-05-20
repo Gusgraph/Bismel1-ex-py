@@ -349,14 +349,15 @@ class AlpacaPaperTradingAdapter:
         credential_context: ResolvedAlpacaAccountContext | None = None,
     ) -> AlpacaPaperSubmissionState:
         base_url = self._resolve_base_url(credential_context).rstrip("/")
-        headers = self._headers(client_order_id="prime-state-probe", credential_context=credential_context)
+        probe_client_order_id = "broker-state-probe"
+        headers = self._headers(client_order_id=probe_client_order_id, credential_context=credential_context)
         account_payload = self._request_json(
             url=f"{base_url}/v2/account",
             method="GET",
             headers=headers,
             operation="get_submission_state_account",
             symbol=symbol.upper(),
-            client_order_id="prime-state-probe",
+            client_order_id=probe_client_order_id,
         )
         positions_payload = self._request_json(
             url=f"{base_url}/v2/positions",
@@ -364,7 +365,7 @@ class AlpacaPaperTradingAdapter:
             headers=headers,
             operation="get_submission_state_positions",
             symbol=symbol.upper(),
-            client_order_id="prime-state-probe",
+            client_order_id=probe_client_order_id,
         )
         asset_payload = self._request_json(
             url=f"{base_url}/v2/assets/{symbol.upper()}",
@@ -372,7 +373,7 @@ class AlpacaPaperTradingAdapter:
             headers=headers,
             operation="get_submission_state_asset",
             symbol=symbol.upper(),
-            client_order_id="prime-state-probe",
+            client_order_id=probe_client_order_id,
         )
         position_payload = None
         try:
@@ -382,7 +383,7 @@ class AlpacaPaperTradingAdapter:
                 headers=headers,
                 operation="get_submission_state_position",
                 symbol=symbol.upper(),
-                client_order_id="prime-state-probe",
+                client_order_id=probe_client_order_id,
             )
         except AlpacaPaperTradingError as exc:
             if exc.http_status != 404:
@@ -412,12 +413,13 @@ class AlpacaPaperTradingAdapter:
         limit: int = 50,
     ) -> list[dict[str, object]]:
         base_url = self._resolve_base_url(credential_context).rstrip("/")
+        probe_client_order_id = "broker-orders-probe"
         payload = self._request_json(
             url=f"{base_url}/v2/orders?status=all&limit={max(1, int(limit))}",
             method="GET",
-            headers=self._headers(client_order_id="prime-orders-probe", credential_context=credential_context),
+            headers=self._headers(client_order_id=probe_client_order_id, credential_context=credential_context),
             operation="list_recent_orders",
-            client_order_id="prime-orders-probe",
+            client_order_id=probe_client_order_id,
         )
         return payload if isinstance(payload, list) else []
 

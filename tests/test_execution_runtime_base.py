@@ -19,6 +19,7 @@ from app.runtime.execution.execution_runtime_base import (
     ExecutionRuntimeResult,
     ExecutionRuntimeService,
     ExecutionRuntimeStore,
+    _execution_cycle_summary_payload,
     _effective_open_positions_count,
     _normalize_symbol_assignments,
     _position_has_broker_quantity,
@@ -84,6 +85,43 @@ def test_execution_runtime_treats_fractional_residual_as_broker_open_but_not_str
     assert _position_is_residual(submission_state.position) is True
     assert _position_is_strategy_managed_open(submission_state.position) is False
     assert _effective_open_positions_count(submission_state) == 0
+
+
+def test_execution_cycle_summary_payload_exposes_compact_observability_fields() -> None:
+    started = datetime(2026, 5, 20, 14, 15, tzinfo=UTC)
+    finished = started + timedelta(seconds=3)
+
+    summary = _execution_cycle_summary_payload(
+        counts={
+            "no_signal": 2,
+            "buy_submitted": 1,
+            "close_submitted": 1,
+            "skipped_system_review": 1,
+            "market_data_issue": 1,
+            "execution_strategy_profit_below_tp_floor": 1,
+            "failed": 1,
+        },
+        configured_symbols=7,
+        scanned_symbols=7,
+        cycle_started_at=started,
+        cycle_finished_at=finished,
+        cycle_duration_ms=3000,
+        sdk_transport="sdk",
+    )
+
+    assert summary["configured_symbols"] == 7
+    assert summary["scanned_symbols"] == 7
+    assert summary["no_signal_count"] == 2
+    assert summary["buy_candidate_count"] == 1
+    assert summary["close_candidate_count"] == 2
+    assert summary["submitted_buy_count"] == 1
+    assert summary["submitted_close_count"] == 1
+    assert summary["skipped_system_review_count"] == 1
+    assert summary["market_data_issue_count"] == 1
+    assert summary["strategy_profit_below_tp_floor_count"] == 1
+    assert summary["error_count"] == 1
+    assert summary["sdk_transport"] == "sdk"
+    assert summary["rest_fallback_count"] == 0
 
 
 def test_execution_runtime_submits_residual_cleanup_after_bismel1_full_close() -> None:

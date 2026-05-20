@@ -96,6 +96,7 @@ class AppConfig:
     ai_market_cache_ttl_minutes: int = 60
     ai_symbol_cache_ttl_minutes: int = 60
     ai_refresh_max_symbols: int = 80
+    ai_refresh_batch_size: int = 10
     ai_safety_hard_block_enabled: bool = False
 
 
@@ -223,5 +224,6 @@ def get_settings() -> AppConfig:
         ai_market_cache_ttl_minutes=int(os.getenv("AI_MARKET_CACHE_TTL_MINUTES", "60")),
         ai_symbol_cache_ttl_minutes=int(os.getenv("AI_SYMBOL_CACHE_TTL_MINUTES", "60")),
         ai_refresh_max_symbols=max(1, int(os.getenv("AI_REFRESH_MAX_SYMBOLS", "80"))),
+        ai_refresh_batch_size=max(1, int(os.getenv("AI_REFRESH_BATCH_SIZE", "10"))),
         ai_safety_hard_block_enabled=_env_flag("AI_SAFETY_HARD_BLOCK_ENABLED", False),
     )

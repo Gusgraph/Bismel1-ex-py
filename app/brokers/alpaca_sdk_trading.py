@@ -474,23 +474,24 @@ class AlpacaSdkBrokerAdapter:
         credential_context: ResolvedAlpacaAccountContext | None = None,
     ) -> AlpacaPaperSubmissionState:
         sdk_context = self._resolve_sdk_context(credential_context)
+        probe_client_order_id = "broker-state-probe"
         account_payload = self._sdk_call(
             sdk_context.client.get_account,
             operation="get_submission_state_account",
             symbol=symbol.upper(),
-            client_order_id="prime-state-probe",
+            client_order_id=probe_client_order_id,
         )
         positions_payload = self._sdk_call(
             sdk_context.client.get_all_positions,
             operation="get_submission_state_positions",
             symbol=symbol.upper(),
-            client_order_id="prime-state-probe",
+            client_order_id=probe_client_order_id,
         )
         asset_payload = self._sdk_call(
             lambda: sdk_context.client.get_asset(symbol.upper()),
             operation="get_submission_state_asset",
             symbol=symbol.upper(),
-            client_order_id="prime-state-probe",
+            client_order_id=probe_client_order_id,
         )
         position_payload = None
         try:
@@ -498,7 +499,7 @@ class AlpacaSdkBrokerAdapter:
                 lambda: sdk_context.client.get_open_position(symbol.upper()),
                 operation="get_submission_state_position",
                 symbol=symbol.upper(),
-                client_order_id="prime-state-probe",
+                client_order_id=probe_client_order_id,
             )
         except AlpacaPaperTradingError as exc:
             if exc.http_status != 404:
@@ -529,10 +530,11 @@ class AlpacaSdkBrokerAdapter:
         limit: int = 50,
     ) -> list[dict[str, object]]:
         sdk_context = self._resolve_sdk_context(credential_context)
+        probe_client_order_id = "broker-orders-probe"
         payload = self._sdk_call(
             lambda: sdk_context.client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.ALL, limit=max(1, int(limit)))),
             operation="list_recent_orders",
-            client_order_id="prime-orders-probe",
+            client_order_id=probe_client_order_id,
         )
         raw_payload = _sdk_payload(payload)
         return raw_payload if isinstance(raw_payload, list) else []

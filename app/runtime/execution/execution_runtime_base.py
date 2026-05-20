@@ -4,6 +4,7 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 import logging
+from time import perf_counter
 from typing import Any, Callable, Protocol, TypeVar
 from uuid import uuid4
 
@@ -2421,6 +2422,8 @@ class ExecutionRuntimeService:
             )
             return summary
 
+        cycle_started_at = self._now_provider()
+        cycle_started_perf = perf_counter()
         symbol_results: list[ExecutionRuntimeResult] = []
         for symbol, assignment in symbol_assignments.items():
             try:
@@ -2516,11 +2519,39 @@ class ExecutionRuntimeService:
                     symbol,
                 )
 
+        cycle_finished_at = self._now_provider()
+        cycle_duration_ms = int(round((perf_counter() - cycle_started_perf) * 1000))
         summary = self._summarize_strategy_results(
             runtime_config=runtime_config,
             account_context=account_context,
             run_id=run_id,
             symbol_results=symbol_results,
+            cycle_started_at=cycle_started_at,
+            cycle_finished_at=cycle_finished_at,
+            cycle_duration_ms=cycle_duration_ms,
+        )
+        summary_payload = summary.raw_response.get("cycle_summary") if isinstance(summary.raw_response, dict) else {}
+        logger.info(
+            "Execution slot cycle summary product_id=%s account_id=%s slot=%s run_id=%s configured_symbols=%s scanned_symbols=%s duration_ms=%s no_signal_count=%s buy_candidate_count=%s close_candidate_count=%s submitted_buy_count=%s submitted_close_count=%s skipped_system_review_count=%s market_data_issue_count=%s stop_loss_disabled_block_count=%s strategy_profit_below_tp_floor_count=%s error_count=%s sdk_transport=%s rest_fallback_count=%s",
+            runtime_config.product_id,
+            runtime_config.account_id,
+            runtime_config.slot_number,
+            run_id,
+            summary_payload.get("configured_symbols"),
+            summary_payload.get("scanned_symbols"),
+            summary_payload.get("cycle_duration_ms"),
+            summary_payload.get("no_signal_count"),
+            summary_payload.get("buy_candidate_count"),
+            summary_payload.get("close_candidate_count"),
+            summary_payload.get("submitted_buy_count"),
+            summary_payload.get("submitted_close_count"),
+            summary_payload.get("skipped_system_review_count"),
+            summary_payload.get("market_data_issue_count"),
+            summary_payload.get("stop_loss_disabled_block_count"),
+            summary_payload.get("strategy_profit_below_tp_floor_count"),
+            summary_payload.get("error_count"),
+            summary_payload.get("sdk_transport"),
+            summary_payload.get("rest_fallback_count"),
         )
         self._sync_execution_performance(
             runtime_config=runtime_config,
@@ -3859,10 +3890,22 @@ class ExecutionRuntimeService:
         account_context: ResolvedAlpacaAccountContext,
         run_id: str,
         symbol_results: list[ExecutionRuntimeResult],
+        cycle_started_at: datetime | None = None,
+        cycle_finished_at: datetime | None = None,
+        cycle_duration_ms: int | None = None,
     ) -> ExecutionRuntimeResult:
         counts: dict[str, int] = {}
         for item in symbol_results:
             counts[item.execution_status] = counts.get(item.execution_status, 0) + 1
+        cycle_summary = _execution_cycle_summary_payload(
+            counts=counts,
+            configured_symbols=len(runtime_config.symbol_assignments or {}),
+            scanned_symbols=len(symbol_results),
+            cycle_started_at=cycle_started_at,
+            cycle_finished_at=cycle_finished_at,
+            cycle_duration_ms=cycle_duration_ms,
+            sdk_transport=self._settings.alpaca_transport_primary,
+        )
         ordered_statuses = [
             "buy_submitted",
             "close_submitted",
@@ -3916,6 +3959,7 @@ class ExecutionRuntimeService:
             guardrail_metric_snapshot=primary_result.guardrail_metric_snapshot if primary_result is not None else None,
             last_guardrail_check_at=primary_result.last_guardrail_check_at if primary_result is not None else None,
             raw_response={
+                "cycle_summary": cycle_summary,
                 "summary_counts": counts,
                 "symbols": [
                     {
@@ -4123,6 +4167,52 @@ def _normalize_execution_close_reason(value: Any) -> str | None:
     if raw in {"broker_reconcile", "broker_sync", "reconcile"}:
         return "broker_reconcile"
     return None
+
+
+def _execution_cycle_summary_payload(
+    *,
+    counts: dict[str, int],
+    configured_symbols: int,
+    scanned_symbols: int,
+    cycle_started_at: datetime | None,
+    cycle_finished_at: datetime | None,
+    cycle_duration_ms: int | None,
+    sdk_transport: str | None,
+) -> dict[str, object]:
+    submitted_buy_count = counts.get("buy_submitted", 0)
+    submitted_close_count = counts.get("close_submitted", 0) + counts.get("sell_submitted", 0)
+    buy_candidate_count = submitted_buy_count + counts.get("skipped_guardrail_run_entry_limit", 0)
+    close_candidate_count = (
+        submitted_close_count
+        + counts.get("execution_strategy_profit_below_tp_floor", 0)
+        + counts.get("execution_take_profit_below_configured_floor", 0)
+    )
+    error_count = (
+        counts.get("failed", 0)
+        + counts.get("skipped_runtime_symbol_error", 0)
+        + counts.get("skipped_broker_state_unavailable", 0)
+    )
+    return {
+        "cycle_started_at": None if cycle_started_at is None else cycle_started_at.astimezone(UTC).isoformat(),
+        "cycle_finished_at": None if cycle_finished_at is None else cycle_finished_at.astimezone(UTC).isoformat(),
+        "cycle_duration_ms": cycle_duration_ms,
+        "account_slot_count": 1,
+        "configured_symbols": configured_symbols,
+        "scanned_symbols": scanned_symbols,
+        "no_signal_count": counts.get("no_signal", 0),
+        "buy_candidate_count": buy_candidate_count,
+        "close_candidate_count": close_candidate_count,
+        "submitted_buy_count": submitted_buy_count,
+        "submitted_close_count": submitted_close_count,
+        "skipped_system_review_count": counts.get("skipped_system_review", 0),
+        "skipped_no_open_position_count": counts.get("skipped_no_open_position", 0),
+        "market_data_issue_count": counts.get("market_data_issue", 0) + counts.get("skipped_market_data_unavailable", 0),
+        "stop_loss_disabled_block_count": counts.get("execution_stop_loss_disabled", 0),
+        "strategy_profit_below_tp_floor_count": counts.get("execution_strategy_profit_below_tp_floor", 0),
+        "sdk_transport": (sdk_transport or "sdk").strip().lower() or "sdk",
+        "rest_fallback_count": 0,
+        "error_count": error_count,
+    }
 
 
 def _execution_stop_loss_enabled(assignment: dict[str, Any]) -> bool:

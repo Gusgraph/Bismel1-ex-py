@@ -303,6 +303,8 @@ def trigger_gemini_market_intelligence_refresh(
         "symbols_discovered": result.symbols_discovered,
         "symbols_refreshed": result.symbols_refreshed,
         "symbols_skipped_fresh": result.symbols_skipped_fresh,
+        "symbols_remaining_stale": result.symbols_remaining_stale,
+        "batch_limit": result.batch_limit,
         "errors": result.errors,
         "tokens_used": result.tokens_used,
     }

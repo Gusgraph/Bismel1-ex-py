@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from app.products.stocks.bismel1.models import AiCacheRecord
@@ -193,6 +194,33 @@ def test_shared_gemini_refresh_dedupes_symbols_and_skips_fresh_cache(monkeypatch
 
     assert second.symbols_refreshed == 0
     assert second.symbols_skipped_fresh == 3
+
+
+def test_shared_gemini_refresh_processes_stale_symbols_in_bounded_batches(monkeypatch) -> None:
+    settings = replace(_settings(), ai_refresh_batch_size=2, ai_refresh_max_symbols=10)
+    fake_client = FakeFirestoreClient()
+    store = PrimeStocksFirestoreRuntimeStore(settings=settings, client=fake_client)
+    scorer = FakeSymbolScorer()
+    now = datetime(2026, 5, 18, 14, 0, tzinfo=UTC)
+    monkeypatch.setenv("AI_REFRESH_SYMBOLS", "")
+
+    service = GeminiMarketIntelligenceRefreshService(
+        settings=settings,
+        store=store,
+        scorer=scorer,
+        now_provider=lambda: now,
+    )
+
+    result = service.refresh(symbols=["AAPL", "MSFT", "NVDA", "TSLA", "SMH"], force=False)
+
+    assert result.ok is True
+    assert result.batch_limit == 2
+    assert result.symbols_discovered == 5
+    assert result.symbols_refreshed == 2
+    assert result.symbols_remaining_stale == 3
+    assert scorer.symbol_calls == ["AAPL", "MSFT"]
+    summary = fake_client.storage["runtime_products"]["prime_stocks"]["ai_runtime"]["current"]
+    assert summary["last_response_status"] == "success"
 
 
 def test_ai_cache_is_advisory_for_bearish_but_unsafe_can_be_flagged() -> None:
