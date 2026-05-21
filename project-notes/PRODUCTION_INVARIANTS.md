@@ -1,8 +1,22 @@
 # Production Invariants
 
-Last updated: 2026-05-16
+Last updated: 2026-05-20
 
 These rules protect the recovered/stabilized Bismel1 runtime state. Read this before changing account discovery, market-data routing, history fetching, order/position monitoring, or Cloud Run release flow.
+
+## Current Production Lock - 2026-05-20
+- Alpaca SDK is the primary transport for Alpaca across Prime, Execution, Admin Runtime Control, paper, and live contexts.
+- REST remains an emergency fallback only. Do not remove it.
+- BrokerAdapter remains the strategy/runtime boundary. Strategy code must not call Alpaca SDK internals directly.
+- Shared backend-owned broker stream architecture is active. Browser/customer pages must not own broker websocket streams.
+- Prime production revision validated in market-hours proof: `bismel1-prime-stocks-00074-kr4`.
+- Execution production revision validated after observability deployment: `bismel1-execution-trader-00023-ld9`.
+- AI scanner production revision after bounded refresh fix: `bismel1-ai-scanning-00006-48s`.
+- Laravel automated broker submit remains disabled.
+- `prime-stocks-ping` remains paused.
+- `prime-stocks-scheduled`, `execution-scheduled`, and `ai-market-refresh` are the active scheduled paths.
+- Latest Python runtime commit: `09f2121 runtime: add bounded ai refresh and execution observability`.
+- Latest Laravel UI commit recorded for matching app visibility: `5a264b2 customer: update automation controls and activity visibility`.
 
 ## 1. Admin Runtime Monitor
 - Admin-only crypto monitor exists.
@@ -38,10 +52,12 @@ These rules protect the recovered/stabilized Bismel1 runtime state. Read this be
 - AI cache staleness may produce an advisory or pending signal state, but must not be treated as a runtime crash when scan and strategy evaluation still complete.
 
 ## 4. Exposure Rules
-- Per-symbol entry target: 3% equity.
-- Total account exposure cap: 20%.
-- Adds up to 70%.
-- These must not become per-product inconsistent unless explicitly changed and documented.
+- Prime first-entry target: 5.3% equity.
+- Prime total first-entry/open-entry cap: 37.1% equity.
+- Prime adds/recovery cap: 95% equity.
+- This is intended to allow up to seven first-lot Prime positions when broker buying power, duplicate protection, pending-order protection, and risk checks allow.
+- Execution sizing and guardrails remain product-specific and must not inherit Prime exposure caps.
+- These must not become per-account inconsistent unless explicitly changed and documented.
 
 ## 5. Runtime Fanout Safety
 - Fanout must exclude invalid broker credentials.
@@ -68,19 +84,27 @@ These rules protect the recovered/stabilized Bismel1 runtime state. Read this be
 ## 8. Close-Order Safety
 - Prime executable close reason is take profit only.
 - Prime non-TP close candidates must be blocked before broker submission.
+- Prime TP threshold is `max(ATR TP, configured percent floor)`. Current floor uses `tp_percent=3.1`.
+- Prime dynamic profit extension may hold only after TP floor is reached and may close only as `take_profit_extended`; it must never create a non-TP Prime exit.
 - Execution stop-loss close requires `stop_loss_enabled=true` and a valid configured percent.
+- Execution automated profit closes must respect configured symbol TP percent as the minimum floor.
+- Execution strategy profit exits below configured TP must be blocked with `execution_strategy_profit_below_tp_floor`.
+- Execution take-profit exits below configured TP must be blocked with `execution_take_profit_below_configured_floor`.
+- Execution dynamic profit extension may hold only after configured TP floor is reached.
+- Manual close and residual cleanup remain separate from automated TP floor enforcement.
 - Strategy-driven closes require fresh market data or fresh take-profit confirmation.
 - Bismel1-submitted close orders must carry structured metadata and controlled client order IDs.
 - Broker-reconciled sells without local metadata must be treated as broker reconcile, not strategy close.
+- 2026-05-20 proof: XLE Execution close submitted at 14:45 UTC used `execution-close-*`, close reason `take_profit`, TP 4%, entry 57.54, confirmation 60.685, fill 60.70, realized +5.492%, and respected TP floor 59.8416.
 
 ## 9. Broker Stream Monitoring Boundary
 - Alpaca websocket `trade_updates` support is monitoring-only.
-- REST remains the only order submission path.
+- Alpaca SDK is the primary active order/read transport.
+- REST remains emergency fallback only and must not become the default again without explicit rollback.
 - Websocket events must never submit or cancel broker orders.
 - Reconciliation remains the broker truth checker after fills, rejects, cancels, and partial fills.
-- SDK transport remains opt-in behind `ALPACA_TRANSPORT=sdk`; REST remains the production default until a separate rollout approval.
-- SDK paper validation is currently proven for read-only account/position/asset reads and admin-only 24/7 crypto order validation.
-- SDK stock/equity paper order validation must wait for regular market hours and must remain paper-only.
+- SDK transport rollout is complete for Alpaca contexts; full fallback code must remain.
+- SDK read/order/reconciliation/streaming paths have been validated.
 - Stream writeback must store sanitized event summaries only:
   - no API keys or secrets
   - no raw broker payloads
@@ -106,6 +130,7 @@ These rules protect the recovered/stabilized Bismel1 runtime state. Read this be
 - Commit and push the protected release branch before destructive recovery work.
 
 ## Current Locked Runtime References
-- Prime Cloud Run revision recorded for this lock: `bismel1-prime-stocks-00063-w9w`.
-- Execution Cloud Run revision recorded for this lock: `bismel1-execution-trader-00015-cv6`.
-- Runtime lock branch: `release/runtime-monitor-lock`.
+- Prime Cloud Run revision recorded for this lock: `bismel1-prime-stocks-00074-kr4`.
+- Execution Cloud Run revision recorded for this lock: `bismel1-execution-trader-00023-ld9`.
+- AI scanning Cloud Run revision recorded for this lock: `bismel1-ai-scanning-00006-48s`.
+- Runtime branch: `main`.
