@@ -52,10 +52,10 @@ These rules protect the recovered/stabilized Bismel1 runtime state. Read this be
 - AI cache staleness may produce an advisory or pending signal state, but must not be treated as a runtime crash when scan and strategy evaluation still complete.
 
 ## 4. Exposure Rules
-- Prime first-entry target: 5.3% equity.
+- Prime first-entry target: 3.35% equity.
 - Prime total first-entry/open-entry cap: 37.1% equity.
 - Prime adds/recovery cap: 95% equity.
-- This is intended to allow up to seven first-lot Prime positions when broker buying power, duplicate protection, pending-order protection, and risk checks allow.
+- This is intended to allow about eleven first-lot Prime positions when broker buying power, duplicate protection, pending-order protection, and risk checks allow.
 - Execution sizing and guardrails remain product-specific and must not inherit Prime exposure caps.
 - These must not become per-account inconsistent unless explicitly changed and documented.
 
@@ -84,7 +84,7 @@ These rules protect the recovered/stabilized Bismel1 runtime state. Read this be
 ## 8. Close-Order Safety
 - Prime executable close reason is take profit only.
 - Prime non-TP close candidates must be blocked before broker submission.
-- Prime TP threshold is `max(ATR TP, configured percent floor)`. Current floor uses `tp_percent=3.1`.
+- Prime TP threshold is `max(ATR TP, configured percent floor)`. Current floor uses `tp_percent=2.7`.
 - Prime dynamic profit extension may hold only after TP floor is reached and may close only as `take_profit_extended`; it must never create a non-TP Prime exit.
 - Execution stop-loss close requires `stop_loss_enabled=true` and a valid configured percent.
 - Execution automated profit closes must respect configured symbol TP percent as the minimum floor.

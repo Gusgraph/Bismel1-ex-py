@@ -262,9 +262,9 @@ def test_runtime_service_submits_take_profit_when_fresh_bar_confirms_threshold()
     assert execution["request_action"] == "close"
     assert execution["market_confirmation"]["market_confirmation_fresh"] is True
     assert execution["market_confirmation"]["market_confirmation_source"] == "bar_close"
-    assert execution["market_confirmation"]["tp_percent_floor"] == 3.1
+    assert execution["market_confirmation"]["tp_percent_floor"] == 2.7
     assert execution["market_confirmation"]["tp_floor_applied"] is True
-    assert execution["market_confirmation"]["floor_threshold"] == 103.1
+    assert round(execution["market_confirmation"]["floor_threshold"], 1) == 102.7
 
 
 def test_runtime_service_holds_take_profit_extension_while_move_is_strong() -> None:
@@ -544,7 +544,7 @@ def test_runtime_service_allows_kos_style_tp_above_atr_and_percent_floor() -> No
     assert result.candidate_action == "take_profit"
     assert result.execution_decision == "submitted_exit"
     execution = fake_client.storage["runtime_products"]["prime_stocks"]["execution"]["current"]
-    assert execution["market_confirmation"]["tp_threshold"] == 103.1
+    assert round(execution["market_confirmation"]["tp_threshold"], 1) == 102.7
     assert execution["market_confirmation"]["tp_floor_applied"] is True
 
 
@@ -573,7 +573,7 @@ def test_runtime_service_uses_atr_threshold_when_atr_exceeds_percent_floor() -> 
     assert result.execution_decision == "submitted_exit"
     execution = fake_client.storage["runtime_products"]["prime_stocks"]["execution"]["current"]
     assert execution["market_confirmation"]["atr_threshold"] == 104.6
-    assert execution["market_confirmation"]["floor_threshold"] == 103.1
+    assert round(execution["market_confirmation"]["floor_threshold"], 1) == 102.7
     assert execution["market_confirmation"]["tp_threshold"] == 104.6
     assert execution["market_confirmation"]["tp_floor_applied"] is False
 
@@ -854,7 +854,7 @@ def test_runtime_service_submits_first_lot_buy_when_paper_enabled() -> None:
     assert result.order_submitted is True
     assert result.order_status == "accepted"
     assert paper_trading.calls[-1]["action"] == "FirstLot"
-    assert paper_trading.calls[-1]["notional"] == 530.0
+    assert paper_trading.calls[-1]["notional"] == 335.0
 
 
 def test_runtime_service_prime_intraday_breakout_creates_first_lot_candidate() -> None:
@@ -884,7 +884,7 @@ def test_runtime_service_prime_intraday_breakout_creates_first_lot_candidate() -
     assert result.strategy_reasoning["entry_reason"] == "intraday_breakout_scalp"
     assert result.strategy_reasoning["setup_context"] == "Prime Intraday Setup"
     assert result.strategy_reasoning["primary_reason"] == "Prime Intraday Setup passed intraday confirmation."
-    assert paper_trading.calls[-1]["notional"] == 530.0
+    assert paper_trading.calls[-1]["notional"] == 335.0
 
 
 def test_runtime_service_prime_intraday_strong_move_without_confirmation_holds() -> None:
@@ -1690,7 +1690,7 @@ def test_runtime_service_prime_first_lot_respects_total_entry_budget() -> None:
     assert result.order_submitted is False
 
 
-def test_runtime_service_prime_defaults_allow_seventh_first_lot_entry() -> None:
+def test_runtime_service_prime_defaults_allow_eleventh_first_lot_entry() -> None:
     settings = _settings(
         prime_stocks_dry_run=False,
         prime_stocks_paper_execution_enabled=True,
@@ -1700,9 +1700,9 @@ def test_runtime_service_prime_defaults_allow_seventh_first_lot_entry() -> None:
         submission_state=AlpacaPaperSubmissionState(
             account=AlpacaPaperAccountState(
                 buying_power=1000.0,
-                open_positions_count=6,
+                open_positions_count=10,
                 equity=1000.0,
-                total_exposure=318.0,
+                total_exposure=335.0,
             ),
             asset=AlpacaPaperAssetState(symbol="AAPL", tradable=True, status="active"),
             position=None,
@@ -1722,10 +1722,10 @@ def test_runtime_service_prime_defaults_allow_seventh_first_lot_entry() -> None:
     assert result.execution_decision == "submitted_buy"
     assert result.order_submitted is True
     buy_call = next(call for call in paper_trading.calls if call["action"] == "FirstLot")
-    assert abs(float(buy_call["notional"]) - 53.0) < 0.01
+    assert abs(float(buy_call["notional"]) - 33.5) < 0.01
 
 
-def test_runtime_service_prime_defaults_block_eighth_first_lot_entry() -> None:
+def test_runtime_service_prime_defaults_block_twelfth_first_lot_entry() -> None:
     settings = _settings(
         prime_stocks_dry_run=False,
         prime_stocks_paper_execution_enabled=True,
@@ -1739,9 +1739,9 @@ def test_runtime_service_prime_defaults_block_eighth_first_lot_entry() -> None:
             submission_state=AlpacaPaperSubmissionState(
                 account=AlpacaPaperAccountState(
                     buying_power=1000.0,
-                    open_positions_count=7,
+                    open_positions_count=11,
                     equity=1000.0,
-                    total_exposure=371.0,
+                    total_exposure=368.5,
                 ),
                 asset=AlpacaPaperAssetState(symbol="AAPL", tradable=True, status="active"),
                 position=None,
@@ -2921,7 +2921,7 @@ def test_runtime_service_persists_runtime_state_after_first_lot_buy() -> None:
     assert result.execution_decision == "submitted_buy"
     assert state["position_open"] is True
     assert state["position_size"] > 0.0
-    assert state["dollars_used"] == 530.0
+    assert state["dollars_used"] == 335.0
     assert state["add_count"] == 0
     assert state["last_entry_time"] == _bars()[-1].ends_at.isoformat()
     assert state["latest_execution_decision"] == "submitted_buy"
@@ -4251,7 +4251,7 @@ def _settings(**overrides) -> AppConfig:
         prime_stocks_max_open_positions=None,
         prime_stocks_broker_retry_max_attempts=1,
         prime_stocks_force_candidate_action=None,
-        prime_stocks_live_cap_pct=5.3,
+        prime_stocks_live_cap_pct=3.35,
         prime_stocks_total_entry_exposure_cap_pct=37.1,
         prime_stocks_total_add_exposure_cap_pct=95.0,
         prime_stocks_scheduler_job_name="prime-stocks-scheduled",

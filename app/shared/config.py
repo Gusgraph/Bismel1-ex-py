@@ -73,14 +73,14 @@ class AppConfig:
     prime_stocks_ping_scheduler_header_value: str | None
     prime_stocks_safe_mode_enabled: bool = False
     prime_stocks_safe_mode_size_pct: float = 100.0
-    prime_stocks_live_cap_pct: float = 5.3
+    prime_stocks_live_cap_pct: float = 3.35
     prime_stocks_max_total_exposure_pct: float = 70.0
     prime_stocks_total_entry_exposure_cap_pct: float = 37.1
     prime_stocks_total_add_exposure_cap_pct: float = 95.0
     prime_stocks_global_kill_switch_enabled: bool = False
     prime_stocks_tp_mode: str = "atr"
     prime_stocks_tp_atr_mult: float = 2.3
-    prime_stocks_tp_percent: float = 3.1
+    prime_stocks_tp_percent: float = 2.7
     prime_stocks_runtime_api_token: str | None = None
     prime_stocks_notifications_enabled: bool = True
     cloud_run_service_name: str | None = None
@@ -186,7 +186,7 @@ def get_settings() -> AppConfig:
         prime_stocks_ping_scheduler_header_value=_env_optional("PRIME_STOCKS_PING_SCHEDULER_HEADER_VALUE"),
         prime_stocks_safe_mode_enabled=_env_flag("PRIME_STOCKS_SAFE_MODE_ENABLED", False),
         prime_stocks_safe_mode_size_pct=float(os.getenv("PRIME_STOCKS_SAFE_MODE_SIZE_PCT", "100.0")),
-        prime_stocks_live_cap_pct=float(os.getenv("PRIME_STOCKS_LIVE_CAP_PCT", "5.3")),
+        prime_stocks_live_cap_pct=float(os.getenv("PRIME_STOCKS_LIVE_CAP_PCT", "3.35")),
         prime_stocks_max_total_exposure_pct=float(os.getenv("PRIME_STOCKS_MAX_TOTAL_EXPOSURE_PCT", "70.0")),
         prime_stocks_total_entry_exposure_cap_pct=float(
             os.getenv("PRIME_STOCKS_TOTAL_ENTRY_EXPOSURE_CAP_PCT", "37.1")
@@ -200,7 +200,7 @@ def get_settings() -> AppConfig:
         prime_stocks_global_kill_switch_enabled=_env_flag("PRIME_STOCKS_GLOBAL_KILL_SWITCH_ENABLED", False),
         prime_stocks_tp_mode=os.getenv("PRIME_STOCKS_TP_MODE", "atr"),
         prime_stocks_tp_atr_mult=float(os.getenv("PRIME_STOCKS_TP_ATR_MULT", "2.3")),
-        prime_stocks_tp_percent=float(os.getenv("PRIME_STOCKS_TP_PERCENT", "3.1")),
+        prime_stocks_tp_percent=float(os.getenv("PRIME_STOCKS_TP_PERCENT", "2.7")),
         prime_stocks_runtime_api_token=_env_optional("PRIME_STOCKS_RUNTIME_API_TOKEN"),
         prime_stocks_notifications_enabled=_env_flag("PRIME_STOCKS_NOTIFICATIONS_ENABLED", True),
         alpaca_transport=os.getenv("ALPACA_TRANSPORT", "auto").strip().lower() or "auto",

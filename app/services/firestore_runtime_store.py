@@ -89,16 +89,16 @@ class PrimeStocksRuntimeConfigRecord:
     entitlement: dict[str, Any] = field(default_factory=dict)
     safe_mode_enabled: bool = False
     safe_mode_size_pct: float = 100.0
-    live_cap_pct: float = 5.3
+    live_cap_pct: float = 3.35
     max_total_exposure_pct: float = 70.0
-    per_symbol_entry_pct: float = 5.3
+    per_symbol_entry_pct: float = 3.35
     total_entry_exposure_cap_pct: float = 37.1
     total_add_exposure_cap_pct: float = 95.0
     global_kill_switch_enabled: bool = False
     account_kill_switch_enabled: bool = False
     tp_mode: str = "atr"
     tp_atr_mult: float = 2.3
-    tp_percent: float = 3.1
+    tp_percent: float = 2.7
     profit_extension_enabled: bool = True
     profit_extension_slowdown_bars: int = 2
     profit_extension_min_pullback_from_peak_pct: float = 0.35
